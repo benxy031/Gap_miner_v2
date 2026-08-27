@@ -3,6 +3,7 @@ gapcoin_src/
 
 # Build output
 bin/
+build/
 src/*.o
 tests/test_rpc_json
 

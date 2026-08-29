@@ -26,6 +26,8 @@ struct covering_config {
     uint32_t local_sweeps;  /* single-prime local-search passes after greedy */
     uint32_t ils_rounds;    /* iterated-local-search perturbation rounds */
     int pair_search;        /* reserved: pair local search (unused for now) */
+    int run_objective;      /* 1 = maximize longest covered run (tie-break
+                               by survivor count), 0 = minimize survivors */
     uint64_t seed;          /* deterministic seed (0 = fixed default) */
 };
 
@@ -37,6 +39,7 @@ struct covering_evo_config {
     uint32_t local_sweeps;  /* single-prime local-search passes per refinement */
     uint32_t fixed;         /* --ctr-fixed: first N primes frozen (2,3,5,7..) */
     uint32_t ils_rounds;    /* perturbation rounds after evolution */
+    int run_objective;      /* same as covering_config.run_objective */
     uint64_t seed;
 };
 
@@ -67,5 +70,11 @@ uint64_t covering_survivors(const uint64_t *primes, const uint64_t *residues,
 uint64_t covering_count_survivors(const uint64_t *primes,
                                   const uint64_t *residues,
                                   size_t n_primes, uint64_t gap_target);
+
+/* Length of the longest contiguous covered run in [1, gap_target) for a
+ * fixed residue set (0 if allocation fails). */
+uint64_t covering_longest_run(const uint64_t *primes,
+                              const uint64_t *residues,
+                              size_t n_primes, uint64_t gap_target);
 
 #endif /* COVERING_H */

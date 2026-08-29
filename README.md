@@ -173,6 +173,25 @@ The RPC thread polls the node for a new block template every **500 ms**
 (average new-block detection latency ≈ 0.25 s, ~0.2% of the ~118 s block
 interval).
 
+## A/B shift comparison
+
+`scripts/ab_shift_compare.sh` runs two CRT shifts back-to-back (default:
+`shift258_p43_strong_m40.txt` vs `shift998_p128_strong_m40.txt` — same
+covering generation, merit-40 "strong" files), parses the final
+`ROLLING STATS` block of each run, and prints `accepted/hour` and
+`candidates/hour` for both. Runs are **dry-run by default** — set
+`COINBASE_HEX` to your payout script to enable real submissions:
+
+```bash
+DURATION=3600 ITERATIONS=2 COINBASE_HEX=76a914<20-byte-hash160>88ac \
+  ./scripts/ab_shift_compare.sh
+```
+
+Duration is per single-shift run (`3600` s default); iteration order
+alternates to cancel difficulty drift. Results land in
+`/tmp/ab_shift_results.tsv` (`OUT=`), logs in `/tmp/ab_shift_logs`
+(`LOGDIR=`). Treat runs with <5 merit candidates as noisy (Poisson).
+
 ## CLI reference
 
 | Option | Default | Description |
@@ -293,7 +312,7 @@ new_src/gpu/      CUDA kernels (gpu_fermat.cu, gpu_sieve.cu)
 tests/            Unit/integration tests
 data/crt/m23/     Prebuilt merit-23 CRT covering files (shift 450..1017)
 data/prime_gap_merits.txt  Best-known-merit reference table
-scripts/          gen_crt_batch.sh, update_merits.sh
+scripts/          gen_crt_batch.sh, update_merits.sh, ab_shift_compare.sh
 gen_crt.md        CRT covering-file generator guide
 docs/             Architecture references
 ```

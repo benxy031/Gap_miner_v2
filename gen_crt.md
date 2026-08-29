@@ -36,6 +36,11 @@ Usage: bin/gen_crt --calc-ctr --ctr-primes N --ctr-file FILE [options]
   --ctr-bits   B        Extra bits: shift - log2(primorial) (default 0)
   --ctr-strength S      Greedy restarts / quality (default 50)
   --ctr-evolution       Enable evolutionary refinement
+  --ctr-run-objective   Maximize longest covered run (tie-break: survivors)
+                        instead of minimizing survivors. MEASURED WORSE for
+                        mining (shift998/m40: sigma 1.87 -> 1.40): crossing
+                        gaps are density-driven, not run-driven — keep the
+                        default survivor objective
   --ctr-fixed  F        Primes frozen during evolution (default 8)
   --ctr-ivs    I        Population size for evolution (default 10)
   --ctr-range  R        Percent deviation from --ctr-primes (default 0)
@@ -126,6 +131,18 @@ Each file takes roughly a second (greedy + local sweep). 64 files ≈ one minute
   --ctr-evolution --ctr-strength 100 --ctr-ivs 20 --ctr-fixed 8 \
   --ctr-file my_crt_evo.txt
 ```
+
+`scripts/gen_crt_batch.sh` mirrors these options. With `--run-objective` it
+passes `--ctr-run-objective` to gen_crt, keeps the **longest-run** result of
+its `--attempts` tries (instead of fewest candidates) and names the output
+`*_objective_*` instead of `*_strong_*`:
+
+```bash
+scripts/gen_crt_batch.sh --only 128 --merit 40 --run-objective
+```
+
+(Measured worse for mining at shift 998 — σ 1.87 → 1.40 — so the default
+survivor objective stays; the flag exists for the experiment/analysis.)
 
 ## File format
 

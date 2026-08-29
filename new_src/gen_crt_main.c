@@ -60,6 +60,8 @@ static void usage(const char *prog) {
         "  --ctr-bits   B        Extra bits: shift - log2(primorial) (default 0)\n"
         "  --ctr-strength S      Greedy restarts / quality (default 50)\n"
         "  --ctr-evolution       Enable evolutionary refinement\n"
+        "  --ctr-run-objective   Maximize longest covered run (tie-break:\n"
+        "                        survivors) instead of minimizing survivors\n"
         "  --ctr-fixed  F        Primes frozen during evolution (default 8)\n"
         "  --ctr-ivs    I        Population size for evolution (default 10)\n"
         "  --ctr-range  R        Percent deviation from --ctr-primes (default 0)\n"
@@ -76,6 +78,7 @@ int main(int argc, char **argv) {
     int ctr_bits = 0;
     int ctr_strength = 50;
     int ctr_evolution = 0;
+    int ctr_run_objective = 0;
     int ctr_fixed = 8;
     int ctr_ivs = 10;
     int ctr_range = 0;
@@ -88,6 +91,7 @@ int main(int argc, char **argv) {
         {"ctr-bits",       required_argument, NULL, 'b'},
         {"ctr-strength",   required_argument, NULL, 's'},
         {"ctr-evolution",  no_argument,       NULL, 'e'},
+        {"ctr-run-objective", no_argument,     NULL, 'R'},
         {"ctr-fixed",      required_argument, NULL, 'f'},
         {"ctr-ivs",        required_argument, NULL, 'i'},
         {"ctr-range",      required_argument, NULL, 'r'},
@@ -97,7 +101,7 @@ int main(int argc, char **argv) {
     };
 
     int opt;
-    while ((opt = getopt_long(argc, argv, "Cp:m:b:s:ef:i:r:o:h", long_opts, NULL)) != -1) {
+    while ((opt = getopt_long(argc, argv, "Cp:m:b:s:eRf:i:r:o:h", long_opts, NULL)) != -1) {
         switch (opt) {
         case 'C': break;
         case 'p': ctr_primes = atoi(optarg); break;
@@ -105,6 +109,7 @@ int main(int argc, char **argv) {
         case 'b': ctr_bits = atoi(optarg); break;
         case 's': ctr_strength = atoi(optarg); break;
         case 'e': ctr_evolution = 1; break;
+        case 'R': ctr_run_objective = 1; break;
         case 'f': ctr_fixed = atoi(optarg); break;
         case 'i': ctr_ivs = atoi(optarg); break;
         case 'r': ctr_range = atoi(optarg); break;
@@ -165,6 +170,7 @@ int main(int argc, char **argv) {
             cfg.local_sweeps = 4;
             cfg.fixed = (uint32_t)ctr_fixed;
             cfg.ils_rounds = 8;
+            cfg.run_objective = ctr_run_objective;
             cfg.seed = (uint64_t)time(NULL) ^ (uint64_t)n;
             cand = covering_optimize_evolution(g_primes, (size_t)n, gap_size,
                                                residues, &cfg);
@@ -174,6 +180,7 @@ int main(int argc, char **argv) {
             cfg.local_sweeps = 8;
             cfg.ils_rounds = 0;
             cfg.pair_search = 0;
+            cfg.run_objective = ctr_run_objective;
             cfg.seed = (uint64_t)time(NULL) ^ (uint64_t)n;
             cand = covering_optimize(g_primes, (size_t)n, gap_size, residues,
                                      &cfg);
@@ -207,8 +214,13 @@ int main(int argc, char **argv) {
     }
     fclose(f);
 
-    fprintf(stderr, "wrote %s  (%d primes, %llu candidates, shift=%d, gap_target=%llu)\n",
+    uint64_t best_run = covering_longest_run(g_primes, best_res,
+                                             (size_t)best_n, best_gap);
+    fprintf(stderr, "wrote %s  (%d primes, %llu candidates, shift=%d, "
+                    "gap_target=%llu, longest_run=%llu%s)\n",
             ctr_file, best_n, (unsigned long long)best_cand,
-            best_shift, (unsigned long long)best_gap);
+            best_shift, (unsigned long long)best_gap,
+            (unsigned long long)best_run,
+            ctr_run_objective ? " (run objective)" : "");
     return 0;
 }

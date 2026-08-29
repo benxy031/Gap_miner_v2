@@ -12,6 +12,10 @@
 
 static uint64_t g_rng_state;
 
+/* Objective mode shared by both optimizers: 0 = minimize survivors
+   (classic), 1 = maximize the longest contiguous covered run. */
+static int g_run_mode = 0;
+
 static uint64_t rng_next(void) {
     uint64_t x = g_rng_state;
     x ^= x << 13;
@@ -50,6 +54,144 @@ static uint64_t count_survivors(const uint8_t *covered, uint64_t gap_target) {
         if (!covered[j])
             s++;
     return s;
+}
+
+/* Longest contiguous covered run + survivor count of a bitmap. */
+static void covered_stats(const uint8_t *covered, uint64_t gap_target,
+                          uint64_t *longest_out, uint64_t *survivors_out) {
+    uint64_t longest = 0, surv = 0;
+    uint64_t j = 1;
+    while (j < gap_target) {
+        if (!covered[j]) {
+            surv++;
+            j++;
+            continue;
+        }
+        uint64_t s = j;
+        while (j < gap_target && covered[j])
+            j++;
+        uint64_t len = j - s;
+        if (len > longest)
+            longest = len;
+    }
+    *longest_out = longest;
+    *survivors_out = surv;
+}
+
+/* Encoded solution score: lower is better.  Run-mode ranks the longest
+ * covered run first and survivor count second; classic ranks survivors
+ * only.  gap_target is < 2^32 in all supported configurations. */
+static uint64_t encode_score(uint64_t longest, uint64_t survivors,
+                             uint64_t gap_target) {
+    if (g_run_mode)
+        return ((gap_target - longest) << 32) | survivors;
+    return survivors;
+}
+
+/* Full evaluation of a residue set (builds its bitmap). */
+static uint64_t eval_solution(const uint64_t *primes, const uint64_t *residues,
+                              size_t n_primes, uint64_t gap_target,
+                              uint64_t *longest_out, uint64_t *survivors_out) {
+    uint8_t *covered = (uint8_t *)calloc(gap_target, 1);
+    if (!covered) {
+        if (longest_out) *longest_out = 0;
+        if (survivors_out) *survivors_out = UINT64_MAX;
+        return UINT64_MAX;
+    }
+    for (size_t i = 0; i < n_primes; i++)
+        mark_cover(covered, gap_target, primes[i], residues[i]);
+    uint64_t longest, surv;
+    covered_stats(covered, gap_target, &longest, &surv);
+    free(covered);
+    if (longest_out) *longest_out = longest;
+    if (survivors_out) *survivors_out = surv;
+    return encode_score(longest, surv, gap_target);
+}
+
+uint64_t covering_longest_run(const uint64_t *primes, const uint64_t *residues,
+                              size_t n_primes, uint64_t gap_target) {
+    if (!primes || !residues || n_primes == 0 || gap_target < 2)
+        return 0;
+    uint64_t longest, surv;
+    eval_solution(primes, residues, n_primes, gap_target, &longest, &surv);
+    return longest;
+}
+
+/* One-pass per-prime refinement targeting the longest covered run: for
+ * each prime, rebuild the cover without it and pick the residue whose
+ * marks merge covered runs into the longest run (tie-break: most newly
+ * covered positions).  O(n_primes * gap_target). */
+static void run_polish(const uint64_t *primes, size_t n_primes,
+                       uint64_t gap_target, uint64_t *residues) {
+    uint8_t *covered = (uint8_t *)malloc(gap_target);
+    uint64_t *left = (uint64_t *)malloc(gap_target * sizeof(uint64_t));
+    uint64_t *right = (uint64_t *)malloc(gap_target * sizeof(uint64_t));
+    if (!covered || !left || !right) {
+        free(covered);
+        free(left);
+        free(right);
+        return;
+    }
+
+    for (size_t i = 0; i < n_primes; i++) {
+        uint64_t p = primes[i];
+        memset(covered, 0, gap_target);
+        for (size_t k = 0; k < n_primes; k++) {
+            if (k != i)
+                mark_cover(covered, gap_target, primes[k], residues[k]);
+        }
+
+        /* Run boundaries of the bitmap without prime i. */
+        uint64_t base_run = 0;
+        for (uint64_t j = 1; j < gap_target; ) {
+            if (!covered[j]) {
+                j++;
+                continue;
+            }
+            uint64_t s = j;
+            while (j < gap_target && covered[j])
+                j++;
+            uint64_t e = j - 1;
+            if (e - s + 1 > base_run)
+                base_run = e - s + 1;
+            for (uint64_t t = s; t <= e; t++) {
+                left[t] = s;
+                right[t] = e;
+            }
+        }
+
+        uint64_t best_r = residues[i];
+        uint64_t best_run = 0, best_cov = 0;
+        int first = 1;
+        for (uint64_t r = 1; r < p; r++) {
+            uint64_t run = base_run;
+            uint64_t ncov = 0;
+            for (uint64_t j = first_hit(p, r); j < gap_target; j += p) {
+                if (covered[j])
+                    continue;
+                ncov++;
+                uint64_t len = 1;
+                if (j >= 1 && covered[j - 1])
+                    len += right[j - 1] - left[j - 1] + 1;
+                if (j + 1 < gap_target && covered[j + 1])
+                    len += right[j + 1] - left[j + 1] + 1;
+                if (len > run)
+                    run = len;
+            }
+            if (first || run > best_run ||
+                (run == best_run && ncov > best_cov)) {
+                best_r = r;
+                best_run = run;
+                best_cov = ncov;
+                first = 0;
+            }
+        }
+        residues[i] = best_r;
+    }
+
+    free(covered);
+    free(left);
+    free(right);
 }
 
 /* Greedy pass: process primes in the given order, picking for each the
@@ -146,6 +288,7 @@ uint64_t covering_optimize(const uint64_t *primes, size_t n_primes,
     if (!primes || !residues_out || n_primes == 0 || gap_target < 2 || !cfg)
         return 0;
 
+    g_run_mode = cfg->run_objective != 0;
     g_rng_state = cfg->seed ? cfg->seed : 0x9e3779b97f4a7c15ULL;
 
     uint8_t *covered = (uint8_t *)malloc(gap_target);
@@ -160,7 +303,7 @@ uint64_t covering_optimize(const uint64_t *primes, size_t n_primes,
 
     uint32_t strength = cfg->strength ? cfg->strength : 1;
     uint32_t sweeps = cfg->local_sweeps;
-    uint64_t best_surv = UINT64_MAX;
+    uint64_t best_score = UINT64_MAX;
 
     for (uint32_t s = 0; s < strength; s++) {
         /* Randomize prime order (Fisher-Yates) for diverse greedy restarts. */
@@ -178,20 +321,23 @@ uint64_t covering_optimize(const uint64_t *primes, size_t n_primes,
         for (uint32_t sw = 0; sw < sweeps; sw++)
             local_sweep(primes, n_primes, gap_target, residues_out);
 
-        uint64_t surv = covering_count_survivors(primes, residues_out,
-                                                 n_primes, gap_target);
-        if (surv < best_surv) {
-            best_surv = surv;
+        uint64_t sc = eval_solution(primes, residues_out, n_primes,
+                                    gap_target, NULL, NULL);
+        if (sc < best_score) {
+            best_score = sc;
             memcpy(best_res, residues_out, n_primes * sizeof(uint64_t));
         }
     }
 
     memcpy(residues_out, best_res, n_primes * sizeof(uint64_t));
+    if (g_run_mode)
+        run_polish(primes, n_primes, gap_target, residues_out);
 
     free(covered);
     free(best_res);
     free(order);
-    return best_surv;
+    return covering_count_survivors(primes, residues_out, n_primes,
+                                    gap_target);
 }
 
 /* ── Evolutionary optimizer (GapMiner gen_crt --ctr-evolution semantics) ── */
@@ -237,6 +383,7 @@ uint64_t covering_optimize_evolution(const uint64_t *primes, size_t n_primes,
     if (!primes || !residues_out || n_primes == 0 || gap_target < 2 || !cfg)
         return 0;
 
+    g_run_mode = cfg->run_objective != 0;
     g_rng_state = cfg->seed ? cfg->seed : 0x9e3779b97f4a7c15ULL;
 
     uint32_t pop_size = cfg->population ? cfg->population : 20;
@@ -285,8 +432,8 @@ uint64_t covering_optimize_evolution(const uint64_t *primes, size_t n_primes,
         }
         for (uint32_t s = 0; s < sweeps; s++)
             local_sweep_fixed(primes, n_primes, gap_target, pop[i], fixed);
-        score[i] = covering_count_survivors(primes, pop[i], n_primes,
-                                            gap_target);
+        score[i] = eval_solution(primes, pop[i], n_primes, gap_target,
+                                 NULL, NULL);
     }
 
     /* Evolution: tournament selection + crossover + mutation + local search,
@@ -308,8 +455,8 @@ uint64_t covering_optimize_evolution(const uint64_t *primes, size_t n_primes,
         for (uint32_t s = 0; s < sweeps; s++)
             local_sweep_fixed(primes, n_primes, gap_target, child, fixed);
 
-        uint64_t child_score = covering_count_survivors(primes, child,
-                                                        n_primes, gap_target);
+        uint64_t child_score = eval_solution(primes, child, n_primes,
+                                             gap_target, NULL, NULL);
         size_t worst = 0;
         for (uint32_t i = 1; i < pop_size; i++)
             if (score[i] > score[worst])
@@ -338,13 +485,16 @@ uint64_t covering_optimize_evolution(const uint64_t *primes, size_t n_primes,
         }
         for (uint32_t s = 0; s < sweeps; s++)
             local_sweep_fixed(primes, n_primes, gap_target, child, fixed);
-        uint64_t cs = covering_count_survivors(primes, child, n_primes,
-                                               gap_target);
+        uint64_t cs = eval_solution(primes, child, n_primes, gap_target,
+                                    NULL, NULL);
         if (cs < score[best]) {
             memcpy(residues_out, child, n_primes * sizeof(uint64_t));
             score[best] = cs;
         }
     }
+
+    if (g_run_mode)
+        run_polish(primes, n_primes, gap_target, residues_out);
 
     uint64_t final = covering_count_survivors(primes, residues_out, n_primes,
                                               gap_target);

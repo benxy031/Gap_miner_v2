@@ -12,6 +12,10 @@
 #   scripts/gen_crt_batch.sh --start 67 --end 98 \
 #       --merit 23 --bits 8 --out-dir data/crt/m23
 #   scripts/gen_crt_batch.sh --only 67 --evolution # "strong" (higher quality) variant
+#   scripts/gen_crt_batch.sh --only 128 --merit 40 --run-objective
+#                        # longest-covered-run objective; files named
+#                        # "*_objective_*" (measured WORSE for mining at
+#                        # shift 998: sigma 1.87 -> 1.40; keep for research)
 #
 # Existing files are skipped unless --force is given (idempotent re-runs).
 
@@ -31,9 +35,10 @@ IVS=6000
 FIXED=8
 RANGE=0
 EVOLUTION=1
+RUN_OBJECTIVE=0
 FORCE=0
 BUILD=1
-ATTEMPTS=1
+ATTEMPTS=3
 
 usage() {
     cat <<EOF
@@ -50,6 +55,10 @@ Options:
   --out-dir DIR      Output directory (default $OUT_DIR)
   --strength S       Greedy restarts / quality (default $STRENGTH)
   --evolution        Enable evolutionary refinement -> "*_strong_*" file names
+  --run-objective    Maximize longest covered run (passes --ctr-run-objective;
+                     file names use "_objective" instead of "_strong";
+                     selection keeps the longest-run result instead of the
+                     fewest-candidates one)
   --ivs I            Evolution population size (default $IVS)
   --fixed F          Primes frozen during evolution (default $FIXED)
   --range R          Percent deviation from --ctr-primes (default $RANGE)
@@ -73,6 +82,7 @@ while [[ $# -gt 0 ]]; do
         --fixed)      FIXED="${2:?--fixed needs a value}"; shift 2 ;;
         --range)      RANGE="${2:?--range needs a value}"; shift 2 ;;
         --evolution)  EVOLUTION=1; shift ;;
+        --run-objective) RUN_OBJECTIVE=1; shift ;;
         --force)      FORCE=1; shift ;;
         --attempts)   ATTEMPTS="${2:?--attempts needs a value}"; shift 2 ;;
         --no-build)   BUILD=0; shift ;;
@@ -92,14 +102,15 @@ MERITS="${MERITS//,/ }"
 
 run_one() {
     # $1=n  $2=merit  $3=tmp_path
-    # stdout on success: "<shift> <n_primes> <n_candidates>"
+    # stdout on success: "<shift> <n_primes> <n_candidates> <longest_run>"
     local n=$1 merit=$2 tmp=$3
     local args=( --calc-ctr --ctr-primes "$n" --ctr-merit "$merit" --ctr-bits "$BITS"
                  --ctr-strength "$STRENGTH" --ctr-fixed "$FIXED" --ctr-ivs "$IVS"
                  --ctr-range "$RANGE" --ctr-file "$tmp" )
     [[ $EVOLUTION -eq 1 ]] && args+=( --ctr-evolution )
+    [[ $RUN_OBJECTIVE -eq 1 ]] && args+=( --ctr-run-objective )
 
-    local out wrote_line shift_val n_val cand
+    local out wrote_line shift_val n_val cand run_val
     if ! out=$(./"$BIN" "${args[@]}" 2>&1); then
         return 1
     fi
@@ -107,16 +118,18 @@ run_one() {
     shift_val=$(printf '%s\n' "$wrote_line" | sed -n 's/.*shift=\([0-9][0-9]*\).*/\1/p')
     n_val=$(printf '%s\n' "$wrote_line" | sed -n 's/^wrote .* (\([0-9][0-9]*\) primes,.*/\1/p')
     cand=$(grep '^n_candidates ' "$tmp" 2>/dev/null | awk '{print $2}')
+    run_val=$(printf '%s\n' "$wrote_line" | sed -n 's/.*longest_run=\([0-9][0-9]*\).*/\1/p')
     if [[ -z "$shift_val" || -z "$n_val" || -z "$cand" ]]; then
         return 1
     fi
-    printf '%s %s %s\n' "$shift_val" "$n_val" "$cand"
+    printf '%s %s %s %s\n' "$shift_val" "$n_val" "$cand" "${run_val:-0}"
 }
 
 total=0; skipped=0; failed=0
 for merit in $MERITS; do
     for (( n = START; n <= END; n++ )); do
         best_cand=9223372036854775807
+        best_run=0
         best_tmp=""
         best_shift=""
         best_n=""
@@ -128,11 +141,17 @@ for merit in $MERITS; do
                 rm -f "$tmp"
                 continue
             fi
-            read -r s nv cv <<< "$res"
+            read -r s nv cv rv <<< "$res"
             ok_attempts=$((ok_attempts+1))
-            if [[ "$cv" -lt "$best_cand" ]]; then
+            keep=0
+            if [[ $RUN_OBJECTIVE -eq 1 ]]; then
+                [[ "$rv" -gt "$best_run" ]] && keep=1
+            else
+                [[ "$cv" -lt "$best_cand" ]] && keep=1
+            fi
+            if [[ $keep -eq 1 ]]; then
                 [[ -n "$best_tmp" ]] && rm -f "$best_tmp"
-                best_cand=$cv; best_shift=$s; best_n=$nv; best_tmp=$tmp
+                best_cand=$cv; best_run=$rv; best_shift=$s; best_n=$nv; best_tmp=$tmp
             else
                 rm -f "$tmp"
             fi
@@ -144,9 +163,14 @@ for merit in $MERITS; do
             continue
         fi
 
-        strong=""
-        [[ $EVOLUTION -eq 1 ]] && strong="_strong"
-        final="$OUT_DIR/shift${best_shift}_p${best_n}${strong}_m${merit}.txt"
+        if [[ $RUN_OBJECTIVE -eq 1 ]]; then
+            suffix="_objective"
+        elif [[ $EVOLUTION -eq 1 ]]; then
+            suffix="_strong"
+        else
+            suffix=""
+        fi
+        final="$OUT_DIR/shift${best_shift}_p${best_n}${suffix}_m${merit}.txt"
 
         if [[ -e "$final" && $FORCE -eq 0 ]]; then
             echo "skip $final (exists)"
@@ -157,7 +181,11 @@ for merit in $MERITS; do
 
         mv "$best_tmp" "$final"
         total=$((total+1))
-        echo "  ok  $final  ${best_n} primes, ${best_cand} candidates (best of $ok_attempts)"
+        if [[ $RUN_OBJECTIVE -eq 1 ]]; then
+            echo "  ok  $final  ${best_n} primes, ${best_cand} candidates, longest_run ${best_run} (best of $ok_attempts)"
+        else
+            echo "  ok  $final  ${best_n} primes, ${best_cand} candidates (best of $ok_attempts)"
+        fi
     done
 done
 

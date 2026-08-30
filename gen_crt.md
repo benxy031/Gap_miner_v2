@@ -41,6 +41,16 @@ Usage: bin/gen_crt --calc-ctr --ctr-primes N --ctr-file FILE [options]
                         mining (shift998/m40: sigma 1.87 -> 1.40): crossing
                         gaps are density-driven, not run-driven — keep the
                         default survivor objective
+  --ctr-lex-objective   Lexicographic: minimize survivors first, then
+                        maximize longest covered run. MEASURED at production
+                        budget (strength 19000/ivs 6000, shift998/m40): 2186
+                        candidates (<= baseline 2191) and P(merit>=10) per
+                        window 2.02x HIGHER than the survivor-only file
+                        (110 vs 69 gaps/60s; sigma ~2.15 vs ~1.87 estimate).
+                        Regularized hole spacing stretches the tail at fixed
+                        density. Weak-budget runs (strength 80) showed the
+                        opposite — budget matters. Verify at live merit
+                        before adopting as default
   --ctr-fixed  F        Primes frozen during evolution (default 8)
   --ctr-ivs    I        Population size for evolution (default 10)
   --ctr-range  R        Percent deviation from --ctr-primes (default 0)

@@ -13,8 +13,10 @@
 static uint64_t g_rng_state;
 
 /* Objective mode shared by both optimizers: 0 = minimize survivors
-   (classic), 1 = maximize the longest contiguous covered run. */
+   (classic), 1 = maximize the longest contiguous covered run, 2 =
+   lexicographic (minimize survivors first, then maximize the run). */
 static int g_run_mode = 0;
+static int g_lex_mode = 0;
 
 static uint64_t rng_next(void) {
     uint64_t x = g_rng_state;
@@ -79,12 +81,15 @@ static void covered_stats(const uint8_t *covered, uint64_t gap_target,
 }
 
 /* Encoded solution score: lower is better.  Run-mode ranks the longest
- * covered run first and survivor count second; classic ranks survivors
- * only.  gap_target is < 2^32 in all supported configurations. */
+ * covered run first and survivor count second; lex-mode ranks survivors
+ * first and the run second; classic ranks survivors only.
+ * gap_target is < 2^32 in all supported configurations. */
 static uint64_t encode_score(uint64_t longest, uint64_t survivors,
                              uint64_t gap_target) {
     if (g_run_mode)
         return ((gap_target - longest) << 32) | survivors;
+    if (g_lex_mode)
+        return (survivors << 32) | (gap_target - longest);
     return survivors;
 }
 
@@ -143,8 +148,10 @@ static void run_polish(const uint64_t *primes, size_t n_primes,
 
         /* Run boundaries of the bitmap without prime i. */
         uint64_t base_run = 0;
+        uint64_t base_surv = 0;
         for (uint64_t j = 1; j < gap_target; ) {
             if (!covered[j]) {
+                base_surv++;
                 j++;
                 continue;
             }
@@ -161,7 +168,7 @@ static void run_polish(const uint64_t *primes, size_t n_primes,
         }
 
         uint64_t best_r = residues[i];
-        uint64_t best_run = 0, best_cov = 0;
+        uint64_t best_run = 0, best_cov = 0, best_surv = base_surv;
         int first = 1;
         for (uint64_t r = 1; r < p; r++) {
             uint64_t run = base_run;
@@ -178,8 +185,20 @@ static void run_polish(const uint64_t *primes, size_t n_primes,
                 if (len > run)
                     run = len;
             }
-            if (first || run > best_run ||
-                (run == best_run && ncov > best_cov)) {
+            int better;
+            if (g_lex_mode) {
+                uint64_t surv = base_surv - ncov;
+                better = first || surv < best_surv ||
+                         (surv == best_surv && run > best_run) ||
+                         (surv == best_surv && run == best_run &&
+                          ncov > best_cov);
+                if (surv < best_surv)
+                    best_surv = surv;
+            } else {
+                better = first || run > best_run ||
+                         (run == best_run && ncov > best_cov);
+            }
+            if (better) {
                 best_r = r;
                 best_run = run;
                 best_cov = ncov;
@@ -289,6 +308,7 @@ uint64_t covering_optimize(const uint64_t *primes, size_t n_primes,
         return 0;
 
     g_run_mode = cfg->run_objective != 0;
+    g_lex_mode = cfg->lex_objective != 0;
     g_rng_state = cfg->seed ? cfg->seed : 0x9e3779b97f4a7c15ULL;
 
     uint8_t *covered = (uint8_t *)malloc(gap_target);
@@ -330,7 +350,7 @@ uint64_t covering_optimize(const uint64_t *primes, size_t n_primes,
     }
 
     memcpy(residues_out, best_res, n_primes * sizeof(uint64_t));
-    if (g_run_mode)
+    if (g_run_mode || g_lex_mode)
         run_polish(primes, n_primes, gap_target, residues_out);
 
     free(covered);
@@ -384,6 +404,7 @@ uint64_t covering_optimize_evolution(const uint64_t *primes, size_t n_primes,
         return 0;
 
     g_run_mode = cfg->run_objective != 0;
+    g_lex_mode = cfg->lex_objective != 0;
     g_rng_state = cfg->seed ? cfg->seed : 0x9e3779b97f4a7c15ULL;
 
     uint32_t pop_size = cfg->population ? cfg->population : 20;
@@ -493,7 +514,7 @@ uint64_t covering_optimize_evolution(const uint64_t *primes, size_t n_primes,
         }
     }
 
-    if (g_run_mode)
+    if (g_run_mode || g_lex_mode)
         run_polish(primes, n_primes, gap_target, residues_out);
 
     uint64_t final = covering_count_survivors(primes, residues_out, n_primes,

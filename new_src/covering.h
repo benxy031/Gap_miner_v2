@@ -28,6 +28,10 @@ struct covering_config {
     int pair_search;        /* reserved: pair local search (unused for now) */
     int run_objective;      /* 1 = maximize longest covered run (tie-break
                                by survivor count), 0 = minimize survivors */
+    int lex_objective;      /* 1 = LEXICOGRAPHIC: minimize survivors first,
+                               then maximize longest covered run.  This is
+                               the mining-safe arrangement objective (the
+                               run-first variant was measured worse). */
     uint64_t seed;          /* deterministic seed (0 = fixed default) */
 };
 
@@ -40,6 +44,7 @@ struct covering_evo_config {
     uint32_t fixed;         /* --ctr-fixed: first N primes frozen (2,3,5,7..) */
     uint32_t ils_rounds;    /* perturbation rounds after evolution */
     int run_objective;      /* same as covering_config.run_objective */
+    int lex_objective;      /* same as covering_config.lex_objective */
     uint64_t seed;
 };
 

@@ -62,6 +62,8 @@ static void usage(const char *prog) {
         "  --ctr-evolution       Enable evolutionary refinement\n"
         "  --ctr-run-objective   Maximize longest covered run (tie-break:\n"
         "                        survivors) instead of minimizing survivors\n"
+        "  --ctr-lex-objective   Lexicographic: minimize survivors first, then\n"
+        "                        maximize longest covered run (mining-safe)\n"
         "  --ctr-fixed  F        Primes frozen during evolution (default 8)\n"
         "  --ctr-ivs    I        Population size for evolution (default 10)\n"
         "  --ctr-range  R        Percent deviation from --ctr-primes (default 0)\n"
@@ -79,6 +81,7 @@ int main(int argc, char **argv) {
     int ctr_strength = 50;
     int ctr_evolution = 0;
     int ctr_run_objective = 0;
+    int ctr_lex_objective = 0;
     int ctr_fixed = 8;
     int ctr_ivs = 10;
     int ctr_range = 0;
@@ -92,6 +95,7 @@ int main(int argc, char **argv) {
         {"ctr-strength",   required_argument, NULL, 's'},
         {"ctr-evolution",  no_argument,       NULL, 'e'},
         {"ctr-run-objective", no_argument,     NULL, 'R'},
+        {"ctr-lex-objective", no_argument,     NULL, 'L'},
         {"ctr-fixed",      required_argument, NULL, 'f'},
         {"ctr-ivs",        required_argument, NULL, 'i'},
         {"ctr-range",      required_argument, NULL, 'r'},
@@ -101,7 +105,7 @@ int main(int argc, char **argv) {
     };
 
     int opt;
-    while ((opt = getopt_long(argc, argv, "Cp:m:b:s:eRf:i:r:o:h", long_opts, NULL)) != -1) {
+    while ((opt = getopt_long(argc, argv, "Cp:m:b:s:eRLf:i:r:o:h", long_opts, NULL)) != -1) {
         switch (opt) {
         case 'C': break;
         case 'p': ctr_primes = atoi(optarg); break;
@@ -110,6 +114,7 @@ int main(int argc, char **argv) {
         case 's': ctr_strength = atoi(optarg); break;
         case 'e': ctr_evolution = 1; break;
         case 'R': ctr_run_objective = 1; break;
+        case 'L': ctr_lex_objective = 1; break;
         case 'f': ctr_fixed = atoi(optarg); break;
         case 'i': ctr_ivs = atoi(optarg); break;
         case 'r': ctr_range = atoi(optarg); break;
@@ -171,6 +176,7 @@ int main(int argc, char **argv) {
             cfg.fixed = (uint32_t)ctr_fixed;
             cfg.ils_rounds = 8;
             cfg.run_objective = ctr_run_objective;
+            cfg.lex_objective = ctr_lex_objective;
             cfg.seed = (uint64_t)time(NULL) ^ (uint64_t)n;
             cand = covering_optimize_evolution(g_primes, (size_t)n, gap_size,
                                                residues, &cfg);
@@ -181,6 +187,7 @@ int main(int argc, char **argv) {
             cfg.ils_rounds = 0;
             cfg.pair_search = 0;
             cfg.run_objective = ctr_run_objective;
+            cfg.lex_objective = ctr_lex_objective;
             cfg.seed = (uint64_t)time(NULL) ^ (uint64_t)n;
             cand = covering_optimize(g_primes, (size_t)n, gap_size, residues,
                                      &cfg);
@@ -221,6 +228,7 @@ int main(int argc, char **argv) {
             ctr_file, best_n, (unsigned long long)best_cand,
             best_shift, (unsigned long long)best_gap,
             (unsigned long long)best_run,
-            ctr_run_objective ? " (run objective)" : "");
+            ctr_run_objective ? " (run objective)"
+                              : (ctr_lex_objective ? " (lex objective)" : ""));
     return 0;
 }

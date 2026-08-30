@@ -36,6 +36,7 @@ FIXED=8
 RANGE=0
 EVOLUTION=1
 RUN_OBJECTIVE=0
+LEX_OBJECTIVE=0
 FORCE=0
 BUILD=1
 ATTEMPTS=3
@@ -59,6 +60,9 @@ Options:
                      file names use "_objective" instead of "_strong";
                      selection keeps the longest-run result instead of the
                      fewest-candidates one)
+  --lex-objective    Lexicographic: minimize survivors first, then maximize
+                     longest run (passes --ctr-lex-objective; file names use
+                     "_lex"; selection keeps fewest candidates, tie-break run)
   --ivs I            Evolution population size (default $IVS)
   --fixed F          Primes frozen during evolution (default $FIXED)
   --range R          Percent deviation from --ctr-primes (default $RANGE)
@@ -83,6 +87,7 @@ while [[ $# -gt 0 ]]; do
         --range)      RANGE="${2:?--range needs a value}"; shift 2 ;;
         --evolution)  EVOLUTION=1; shift ;;
         --run-objective) RUN_OBJECTIVE=1; shift ;;
+        --lex-objective) LEX_OBJECTIVE=1; shift ;;
         --force)      FORCE=1; shift ;;
         --attempts)   ATTEMPTS="${2:?--attempts needs a value}"; shift 2 ;;
         --no-build)   BUILD=0; shift ;;
@@ -109,6 +114,7 @@ run_one() {
                  --ctr-range "$RANGE" --ctr-file "$tmp" )
     [[ $EVOLUTION -eq 1 ]] && args+=( --ctr-evolution )
     [[ $RUN_OBJECTIVE -eq 1 ]] && args+=( --ctr-run-objective )
+    [[ $LEX_OBJECTIVE -eq 1 ]] && args+=( --ctr-lex-objective )
 
     local out wrote_line shift_val n_val cand run_val
     if ! out=$(./"$BIN" "${args[@]}" 2>&1); then
@@ -146,6 +152,11 @@ for merit in $MERITS; do
             keep=0
             if [[ $RUN_OBJECTIVE -eq 1 ]]; then
                 [[ "$rv" -gt "$best_run" ]] && keep=1
+            elif [[ $LEX_OBJECTIVE -eq 1 ]]; then
+                if [[ "$cv" -lt "$best_cand" ]] ||
+                   [[ "$cv" -eq "$best_cand" && "$rv" -gt "$best_run" ]]; then
+                    keep=1
+                fi
             else
                 [[ "$cv" -lt "$best_cand" ]] && keep=1
             fi
@@ -165,6 +176,8 @@ for merit in $MERITS; do
 
         if [[ $RUN_OBJECTIVE -eq 1 ]]; then
             suffix="_objective"
+        elif [[ $LEX_OBJECTIVE -eq 1 ]]; then
+            suffix="_lex"
         elif [[ $EVOLUTION -eq 1 ]]; then
             suffix="_strong"
         else
@@ -181,7 +194,7 @@ for merit in $MERITS; do
 
         mv "$best_tmp" "$final"
         total=$((total+1))
-        if [[ $RUN_OBJECTIVE -eq 1 ]]; then
+        if [[ $RUN_OBJECTIVE -eq 1 || $LEX_OBJECTIVE -eq 1 ]]; then
             echo "  ok  $final  ${best_n} primes, ${best_cand} candidates, longest_run ${best_run} (best of $ok_attempts)"
         else
             echo "  ok  $final  ${best_n} primes, ${best_cand} candidates (best of $ok_attempts)"

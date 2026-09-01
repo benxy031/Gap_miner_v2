@@ -28,3 +28,4 @@ gbt.json
 *.swp
 *~
 .DS_Store
+gapminer_records.log*

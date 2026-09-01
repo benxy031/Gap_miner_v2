@@ -36,6 +36,7 @@
 #include "crt_runtime.h"
 #include "halfclass.h"
 #include "gap_dist.h"
+#include "gap_hunt.h"
 #ifdef WITH_CUDA
 #include "gpu/gpu_fermat.h"
 #endif
@@ -187,6 +188,12 @@ void print_usage(const char *prog_name) {
     printf("                        Reference gap-length -> best-known-merit table used to flag\n");
     printf("                        new records in the record log (default: data/prime_gap_merits.txt,\n");
     printf("                        from https://primegaps.cloudygo.com/merits.txt)\n");
+    printf("  --gap-hunt            Run standalone record-hunting walk (requires\n");
+    printf("                        --crt-file; exits instead of starting the miner)\n");
+    printf("  --gap-hunt-start <hex>  Base anchor hex (default: 2^762)\n");
+    printf("  --gap-hunt-min-merit <m>  Report gaps with merit >= m (default 15)\n");
+    printf("  --gap-hunt-state <path>  Resume state file\n");
+    printf("  --gap-hunt-out <path>    Results file (default: stdout only)\n");
     printf("  --help                Show this help message\n");
 }
 
@@ -213,6 +220,12 @@ int main(int argc, char *argv[]) {
     int half_class_active = 0;       /* HALF_CLASS two-pass scan (non-CRT) */
     const char *record_log_path = "gapminer_records.log";
     const char *merit_records_path = "data/prime_gap_merits.txt";
+    /* GAP_HUNT standalone mode */
+    int gap_hunt_enabled = 0;
+    const char *gap_hunt_start = NULL;
+    double gap_hunt_min_merit = 15.0;
+    const char *gap_hunt_state = NULL;
+    const char *gap_hunt_out = NULL;
     
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--host") == 0 && i + 1 < argc) {
@@ -263,10 +276,37 @@ int main(int argc, char *argv[]) {
                 return 1;
             }
             merit_records_path = argv[++i];
+        } else if (strcmp(argv[i], "--gap-hunt") == 0) {
+            gap_hunt_enabled = 1;
+        } else if (strcmp(argv[i], "--gap-hunt-start") == 0 && i + 1 < argc) {
+            gap_hunt_start = argv[++i];
+        } else if (strcmp(argv[i], "--gap-hunt-min-merit") == 0 && i + 1 < argc) {
+            gap_hunt_min_merit = atof(argv[++i]);
+        } else if (strcmp(argv[i], "--gap-hunt-state") == 0 && i + 1 < argc) {
+            gap_hunt_state = argv[++i];
+        } else if (strcmp(argv[i], "--gap-hunt-out") == 0 && i + 1 < argc) {
+            gap_hunt_out = argv[++i];
         } else if (strcmp(argv[i], "--help") == 0) {
             print_usage(argv[0]);
             return 0;
         }
+    }
+
+    if (gap_hunt_enabled) {
+        if (!crt_file) {
+            fprintf(stderr, "[Main] --gap-hunt requires --crt-file\n");
+            return 1;
+        }
+        struct gap_hunt_config gh;
+        memset(&gh, 0, sizeof(gh));
+        gh.crt_file = crt_file;
+        gh.start_hex = gap_hunt_start;
+        gh.min_merit = gap_hunt_min_merit;
+        gh.state_path = gap_hunt_state;
+        gh.out_path = gap_hunt_out;
+        gh.sieve_primes = sieve_primes_overridden ? sieve_primes : 2000000U;
+        gh.device = 0;
+        return gap_hunt_run(&gh);
     }
 
     struct crt_runtime crt_rt;

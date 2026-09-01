@@ -73,7 +73,8 @@ SOURCES = $(SRC_DIR)/sieve_core.c \
           $(SRC_DIR)/block_assembly.c \
           $(SRC_DIR)/submission_pipeline.c \
           $(SRC_DIR)/merit_records.c \
-          $(SRC_DIR)/record_log.c
+          $(SRC_DIR)/record_log.c \
+          $(SRC_DIR)/gap_hunt.c
 
 OBJECTS = $(SOURCES:%.c=$(BUILD_DIR)/%.o) $(GPU_OBJ)
 
@@ -99,13 +100,14 @@ TEST_COVERING = $(BIN_DIR)/test_covering
 GEN_CRT = $(BIN_DIR)/gen_crt
 TEST_CRT_RUNTIME = $(BIN_DIR)/test_crt_runtime
 TEST_CRT_SUBMISSION = $(BIN_DIR)/test_crt_submission
+TEST_GAP_HUNT = $(BIN_DIR)/test_gap_hunt
 BENCH_FERMAT = $(BIN_DIR)/bench_fermat
 
 # Phony targets
 .PHONY: all clean test help update-merits
 
 # Default target
-all: $(BIN_DIR) $(BUILD_DIR) $(OBJECTS) $(MAIN_BINARY) $(TEST_GAP_DETECTION) $(TEST_PRIMALITY) $(TEST_WORKER_THREADS) $(TEST_GAPCOIN_RPC) $(TEST_BLOCK_SUBMISSION) $(TEST_SIEVE_CORE) $(TEST_GPU_FERMAT) $(TEST_GPU_SIEVE) $(TEST_GPU_RESOLVE) $(TEST_GAP_DIST) $(TEST_HALFCLASS) $(TEST_GAP_PRIORITY) $(TEST_CRT_SET) $(TEST_GAP_TARGET) $(TEST_COVERING) $(TEST_CRT_RUNTIME) $(TEST_CRT_SUBMISSION) $(CRT_GEN) $(GEN_CRT)
+all: $(BIN_DIR) $(BUILD_DIR) $(OBJECTS) $(MAIN_BINARY) $(TEST_GAP_DETECTION) $(TEST_PRIMALITY) $(TEST_WORKER_THREADS) $(TEST_GAPCOIN_RPC) $(TEST_BLOCK_SUBMISSION) $(TEST_SIEVE_CORE) $(TEST_GPU_FERMAT) $(TEST_GPU_SIEVE) $(TEST_GPU_RESOLVE) $(TEST_GAP_DIST) $(TEST_HALFCLASS) $(TEST_GAP_PRIORITY) $(TEST_CRT_SET) $(TEST_GAP_TARGET) $(TEST_COVERING) $(TEST_CRT_RUNTIME) $(TEST_CRT_SUBMISSION) $(TEST_GAP_HUNT) $(CRT_GEN) $(GEN_CRT)
 
 # Create directories
 $(BIN_DIR):
@@ -224,6 +226,11 @@ $(TEST_GAP_TARGET): $(BUILD_DIR)/$(SRC_DIR)/gap_target.o $(BUILD_DIR)/$(TEST_DIR
 
 $(TEST_COVERING): $(BUILD_DIR)/$(SRC_DIR)/covering.o $(BUILD_DIR)/$(TEST_DIR)/test_covering.o | $(BIN_DIR)
 	$(CC) $(CFLAGS) $^ $(LDFLAGS) -lm -o $@
+	@echo "✓ Built: $@"
+
+# GAP_HUNT record validator (CPU-only: nextprime exactness over an out file)
+$(TEST_GAP_HUNT): $(BUILD_DIR)/$(SRC_DIR)/primality_bpsw.o $(BUILD_DIR)/$(TEST_DIR)/test_gap_hunt.o | $(BIN_DIR)
+	$(CC) $(CFLAGS) $^ -lm -lgmp -o $@
 	@echo "✓ Built: $@"
 
 # Compile test objects

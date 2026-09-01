@@ -192,6 +192,35 @@ alternates to cancel difficulty drift. Results land in
 `/tmp/ab_shift_results.tsv` (`OUT=`), logs in `/tmp/ab_shift_logs`
 (`LOGDIR=`). Treat runs with <5 merit candidates as noisy (Poisson).
 
+## GAP_HUNT — standalone record-hunting mode
+
+`--gap-hunt` decouples gap discovery from Gapcoin's PoW: no headers, no
+difficulty, no submissions.  The CRT cover of a design file is periodic with
+period `P` (product of the cover primes), so every translate
+`b_k = b0 + k·P` of an aligned base carries the identical cover template and
+the same σ-conditioned gap distribution the miner exploits.  The walk uses
+the fused GPU pipeline (device sieve + CGBN MR, full-class) and reports every
+gap whose both endpoints are BPSW-verified and whose merit is at least
+`--gap-hunt-min-merit`.
+
+Windows are `P` apart (not contiguous), so gaps are chained only within a
+window; the first prime of each window is skipped for gap measurement
+(unknown predecessor).  State is written to `--gap-hunt-state` every 1024
+windows and on `SIGINT`/`SIGTERM`; `k` resumes from the state file.
+
+```bash
+# Requires WITH_CUDA=1 build (the same binary as the miner)
+./bin/gapminer --gap-hunt \
+    --crt-file data/crt/m23/shift507_p74_lex_m30.txt \
+    --gap-hunt-min-merit 15 \
+    --gap-hunt-state data/gap_hunt_state.txt \
+    --gap-hunt-out data/gap_hunt_records.txt
+```
+
+Each out record is `k start gap merit` (one per line).  Validate with
+`bin/test_gap_hunt <out-file>` (checks `nextprime(start) == start + gap` for
+every record).
+
 ## CLI reference
 
 | Option | Default | Description |
@@ -210,6 +239,11 @@ alternates to cancel difficulty drift. Results land in
 | `--enable-gpu-fermat` | off | Use the CUDA base-2 MR kernel as the primality filter (requires `WITH_CUDA=1`; falls back to CPU on failure) |
 | `--record-log <path>` | `gapminer_records.log` | Log every BPSW-verified candidate with full parameters |
 | `--merit-records <path>` | `data/prime_gap_merits.txt` | Best-known-merit table used to flag `new_record=yes` |
+| `--gap-hunt` | off | Standalone record-hunting walk (requires `--crt-file` and a `WITH_CUDA=1` build; runs the walk and exits instead of starting the miner) |
+| `--gap-hunt-start <hex>` | `2^762` | Base anchor for the walk (hex); CRT-aligned internally |
+| `--gap-hunt-min-merit <m>` | `15` | Report gaps with merit ≥ m |
+| `--gap-hunt-state <path>` | none | Resume state file (k and diagnostic last prime) |
+| `--gap-hunt-out <path>` | none | Results file (`k start gap merit` per line; stdout-only if unset) |
 | `--help` | — | Print the help message |
 
 Environment variables:

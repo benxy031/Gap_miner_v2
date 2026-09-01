@@ -31,3 +31,4 @@ gbt.json
 gapminer_records.log*
 data/gap_hunt_records.txt
 data/gap_hunt_state.txt
+data/gap_hunt_records.old

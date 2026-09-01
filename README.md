@@ -208,8 +208,11 @@ window; the first prime of each window is skipped for gap measurement
 (unknown predecessor).  Windows accumulate into **K=8 async MR batches**
 with two alternating flights: the host processes one collected batch while
 the GPU runs the next flight's MR kernel (measured on the dev host: **802
-win/s vs 480 synchronous, +67%**).  State is written to `--gap-hunt-state`
-every 1024 windows and on `SIGINT`/`SIGTERM`; `k` resumes from the state file.
+win/s vs 480 synchronous, +67%**).  The walk is single-threaded by design —
+`--threads` and the other miner flags are ignored in this mode; GPU
+concurrency comes from the K=8 flights.  State is written to
+`--gap-hunt-state` every 1024 windows and on `SIGINT`/`SIGTERM`; `k` resumes
+from the state file.
 
 ```bash
 # Requires WITH_CUDA=1 build (the same binary as the miner)

@@ -270,12 +270,12 @@ static void gh_batch_process(struct gh_batch *b, const uint8_t *flags,
                     char *start_dec = mpz_get_str(NULL, 10, last_prime);
                     char *end_dec = mpz_get_str(NULL, 10, p1);
                     fprintf(stderr,
-                            "[GAP_HUNT] gap=%llu merit=%.4f start=%s end=%s\n",
+                            "[GAP_HUNT] gap=%llu merit=%.6f start=%s end=%s\n",
                             (unsigned long long)mpz_get_ui(p2), merit,
                             start_dec ? start_dec : "?",
                             end_dec ? end_dec : "?");
                     if (out) {
-                        fprintf(out, "%llu %.4f %s\n",
+                        fprintf(out, "%llu %.6f %s\n",
                                 (unsigned long long)mpz_get_ui(p2), merit,
                                 start_dec ? start_dec : "?");
                         fflush(out);
@@ -438,7 +438,7 @@ int gap_hunt_run(const struct gap_hunt_config *cfg) {
 
     fprintf(stderr,
             "[GAP_HUNT] walk: shift=%u n_primes=%u P bits=%.0f window=%llu "
-            "sieve=%u min_merit=%.2f k0=%llu device=%d\n",
+            "sieve=%u min_merit=%.6f k0=%llu device=%d\n",
             rt.shift, rt.n_primes,
             (double)mpz_sizeinbase(P, 2),
             (unsigned long long)rt.window, sieve_primes, cfg->min_merit,
@@ -530,7 +530,7 @@ int gap_hunt_run(const struct gap_hunt_config *cfg) {
             save_state(cfg->state_path, next_k, last_prime, have_last);
             last_save = windows;
             fprintf(stderr,
-                    "[GAP_HUNT] k=%llu windows=%llu gaps=%llu best_merit=%.4f\n",
+                    "[GAP_HUNT] k=%llu windows=%llu gaps=%llu best_merit=%.6f\n",
                     (unsigned long long)next_k,
                     (unsigned long long)windows,
                     (unsigned long long)gaps_reported, best_merit);
@@ -558,7 +558,7 @@ int gap_hunt_run(const struct gap_hunt_config *cfg) {
 
     save_state(cfg->state_path, next_k, last_prime, have_last);
     fprintf(stderr,
-            "[GAP_HUNT] stopped: windows=%llu gaps=%llu best_merit=%.4f "
+            "[GAP_HUNT] stopped: windows=%llu gaps=%llu best_merit=%.6f "
             "next_k=%llu\n",
             (unsigned long long)windows, (unsigned long long)gaps_reported,
             best_merit, (unsigned long long)next_k);

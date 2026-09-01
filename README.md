@@ -225,9 +225,10 @@ from the state file.
     --gap-hunt-out data/gap_hunt_records.txt
 ```
 
-Each out record is `<gap> <merit> <startprime>` (one per line).  Validate
-with `bin/test_gap_hunt <out-file>` (checks `nextprime(start) == start + gap`
-for every record).
+Each out record is `<gap> <merit> <startprime>` (one per line; merit printed
+with 6 decimals, the record-submission precision).  Validate with
+`bin/test_gap_hunt <out-file>` (checks `nextprime(start) == start + gap` for
+every record).
 
 ## CLI reference
 

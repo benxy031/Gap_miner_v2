@@ -169,6 +169,11 @@ $(TEST_GPU_RESOLVE): $(OBJECTS) $(BUILD_DIR)/$(TEST_DIR)/test_gpu_resolve.o | $(
 	$(CC) $(CFLAGS) $^ $(LDFLAGS) -lpthread -o $@
 	@echo "✓ Built: $@"
 
+# Link test_gap_dist
+$(TEST_GAP_DIST): $(BUILD_DIR)/$(SRC_DIR)/gap_dist.o $(BUILD_DIR)/$(TEST_DIR)/test_gap_dist.o | $(BIN_DIR)
+	$(CC) $(CFLAGS) $^ $(LDFLAGS) -o $@
+	@echo "✓ Built: $@"
+
 # Link test_halfclass (HALF_CLASS two-pass parity vs the full-class pipeline)
 $(TEST_HALFCLASS): $(BUILD_DIR)/$(SRC_DIR)/halfclass.o $(BUILD_DIR)/$(SRC_DIR)/gap_detection.o $(BUILD_DIR)/$(SRC_DIR)/gap_dist.o $(BUILD_DIR)/$(SRC_DIR)/sieve_core.o $(BUILD_DIR)/$(TEST_DIR)/test_halfclass.o | $(BIN_DIR)
 	$(CC) $(CFLAGS) $^ $(LDFLAGS) -lpthread -o $@

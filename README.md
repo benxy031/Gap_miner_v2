@@ -207,11 +207,11 @@ miner's nominal `gap / ln(2^(256+shift))` protocol merit.
 
 Windows are `P` apart (not contiguous), so gaps are chained only within a
 window; the first prime of each window is skipped for gap measurement
-(unknown predecessor).  Windows accumulate into **K=16 async MR batches**
-(tunable via `GAP_HUNT_BATCH`, 1..16) with two alternating flights: the host
+(unknown predecessor).  Windows accumulate into **K=32 async MR batches**
+(tunable via `GAP_HUNT_BATCH`, 1..32) with two alternating flights: the host
 processes one collected batch while the GPU runs the next flight's MR kernel
-(measured on the dev host while mining runs: **842 win/s at K=16 vs 808 at
-K=8**; the M1 synchronous baseline was 480).  The walk is single-threaded by
+(measured on the dev host while mining runs: **893 win/s at K=32 vs 706 at
+K=16**; the M1 synchronous baseline was 480).  The walk is single-threaded by
 design — `--threads` and the other miner flags are ignored in this mode; GPU
 concurrency comes from the K flights.  State is written to
 `--gap-hunt-state` every 1024 windows and on `SIGINT`/`SIGTERM`; `k` resumes
@@ -271,7 +271,9 @@ Environment variables:
 | `GAPMINER_CPU_WINDOW_OVERRIDE` | `4` | Force the CPU limb path's exponentiation window width (`3`, `4` or `5`; `4` is the specialized default) |
 | `GAPMINER_CPU_WINDOW_LOG` | off | Log the selected window width once per limb count (diagnostic) |
 | `GAPDEBUG` | off | CRT gap diagnostics (HALF_CLASS and full-class modes): for every emitted gap, log to stderr the window class, gap class endpoints, and the interior candidates with their MR flags; in HALF_CLASS mode also logs `[HIDDBG]` hidden-class resolution counters (candidates tested / primes found per resolved interval). Used to trace false-gap regressions; verbose — development only |
-| `GAP_HUNT_BATCH` | `16` | GAP_HUNT windows per accumulated MR batch (`1..16`). Measured on the dev host (RTX 3070, mining running): 842 win/s at 16 vs 808 at 8 vs 778 at K=8+1M sieve — K=16 is the default optimum; batches are guarded against silent truncation at the 40000-candidate MR limit (fail-closed) |
+| `GAP_HUNT_BATCH` | `32` | GAP_HUNT windows per accumulated MR batch (`1..32`). Measured on the dev host (RTX 3070, mining running): **893 win/s at 32 vs 706 at 16 vs 808 at K=8**; batches are guarded against silent truncation at the 80000-candidate MR limit (fail-closed) |
+| `GAP_HUNT_QUARTER` | off | **FALSIFIED experiment** — 4-visible-class scan + on-demand hidden resolution (containment lemma, exact — parity-tested identical to full-class). At record thresholds (merit ≥ 15) the visible-gap trigger fires ~1.3×/window (visible gaps inherit the σ-tail with mean merit ≈ 8) and CPU resolution costs ~40 ms each → 46 win/s vs 893 full-class. Kept off; exact but not profitable |
+| `GAP_HUNT_KMAX` | none | Stop the walk at this k (tests/benchmarks) |
 
 ## Testing
 

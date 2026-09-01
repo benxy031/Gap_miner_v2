@@ -156,6 +156,23 @@ updated).  Measured on the dev host (RTX 3070, shared with live mining):
 `test_gap_hunt` 501/501 exact (nextprime + BPSW); clean shutdown under
 `timeout -s TERM` with both flights drained.
 
+### 2026-09-01 (evening) — K=32 batching; QUARTER_CLASS falsified
+
+- K=32 (GAP_HUNT_BATCH, max raised to 32 with the MR limit at 80000
+  candidates, fail-closed guard): **893 win/s vs 706 at K=16 (+27%)** on the
+  dev host while mining runs; default.
+- QUARTER_CLASS (4-visible-class scan + on-demand hidden resolution) was
+  implemented and is **exact** (parity test: identical records to full-class
+  on the same k-range, after three real bugs were found and fixed: extract
+  `base_mod60=0`, template prefilter assuming an even base while b_k
+  alternates parity, and all-class extension band for containers).  But it is
+  **falsified for record hunting**: visible gaps inherit the σ-tail (mean
+  merit ≈ 8), so the containment trigger fires ~1.3×/window at merit 15 and
+  CPU resolution (~40 ms, mini-sieve 10k + GMP MR) costs more than the MR
+  savings — 46 win/s vs 893.  Kept behind `GAP_HUNT_QUARTER` (off) with the
+  parity evidence; a GPU-resolution variant would need the trigger to be
+  ~300× cheaper, which is not reachable.
+
 ### 2026-09-01 (later) — true record merit
 
 GAP_HUNT now reports the **true record merit** `gap / ln(start)` instead of

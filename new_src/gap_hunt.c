@@ -25,6 +25,7 @@
 #include "crt_runtime.h"
 #include "sieve_core.h"
 #include "primality_bpsw.h"
+#include "halfclass.h"
 
 #ifdef WITH_CUDA
 #include "gpu_adapter.h"
@@ -141,8 +142,10 @@ static int load_state(const char *path, uint64_t *k, mpz_t last_prime,
    submission.  Two flights alternate: while the host processes the
    collected flight, the GPU runs the other flight's MR kernel. */
 
-#define GAP_HUNT_BATCH_MAX 16
-static int g_batch = 16;       /* GAP_HUNT_BATCH env, clamped 1..MAX */
+#define GAP_HUNT_BATCH_MAX 32
+static int g_batch = 32;       /* GAP_HUNT_BATCH env, clamped 1..MAX */
+static int g_quarter = 0;      /* GAP_HUNT_QUARTER env: 4-visible-class scan */
+static uint64_t g_kmax = 0;    /* GAP_HUNT_KMAX env: stop hook (tests/bench) */
 
 struct gh_batch {
     int active;                 /* submitted, not yet collected */
@@ -154,6 +157,7 @@ struct gh_batch {
     uint32_t cum[GAP_HUNT_BATCH_MAX + 1];   /* prefix sums into the flags array */
     mpz_t win_base[GAP_HUNT_BATCH_MAX];
     uint64_t *win_off[GAP_HUNT_BATCH_MAX];  /* host offset slices */
+    uint8_t base_even[GAP_HUNT_BATCH_MAX];  /* template prefilter validity */
 };
 
 struct gh_ctx {
@@ -166,6 +170,11 @@ struct gh_ctx {
     uint64_t interval;
     uint64_t odd_interval_size;
     uint64_t back_limit;
+    int quarter;                /* GAP_HUNT_QUARTER active */
+    uint64_t region_start;      /* offsets below this are all-class scanned */
+    uint64_t tail_start;        /* offsets at/after this are all-class scanned */
+    uint64_t owned_limit;       /* in-window high endpoint (offset rel base) */
+    struct halfclass_tpl tpl;   /* CRT template prefilter for resolution */
     const uint64_t *primes;
     const uint64_t *inv_p;
     size_t prime_count;
@@ -198,6 +207,11 @@ static int gh_batch_fill(struct gh_batch *b, int slot, uint64_t k0,
         mpz_addmul_ui(g->bk, g->P, (unsigned long)k);
         mpz_sub_ui(g->wb, g->bk, g->back_limit);
         mpz_set(b->win_base[i], g->wb);
+        /* The CRT template prefilter assumes an EVEN base (even t -> even
+           value).  P is odd, so b_k alternates parity with k; for odd bases
+           the template's shortcut would kill odd interior primes, so the
+           prefilter is skipped there (mini-sieve alone, still exact). */
+        b->base_even[i] = (uint8_t)(mpz_odd_p(g->wb) ? 0 : 1);
 
         memset(g->base_limbs, 0, (size_t)g->gpu_limbs * sizeof(uint64_t));
         size_t exported = 0;
@@ -217,22 +231,52 @@ static int gh_batch_fill(struct gh_batch *b, int slot, uint64_t k0,
                                       NULL, 0))
             return 0;
 
+        uint64_t class_mask =
+            g->quarter ? halfclass_visible_mask() : UINT64_MAX;
+        /* The extract filter classes VALUES by (base + offset) mod 60 —
+           pass the real window-base residue, never 0. */
+        uint32_t base_mod60 = (uint32_t)mpz_fdiv_ui(g->wb, 60);
+        /* Extension band [tail_start, interval): extracted ALL-classes so
+           every prime there is a chain anchor (containers always exist). */
+        uint64_t lo_tail_odd = 0;
+        if (g->tail_start > first_odd_offset)
+            lo_tail_odd = (g->tail_start - first_odd_offset + 1ULL) >> 1;
+        if (lo_tail_odd > odd_size)
+            lo_tail_odd = odd_size;
+        if (!g->quarter)
+            lo_tail_odd = odd_size;   /* full-class: one whole-range pass */
+
         uint64_t *d_cands = NULL;
         unsigned int nc = 0;
         if (!gpu_sieve_extract_pack_device_range_ex(
-                g->sieve, odd_size, first_odd_offset, 0, odd_size,
+                g->sieve, odd_size, first_odd_offset, 0, lo_tail_odd,
                 buf, slot, g->base_limbs, g->fermat_limbs, &d_cands,
-                b->win_off[i], &nc, 0, UINT64_MAX, 0, cum))
+                b->win_off[i], &nc, base_mod60, class_mask,
+                g->region_start, cum))
             return 0;
         if ((uint64_t)nc > g->capacity)
             return 0;
-        /* gpu_fermat_submit_device silently clamps to GPU_ADAPTER_MAX_BATCH;
-           exceeding it would drop candidates and fabricate false gaps. */
         if (cum + nc > GPU_ADAPTER_MAX_BATCH)
             return 0;
         b->count[i] = nc;
         b->cum[i] = cum;
         cum += nc;
+
+        if (g->quarter && lo_tail_odd < odd_size) {
+            unsigned int nc2 = 0;
+            if (!gpu_sieve_extract_pack_device_range_ex(
+                    g->sieve, odd_size, first_odd_offset, lo_tail_odd,
+                    odd_size, buf, slot, g->base_limbs, g->fermat_limbs,
+                    &d_cands, b->win_off[i] + nc, &nc2,
+                    base_mod60, UINT64_MAX, 0, cum))
+                return 0;
+            if ((uint64_t)(nc + nc2) > g->capacity)
+                return 0;
+            if (cum + nc2 > GPU_ADAPTER_MAX_BATCH)
+                return 0;
+            b->count[i] = nc + nc2;
+            cum += nc2;
+        }
     }
     b->cum[g_batch] = cum;
     b->n_windows = (uint32_t)g_batch;
@@ -247,12 +291,37 @@ static int gh_batch_fill(struct gh_batch *b, int slot, uint64_t k0,
     return 1;
 }
 
+/* Report one verified gap in `<gap> <merit> <startprime>` format. */
+static void gh_report_gap(FILE *out, uint64_t *gaps, double *best,
+                          uint64_t gap_u, double merit,
+                          const char *start_dec, const char *end_dec) {
+    fprintf(stderr,
+            "[GAP_HUNT] gap=%llu merit=%.6f start=%s end=%s\n",
+            (unsigned long long)gap_u, merit,
+            start_dec ? start_dec : "?",
+            end_dec ? end_dec : "?");
+    if (out) {
+        fprintf(out, "%llu %.6f %s\n",
+                (unsigned long long)gap_u, merit,
+                start_dec ? start_dec : "?");
+        fflush(out);
+    }
+    if (merit > *best)
+        *best = merit;
+    (*gaps)++;
+}
+
 /* Chain consecutive primes within each window of a collected flight,
    report every BPSW-verified gap with merit >= min_merit in the
    `<gap> <merit> <startprime>` format, and advance the counters.
-   Merit is the TRUE record merit: gap / ln(start). */
+   Merit is the TRUE record merit: gap / ln(start).
+   QUARTER_CLASS: only pairs inside the all-class back region are true
+   consecutive pairs (reported directly); every other qualifying pair is
+   resolved on demand — its interior is mini-sieved in the hidden classes
+   (CRT template as prefilter) and the emitted true gaps are reported. */
 static void gh_batch_process(struct gh_batch *b, const uint8_t *flags,
                              const struct gap_hunt_config *cfg,
+                             const struct gh_ctx *g,
                              uint64_t *windows,
                              uint64_t *gaps, double *best,
                              FILE *out, mpz_t p1, mpz_t p2,
@@ -261,39 +330,103 @@ static void gh_batch_process(struct gh_batch *b, const uint8_t *flags,
         /* Windows are P apart (NOT contiguous): chain only within the
            window; its first prime has an unknown predecessor. */
         *have_last = 0;
+        uint64_t prev_off = 0;
         for (uint32_t j = 0; j < b->count[i]; j++) {
             if (!flags[b->cum[i] + j])
                 continue;
+            uint64_t off = b->win_off[i][j];
             mpz_set(p1, b->win_base[i]);
-            mpz_add_ui(p1, p1, b->win_off[i][j]);
+            mpz_add_ui(p1, p1, off);
             if (*have_last) {
                 mpz_sub(p2, p1, last_prime);
                 /* True merit (record convention): gap / ln(start). */
                 double merit = mpz_get_d(p2) / log(mpz_get_d(last_prime));
-                if (merit >= cfg->min_merit &&
-                    baillie_psw_test(p1) && baillie_psw_test(last_prime)) {
-                    char *start_dec = mpz_get_str(NULL, 10, last_prime);
-                    char *end_dec = mpz_get_str(NULL, 10, p1);
-                    fprintf(stderr,
-                            "[GAP_HUNT] gap=%llu merit=%.6f start=%s end=%s\n",
-                            (unsigned long long)mpz_get_ui(p2), merit,
-                            start_dec ? start_dec : "?",
-                            end_dec ? end_dec : "?");
-                    if (out) {
-                        fprintf(out, "%llu %.6f %s\n",
-                                (unsigned long long)mpz_get_ui(p2), merit,
-                                start_dec ? start_dec : "?");
-                        fflush(out);
+                if (merit >= cfg->min_merit) {
+                    int direct = !g->quarter ||
+                        (prev_off < g->region_start &&
+                         off < g->region_start) ||
+                        (prev_off >= g->tail_start &&
+                         off >= g->tail_start);
+                    if (direct) {
+                        if (baillie_psw_test(p1) &&
+                            baillie_psw_test(last_prime)) {
+                            if (getenv("GAPDEBUG")) {
+                                fprintf(stderr,
+                                        "[GHDBG] k=%llu off_prev=%llu "
+                                        "off=%llu direct=1\n",
+                                        (unsigned long long)b->base_k[i],
+                                        (unsigned long long)prev_off,
+                                        (unsigned long long)off);
+                            }
+                            char *sd = mpz_get_str(NULL, 10, last_prime);
+                            char *ed = mpz_get_str(NULL, 10, p1);
+                            gh_report_gap(out, gaps, best,
+                                          (uint64_t)mpz_get_ui(p2), merit,
+                                          sd, ed);
+                            free(sd);
+                            free(ed);
+                        }
+                    } else {
+                        /* Visible pair over the covered region: resolve the
+                           hidden classes in the interior, BPSW the emitted
+                           endpoints, report the true gaps. */
+                        struct gap_result *res = NULL;
+                        uint32_t rc = 0;
+                        const struct halfclass_tpl *t =
+                            (g->quarter && b->base_even[i]) ? &g->tpl : NULL;
+                        if (halfclass_resolve_gap_ex(
+                                b->win_base[i], prev_off, off,
+                                g->owned_limit, cfg->min_merit,
+                                t, &res, &rc) && rc > 0) {
+                            if (getenv("GAPDEBUG")) {
+                                fprintf(stderr,
+                                        "[QHDBG] k=%llu base_even=%u "
+                                        "off_a=%llu off_b=%llu emitted=%u\n",
+                                        (unsigned long long)b->base_k[i],
+                                        (unsigned)b->base_even[i],
+                                        (unsigned long long)prev_off,
+                                        (unsigned long long)off, rc);
+                            }
+                            mpz_t rs, re;
+                            mpz_init(rs);
+                            mpz_init(re);
+                            for (uint32_t r = 0; r < rc; r++) {
+                                if (getenv("GAPDEBUG")) {
+                                    fprintf(stderr,
+                                            "[GHDBG] k=%llu off_p1=%llu "
+                                            "off_p2=%llu direct=0\n",
+                                            (unsigned long long)b->base_k[i],
+                                            (unsigned long long)res[r].offset_p1,
+                                            (unsigned long long)res[r].offset_p2);
+                                }
+                                mpz_set(rs, b->win_base[i]);
+                                mpz_add_ui(rs, rs, res[r].offset_p1);
+                                mpz_set(re, b->win_base[i]);
+                                mpz_add_ui(re, re, res[r].offset_p2);
+                                double tm =
+                                    (double)res[r].gap_length /
+                                    log(mpz_get_d(rs));
+                                if (baillie_psw_test(rs) &&
+                                    baillie_psw_test(re)) {
+                                    char *sd = mpz_get_str(NULL, 10, rs);
+                                    char *ed = mpz_get_str(NULL, 10, re);
+                                    gh_report_gap(out, gaps, best,
+                                                  res[r].gap_length, tm,
+                                                  sd, ed);
+                                    free(sd);
+                                    free(ed);
+                                }
+                            }
+                            mpz_clear(rs);
+                            mpz_clear(re);
+                            gap_detection_free_results(res);
+                        }
                     }
-                    if (merit > *best)
-                        *best = merit;
-                    (*gaps)++;
-                    free(start_dec);
-                    free(end_dec);
                 }
             }
             mpz_set(last_prime, p1);
             *have_last = 1;
+            prev_off = off;
         }
         (*windows)++;
     }
@@ -317,6 +450,12 @@ int gap_hunt_run(const struct gap_hunt_config *cfg) {
             if (v >= 1 && v <= GAP_HUNT_BATCH_MAX)
                 g_batch = v;
         }
+        const char *qv = getenv("GAP_HUNT_QUARTER");
+        if (qv && qv[0] && atoi(qv) > 0)
+            g_quarter = 1;
+        const char *km = getenv("GAP_HUNT_KMAX");
+        if (km && km[0])
+            g_kmax = strtoull(km, NULL, 10);
     }
 
     struct crt_runtime rt;
@@ -332,6 +471,23 @@ int gap_hunt_run(const struct gap_hunt_config *cfg) {
     if (back_limit & 1ULL)
         back_limit++;
     uint64_t interval = back_limit + rt.window;
+    {
+        /* Scan past the nominal window end: real gaps whose high endpoint
+           lies just beyond it are still found and reported (the boundary is
+           an artifact).  In quarter mode the extension also guarantees a
+           visible container for every in-window gap.  24·logbase ≈ 6 visible
+           spacings in the uncovered region. */
+        uint64_t ext = (uint64_t)(24.0 * logbase);
+        interval += ext;
+    }
+    if (g_quarter) {
+        halfclass_set_quarter(1);
+        if (!crt_runtime_build_template(&rt)) {
+            fprintf(stderr, "[GAP_HUNT] template build failed\n");
+            crt_runtime_free(&rt);
+            return 1;
+        }
+    }
     uint64_t odd_interval_size = interval >> 1;
 
     /* Anchor: default 2^(255+shift) — half the file's candidate width, so
@@ -453,11 +609,12 @@ int gap_hunt_run(const struct gap_hunt_config *cfg) {
 
     fprintf(stderr,
             "[GAP_HUNT] walk: shift=%u n_primes=%u P bits=%.0f window=%llu "
-            "sieve=%u batch=%d min_merit=%.6f k0=%llu device=%d\n",
+            "sieve=%u batch=%d quarter=%d kmax=%llu min_merit=%.6f k0=%llu "
+            "device=%d\n",
             rt.shift, rt.n_primes,
             (double)mpz_sizeinbase(P, 2),
-            (unsigned long long)rt.window, sieve_primes, g_batch,
-            cfg->min_merit,
+            (unsigned long long)rt.window, sieve_primes, g_batch, g_quarter,
+            (unsigned long long)g_kmax, cfg->min_merit,
             (unsigned long long)k, cfg->device);
 
     uint64_t windows = 0, gaps_reported = 0;
@@ -485,6 +642,18 @@ int gap_hunt_run(const struct gap_hunt_config *cfg) {
     mpz_init(g.wb);
     mpz_set(g.b0, b0);
     mpz_set(g.P, P);
+    g.quarter = g_quarter;
+    g.region_start = g_quarter ? back_limit : 0;
+    g.tail_start = back_limit + rt.window;
+    g.owned_limit = interval;   /* the whole scan is ours */
+    if (g_quarter) {
+        g.tpl.bits = rt.template;
+        g.tpl.words = rt.template_words;
+        g.tpl.base_off = (int64_t)back_limit;
+        g.tpl.window = rt.window;
+    } else {
+        memset(&g.tpl, 0, sizeof(g.tpl));
+    }
 
     for (int i = 0; i < g_batch; i++) {
         A.win_off[i] = offsets + (size_t)i * win_cap;
@@ -496,6 +665,8 @@ int gap_hunt_run(const struct gap_hunt_config *cfg) {
     uint64_t last_save = windows;
 
     while (!g_stop) {
+        if (g_kmax && next_k >= g_kmax)
+            g_stop = 1;
         /* Fill A (then B while A's MR is in flight). */
         if (!A.active && A.n_windows == 0) {
             if (!gh_batch_fill(&A, 0, next_k, &g)) {
@@ -506,7 +677,7 @@ int gap_hunt_run(const struct gap_hunt_config *cfg) {
             next_k += (uint64_t)g_batch;
             if (!A.active) {
                 /* Empty batch: nothing submitted; process immediately. */
-                gh_batch_process(&A, flags, cfg, &windows,
+                gh_batch_process(&A, flags, cfg, &g, &windows,
                                  &gaps_reported, &best_merit, out,
                                  p1, p2, last_prime, &have_last);
                 A.n_windows = 0;
@@ -534,7 +705,7 @@ int gap_hunt_run(const struct gap_hunt_config *cfg) {
                 fprintf(stderr, "[GAP_HUNT] GPU collect failed\n");
                 break;
             }
-            gh_batch_process(fl, flags, cfg, &windows,
+            gh_batch_process(fl, flags, cfg, &g, &windows,
                              &gaps_reported, &best_merit, out,
                              p1, p2, last_prime, &have_last);
             fl->active = 0;
@@ -556,14 +727,14 @@ int gap_hunt_run(const struct gap_hunt_config *cfg) {
     /* Drain the in-flight flights so no window is lost. */
     if (A.active) {
         if (gpu_fermat_collect(fermat, A.slot, flags, (size_t)A.total) >= 0)
-            gh_batch_process(&A, flags, cfg, &windows,
+            gh_batch_process(&A, flags, cfg, &g, &windows,
                              &gaps_reported, &best_merit, out,
                              p1, p2, last_prime, &have_last);
         A.active = 0;
     }
     if (B.active) {
         if (gpu_fermat_collect(fermat, B.slot, flags, (size_t)B.total) >= 0)
-            gh_batch_process(&B, flags, cfg, &windows,
+            gh_batch_process(&B, flags, cfg, &g, &windows,
                              &gaps_reported, &best_merit, out,
                              p1, p2, last_prime, &have_last);
         B.active = 0;

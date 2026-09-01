@@ -244,10 +244,11 @@ static int gh_batch_fill(struct gh_batch *b, int slot, uint64_t k0,
 
 /* Chain consecutive primes within each window of a collected flight,
    report every BPSW-verified gap with merit >= min_merit in the
-   `<gap> <merit> <startprime>` format, and advance the counters. */
+   `<gap> <merit> <startprime>` format, and advance the counters.
+   Merit is the TRUE record merit: gap / ln(start). */
 static void gh_batch_process(struct gh_batch *b, const uint8_t *flags,
                              const struct gap_hunt_config *cfg,
-                             double logbase, uint64_t *windows,
+                             uint64_t *windows,
                              uint64_t *gaps, double *best,
                              FILE *out, mpz_t p1, mpz_t p2,
                              mpz_t last_prime, int *have_last) {
@@ -262,7 +263,8 @@ static void gh_batch_process(struct gh_batch *b, const uint8_t *flags,
             mpz_add_ui(p1, p1, b->win_off[i][j]);
             if (*have_last) {
                 mpz_sub(p2, p1, last_prime);
-                double merit = mpz_get_d(p2) / logbase;
+                /* True merit (record convention): gap / ln(start). */
+                double merit = mpz_get_d(p2) / log(mpz_get_d(last_prime));
                 if (merit >= cfg->min_merit &&
                     baillie_psw_test(p1) && baillie_psw_test(last_prime)) {
                     char *start_dec = mpz_get_str(NULL, 10, last_prime);
@@ -488,7 +490,7 @@ int gap_hunt_run(const struct gap_hunt_config *cfg) {
             next_k += GAP_HUNT_BATCH;
             if (!A.active) {
                 /* Empty batch: nothing submitted; process immediately. */
-                gh_batch_process(&A, flags, cfg, logbase, &windows,
+                gh_batch_process(&A, flags, cfg, &windows,
                                  &gaps_reported, &best_merit, out,
                                  p1, p2, last_prime, &have_last);
                 A.n_windows = 0;
@@ -516,7 +518,7 @@ int gap_hunt_run(const struct gap_hunt_config *cfg) {
                 fprintf(stderr, "[GAP_HUNT] GPU collect failed\n");
                 break;
             }
-            gh_batch_process(fl, flags, cfg, logbase, &windows,
+            gh_batch_process(fl, flags, cfg, &windows,
                              &gaps_reported, &best_merit, out,
                              p1, p2, last_prime, &have_last);
             fl->active = 0;
@@ -538,14 +540,14 @@ int gap_hunt_run(const struct gap_hunt_config *cfg) {
     /* Drain the in-flight flights so no window is lost. */
     if (A.active) {
         if (gpu_fermat_collect(fermat, A.slot, flags, (size_t)A.total) >= 0)
-            gh_batch_process(&A, flags, cfg, logbase, &windows,
+            gh_batch_process(&A, flags, cfg, &windows,
                              &gaps_reported, &best_merit, out,
                              p1, p2, last_prime, &have_last);
         A.active = 0;
     }
     if (B.active) {
         if (gpu_fermat_collect(fermat, B.slot, flags, (size_t)B.total) >= 0)
-            gh_batch_process(&B, flags, cfg, logbase, &windows,
+            gh_batch_process(&B, flags, cfg, &windows,
                              &gaps_reported, &best_merit, out,
                              p1, p2, last_prime, &have_last);
         B.active = 0;

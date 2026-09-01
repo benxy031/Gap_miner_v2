@@ -155,3 +155,11 @@ updated).  Measured on the dev host (RTX 3070, shared with live mining):
 **802 win/s vs 480 synchronous (+67%)**; 10 s run: 501 gaps ≥ 8 merit,
 `test_gap_hunt` 501/501 exact (nextprime + BPSW); clean shutdown under
 `timeout -s TERM` with both flights drained.
+
+### 2026-09-01 (later) — true record merit
+
+GAP_HUNT now reports the **true record merit** `gap / ln(start)` instead of
+the miner's nominal protocol merit `gap / ln(2^(256+shift))` (they differ by
+~0.13% at shift507 — an external verifier flagged gap 11182 as
+21.1709 vs our 21.1431; gap and endpoints were correct).  The validator now
+also re-derives merit from each record's start and fails on any mismatch.

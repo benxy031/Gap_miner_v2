@@ -15,6 +15,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <math.h>
 #include <gmp.h>
 
 #include "../new_src/primality_bpsw.h"
@@ -60,6 +61,19 @@ int main(int argc, char *argv[]) {
         }
 
         mpz_add_ui(end, start, (unsigned long)gap);
+
+        /* True merit arithmetic: merit must equal gap / ln(start). */
+        {
+            double true_merit =
+                (double)gap / log(mpz_get_d(start));
+            if (fabs(merit - true_merit) > 0.002) {
+                fprintf(stderr,
+                        "line %d: FAIL merit %.4f != gap/ln(start) %.6f\n",
+                        lineno, merit, true_merit);
+                bad++;
+                continue;
+            }
+        }
 
         /* Exactness: the next prime after start must be exactly start + gap. */
         mpz_set(next, start);

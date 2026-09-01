@@ -201,7 +201,9 @@ period `P` (product of the cover primes), so every translate
 the same σ-conditioned gap distribution the miner exploits.  The walk uses
 the fused GPU pipeline (device sieve + CGBN MR, full-class) and reports every
 gap whose both endpoints are BPSW-verified and whose merit is at least
-`--gap-hunt-min-merit`.
+`--gap-hunt-min-merit`.  Merit is the **true record merit** `gap / ln(start)`
+(the prime-gap community convention, matching external verifiers) — NOT the
+miner's nominal `gap / ln(2^(256+shift))` protocol merit.
 
 Windows are `P` apart (not contiguous), so gaps are chained only within a
 window; the first prime of each window is skipped for gap measurement
@@ -247,7 +249,7 @@ for every record).
 | `--merit-records <path>` | `data/prime_gap_merits.txt` | Best-known-merit table used to flag `new_record=yes` |
 | `--gap-hunt` | off | Standalone record-hunting walk (requires `--crt-file` and a `WITH_CUDA=1` build; runs the walk and exits instead of starting the miner) |
 | `--gap-hunt-start <hex>` | `2^(255+shift)` | Base anchor for the walk (hex); default follows the CRT file's shift; CRT-aligned internally |
-| `--gap-hunt-min-merit <m>` | `15` | Report gaps with merit ≥ m |
+| `--gap-hunt-min-merit <m>` | `15` | Report gaps with merit ≥ m (true record merit `gap/ln(start)`) |
 | `--gap-hunt-state <path>` | none | Resume state file (k and diagnostic last prime) |
 | `--gap-hunt-out <path>` | none | Results file (`<gap> <merit> <startprime>` per line; stdout-only if unset) |
 | `--help` | — | Print the help message |

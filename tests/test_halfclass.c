@@ -456,6 +456,39 @@ int main(void) {
     parity_case_crt(1ULL << 24);
     parity_case_crt(1ULL << 28);
 
+    /* QUARTER_CLASS parity: 4 visible / 12 hidden classes.  The exact-set
+       equality must hold for the aggressive hiding too (the containment
+       lemma generalizes: every true qualifying gap is contained in a
+       visible qualifying gap regardless of how many classes are hidden). */
+    halfclass_set_quarter(1);
+    {
+        mpz_t base;
+        mpz_init_set_str(base,
+            "1684996666696914987166688442938726917102321526408785780068975640576",
+            10); /* ~2^220 */
+        mpz_setbit(base, 0);
+        parity_case(base, 6000, 4000, 2.5);
+        parity_case(base, 6000, 2000, 3.0);
+        parity_case(base, 6000, 4000, 1.2);   /* mass-stress the hidden resolution */
+        mpz_clear(base);
+    }
+    {
+        mpz_t base;
+        mpz_init_set_ui(base, 1);
+        mpz_mul_2exp(base, base, 310);
+        mpz_setbit(base, 200);
+        mpz_setbit(base, 0);
+        parity_case(base, 32768, 24576, 3.0);
+        parity_case(base, 32768, 24576, 2.0);
+        mpz_clear(base);
+    }
+    parity_case_crt(0);
+    parity_case_crt(1ULL << 16);
+    parity_case_crt(1ULL << 20);
+    parity_case_crt(1ULL << 24);
+    parity_case_crt(1ULL << 28);
+    halfclass_set_quarter(0);
+
     if (failures) {
         printf("test_halfclass FAILED (%d failures)\n", failures);
         return 1;

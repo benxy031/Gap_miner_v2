@@ -33,10 +33,20 @@ struct halfclass_tpl {
     uint64_t window;        /* template covers t in [1, window) */
 };
 
-/* The 60-bit mask of the visible classes {1,7,11,13,17,19,23,29} mod 60. */
+/* QUARTER_CLASS mode: shrink the visible set to 4 of the 16 coprime classes
+   ({1,7,11,13} mod 60) and hide the other 12.  By the containment lemma
+   every true qualifying gap is contained in a visible qualifying gap (a
+   hidden endpoint only enlarges the visible gap), so hiding more classes
+   never loses blocks -- it only shrinks the GPU MR load. */
+void halfclass_set_quarter(int on);
+
+/* The 60-bit mask of the visible classes mod 60: 8 classes
+   {1,7,11,13,17,19,23,29} by default, 4 classes {1,7,11,13} in
+   QUARTER_CLASS mode. */
 uint64_t halfclass_visible_mask(void);
 
-/* The 60-bit mask of the hidden classes {31,37,41,43,47,49,53,59} mod 60. */
+/* The 60-bit mask of the hidden classes mod 60: the complement of the
+   visible set within the 16 residue classes coprime to 60. */
 uint64_t halfclass_hidden_mask(void);
 
 /* base mod 60 for a non-CRT window: base = (h256 << shift) + window_start. */
@@ -74,6 +84,25 @@ int halfclass_resolve_gap_ex(mpz_t base, uint64_t off_a, uint64_t off_b,
                              double merit_threshold,
                              const struct halfclass_tpl *tpl,
                              struct gap_result **out, uint32_t *out_count);
+
+/* Hidden-class candidate collector: mini-sieve (primes <= sieve_cap) +
+   CRT template prefilter over the hidden classes in [bsub, bsub+interval).
+   Returns the surviving candidate offsets (relative to bsub, ascending)
+   with NO primality testing — the caller chooses the tester (GMP BPSW or a
+   GPU MR batch).  -1 on allocation failure; caller frees *out. */
+int64_t halfclass_collect_hidden_candidates(mpz_t bsub, uint64_t interval,
+                                            uint32_t sub_mod60, uint64_t abs_delta,
+                                            const struct halfclass_tpl *tpl,
+                                            uint32_t sieve_cap, uint64_t **out);
+
+/* Chain [off_a, off_a+hid..., off_b] and emit the merit-qualified,
+   first-endpoint-owned consecutive-prime pairs.  Shared by the CPU-only and
+   GPU-pre-filtered resolution paths.  Returns 1 on success (out/out_count
+   set, may be empty), 0 on internal failure. */
+int halfclass_emit_resolved(mpz_t base, uint64_t off_a, uint64_t off_b,
+                            const uint64_t *hid, int64_t hc,
+                            uint64_t owned_offset_limit, double merit_threshold,
+                            struct gap_result **out, uint32_t *out_count);
 
 int halfclass_verify_prefix_ex(mpz_t base, uint64_t off_v0,
                                int terminal_is_prime,

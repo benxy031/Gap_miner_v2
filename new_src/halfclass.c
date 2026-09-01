@@ -24,12 +24,30 @@ static uint64_t class_mask60(const uint8_t *vals, uint32_t n) {
     return mask;
 }
 
+/* QUARTER_CLASS mode: 4 visible / 12 hidden of the 16 coprime classes. */
+static int g_quarter_mode = 0;
+
+void halfclass_set_quarter(int on) { g_quarter_mode = on ? 1 : 0; }
+
 uint64_t halfclass_visible_mask(void) {
+    if (g_quarter_mode) {
+        static const uint8_t qvis[4] = { 1, 7, 11, 13 };
+        return class_mask60(qvis, 4);
+    }
     static const uint8_t vis[8] = { 1, 7, 11, 13, 17, 19, 23, 29 };
     return class_mask60(vis, 8);
 }
 
-uint64_t halfclass_hidden_mask(void) { return class_mask60(HID_MOD60, 8); }
+uint64_t halfclass_hidden_mask(void) {
+    if (g_quarter_mode) {
+        static const uint8_t qhid[12] =
+            { 17, 19, 23, 29, 31, 37, 41, 43, 47, 49, 53, 59 };
+        return class_mask60(qhid, 12);
+    }
+    return class_mask60(HID_MOD60, 8);
+}
+
+
 
 uint32_t halfclass_base_mod60(const uint8_t h256[32], uint32_t shift,
                               uint64_t window_start) {
@@ -121,19 +139,14 @@ static int halfclass_tpl_composite(const struct halfclass_tpl *tpl,
     return (int)((tpl->bits[slot >> 3] >> (slot & 7U)) & 1U);
 }
 
-/* Collect the hidden-class probable primes in [bsub, bsub+interval) as
-   offsets relative to bsub, ascending.  Returns the count via *out (malloc'd
-   array) or -1 on allocation failure.  Marks composites with the lazy prime
-   table (p <= 100k) before MR-testing survivors.  abs_delta is added to the
-   relative offsets to form absolute scan offsets for the optional CRT
-   template prefilter. */
-static int64_t halfclass_collect_hidden(mpz_t bsub, uint64_t interval,
-                                        uint32_t sub_mod60,
-                                        uint64_t abs_delta,
-                                        const struct halfclass_tpl *tpl,
-                                        int mr_reps,
-                                        uint32_t sieve_cap,
-                                        uint64_t **out) {
+/* Mini-sieve + template prefilter over the hidden classes in
+   [bsub, bsub+interval); returns the surviving candidate offsets (relative
+   to bsub, ascending) with NO primality testing. */
+static int64_t halfclass_collect_hidden_candidates_impl(
+    mpz_t bsub, uint64_t interval, uint32_t sub_mod60,
+    uint64_t abs_delta, const struct halfclass_tpl *tpl,
+    uint32_t sieve_cap, uint64_t **out)
+{
     *out = NULL;
     if (interval == 0) return 0;
 
@@ -159,32 +172,85 @@ static int64_t halfclass_collect_hidden(mpz_t bsub, uint64_t interval,
         }
     }
 
-    uint64_t hid_cap = (uint32_t)((interval / 60ULL) * 8ULL + 16ULL);
-    uint64_t *hid =
-        (uint64_t *)malloc((size_t)hid_cap * sizeof(uint64_t));
-    if (!hid) {
+    /* Upper bound: every hidden-class offset in the interval.  Guarantees
+       no candidate is ever silently dropped (a dropped interior prime
+       would fabricate a false gap). */
+    uint64_t cap_off =
+        (uint32_t)((interval / 60ULL) *
+                       (uint64_t)__builtin_popcountll(halfclass_hidden_mask()) +
+                   16ULL);
+    uint64_t *cand = (uint64_t *)malloc((size_t)cap_off * sizeof(uint64_t));
+    if (!cand) {
         free(bits);
         return -1;
     }
-    uint32_t hid_count = 0;
+    uint32_t cnt = 0;
     uint64_t hmask = halfclass_hidden_mask();
-    mpz_t c;
-    mpz_init(c);
     for (uint64_t off = 0; off < interval; off++) {
         uint32_t v = (uint32_t)((sub_mod60 + (off % 60ULL)) % 60ULL);
         if (!((hmask >> v) & 1U)) continue;
         if (bits && ((bits[off >> 6] >> (off & 63U)) & 1U)) continue;
         if (halfclass_tpl_composite(tpl, abs_delta + off)) continue;
+        cand[cnt++] = off;
+    }
+    free(bits);
+    *out = cand;
+    return (int64_t)cnt;
+}
+
+int64_t halfclass_collect_hidden_candidates(mpz_t bsub, uint64_t interval,
+                                            uint32_t sub_mod60, uint64_t abs_delta,
+                                            const struct halfclass_tpl *tpl,
+                                            uint32_t sieve_cap, uint64_t **out)
+{
+    return halfclass_collect_hidden_candidates_impl(
+        bsub, interval, sub_mod60, abs_delta, tpl, sieve_cap, out);
+}
+
+/* Collect the hidden-class probable primes in [bsub, bsub+interval) as
+   offsets relative to bsub, ascending.  Returns the count via *out (malloc'd
+   array) or -1 on allocation failure.  Marks composites with the lazy prime
+   table (p <= 100k) before MR-testing survivors.  abs_delta is added to the
+   relative offsets to form absolute scan offsets for the optional CRT
+   template prefilter. */
+static int64_t halfclass_collect_hidden(mpz_t bsub, uint64_t interval,
+                                        uint32_t sub_mod60,
+                                        uint64_t abs_delta,
+                                        const struct halfclass_tpl *tpl,
+                                        int mr_reps,
+                                        uint32_t sieve_cap,
+                                        uint64_t **out) {
+    *out = NULL;
+    uint64_t *cand = NULL;
+    int64_t nc = halfclass_collect_hidden_candidates_impl(
+        bsub, interval, sub_mod60, abs_delta, tpl, sieve_cap, &cand);
+    if (nc < 0) return -1;
+
+    uint64_t *hid =
+        (uint64_t *)malloc((size_t)(nc > 0 ? nc : 1) * sizeof(uint64_t));
+    if (!hid) {
+        free(cand);
+        return -1;
+    }
+    uint32_t hid_count = 0;
+    mpz_t c;
+    mpz_init(c);
+    for (int64_t i = 0; i < nc; i++) {
         mpz_set(c, bsub);
-        mpz_add_ui(c, c, off);
+        mpz_add_ui(c, c, cand[i]);
         if (mpz_probab_prime_p(c, mr_reps) >= 1) {
-            if (hid_count < hid_cap) {
-                hid[hid_count++] = off;
-            }
+            hid[hid_count++] = cand[i];
         }
     }
     mpz_clear(c);
-    free(bits);
+    free(cand);
+    if (getenv("GAPDEBUG")) {
+        fprintf(stderr,
+                "[HIDDBG] resolve interval=%llu abs_delta=%llu tested=%lld found=%u\n",
+                (unsigned long long)interval,
+                (unsigned long long)abs_delta,
+                (long long)nc, hid_count);
+    }
     *out = hid;
     return (int64_t)hid_count;
 }
@@ -241,6 +307,30 @@ uint32_t halfclass_emit_chain(mpz_t base, const uint64_t *chain,
                                      out);
 }
 
+int halfclass_emit_resolved(mpz_t base, uint64_t off_a, uint64_t off_b,
+                            const uint64_t *hid, int64_t hc,
+                            uint64_t owned_offset_limit, double merit_threshold,
+                            struct gap_result **out, uint32_t *out_count) {
+    *out = NULL;
+    *out_count = 0;
+    if (off_b <= off_a || !base) return 1;
+
+    /* Chain: off_a, hid (absolute), off_b. */
+    uint64_t *chain =
+        (uint64_t *)malloc((size_t)(hc + 2) * sizeof(uint64_t));
+    if (!chain)
+        return 0;
+    chain[0] = off_a;
+    for (int64_t i = 0; i < hc; i++) chain[i + 1] = off_a + hid[i];
+    chain[hc + 1] = off_b;
+
+    *out_count = halfclass_emit_chain_impl(base, chain, (uint32_t)(hc + 2),
+                                           owned_offset_limit,
+                                           merit_threshold, out);
+    free(chain);
+    return 1;
+}
+
 int halfclass_resolve_gap_ex(mpz_t base, uint64_t off_a, uint64_t off_b,
                              uint64_t owned_offset_limit,
                              double merit_threshold,
@@ -267,23 +357,11 @@ int halfclass_resolve_gap_ex(mpz_t base, uint64_t off_a, uint64_t off_b,
     mpz_clear(bsub);
     if (hc < 0) return 0;
 
-    /* Chain: off_a, hid (absolute), off_b. */
-    uint64_t *chain =
-        (uint64_t *)malloc((size_t)(hc + 2) * sizeof(uint64_t));
-    if (!chain) {
-        free(hid);
-        return 0;
-    }
-    chain[0] = off_a;
-    for (int64_t i = 0; i < hc; i++) chain[i + 1] = off_a + hid[i];
-    chain[hc + 1] = off_b;
+    int rc = halfclass_emit_resolved(base, off_a, off_b, hid, hc,
+                                     owned_offset_limit, merit_threshold,
+                                     out, out_count);
     free(hid);
-
-    *out_count = halfclass_emit_chain_impl(base, chain, (uint32_t)(hc + 2),
-                                           owned_offset_limit,
-                                           merit_threshold, out);
-    free(chain);
-    return 1;
+    return rc;
 }
 
 int halfclass_resolve_gap(mpz_t base, uint64_t off_a, uint64_t off_b,

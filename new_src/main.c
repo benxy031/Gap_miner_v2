@@ -34,6 +34,7 @@
 #include "merit_records.h"
 #include "record_log.h"
 #include "crt_runtime.h"
+#include "halfclass.h"
 #include "gap_dist.h"
 #ifdef WITH_CUDA
 #include "gpu/gpu_fermat.h"
@@ -327,6 +328,19 @@ int main(int argc, char *argv[]) {
                crt_mode ? "via CRT covering template" : "mini-sieve");
     }
 
+    /* QUARTER_CLASS: hide 12 of the 16 coprime classes (visible = 4).
+       Generalizes HALF_CLASS; implies it.  The containment lemma guarantees
+       no true qualifying gap is lost, so the GPU MR load halves while the
+       blocks-per-window yield stays identical. */
+    if (main_env_enabled("QUARTER_CLASS")) {
+        halfclass_set_quarter(1);
+        half_class_active = 1;
+        gap_dist_set_enabled(0);
+        printf("[Main] QUARTER_CLASS scan active: visible classes "
+               "{1,7,11,13} mod 60 only (12 hidden verified on demand); "
+               "gap-dist health disabled\n");
+    }
+
     uint32_t owned_window_size = non_crt_owned_window_size(user_shift);
 
     /* Non-CRT GPU: the CGBN MR kernel is the bottleneck and sieve survivors
@@ -360,13 +374,14 @@ int main(int argc, char *argv[]) {
        Keep the shallow 100K default for the hybrid H2D GPU path: the GPU MR
        test is the bottleneck and smart-scan already trims candidates.  The
        fused pipeline (FUSED_GPU=1) computes residues + marking + extraction
-       entirely on-device; measured optimum there is 1M primes (shift258:
-       1M=3106 vs 5M=2814 win/s, +10.4%; shift509: 1M=1971 vs 5M=1905, +3.5%.
-       Deeper than 1M costs more GPU marking time than the MR savings of the
-       shrinking survivor set). */
+       entirely on-device; the measured optimum is 2M primes on the
+       production host (shift475 live merit: 500K=3183, 1M=3197, 2M=3324,
+       5M=3205 win/s; older dev-host runs: 1M=3106 vs 5M=2814 at shift258,
+       1M=1971 vs 5M=1905 at shift509).  Deeper than 2M costs more GPU
+       marking time than the MR savings of the shrinking survivor set). */
     if (!sieve_primes_overridden && crt_mode) {
         if (enable_gpu_fermat) {
-            sieve_primes = main_env_enabled("FUSED_GPU") ? 1000000 : 100000;
+            sieve_primes = main_env_enabled("FUSED_GPU") ? 2000000 : 100000;
         } else {
             sieve_primes = 10000000;
         }

@@ -20,6 +20,8 @@
 #include <stdatomic.h>
 #include <gmp.h>
 #include "atomic_nonce.h"
+#include "gap_detection.h"   /* struct gap_result */
+#include "halfclass.h"       /* struct halfclass_tpl */
 
 #define NON_CRT_MIN_WINDOW_SHIFT 12U
 #define NON_CRT_MAX_WINDOW_SHIFT 20U
@@ -120,5 +122,18 @@ void worker_set_gpu_fermat_enabled(int enabled);
 
 /* Reset nonce counter for new block (Phase 6) */
 void worker_reset_nonce_counter(void);
+
+#ifdef WITH_CUDA
+struct gpu_fermat_ctx;
+
+/* GPU-side hidden-class resolution (exposed for the exactness test):
+   mini-sieve + template on the host, base-2+3 MR batch on the GPU, BPSW only
+   on the MR survivors.  Falls back to the CPU-only resolution on failure. */
+int crt_gpu_resolve_gap_ex(struct gpu_fermat_ctx *fermat, int slot,
+                           mpz_t window_base, uint64_t off_a, uint64_t off_b,
+                           uint64_t owned_offset_limit, double merit_threshold,
+                           const struct halfclass_tpl *tpl,
+                           struct gap_result **out, uint32_t *out_count);
+#endif /* WITH_CUDA */
 
 #endif /* WORKER_GPU_H */

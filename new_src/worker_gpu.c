@@ -37,6 +37,14 @@
 #include <math.h>
 #include <time.h>
 
+/* Editor/IntelliSense fallback: GPU_NLIMBS normally arrives from the
+   Makefile (-DGPU_NLIMBS=20).  The #ifndef guard is idempotent with the
+   command-line define and with gpu_fermat.h's own guard, so compiled
+   behavior is unchanged. */
+#ifndef GPU_NLIMBS
+#define GPU_NLIMBS 16
+#endif
+
 /* CPU limb-based Euler–Plumb test with a per-window limb cache.
  *
  * Candidate = base + offset with ascending offsets inside a window, so the
@@ -1142,8 +1150,8 @@ void *worker_thread_run(void *arg) {
        the hidden classes are verified on demand when a visible gap exceeds
        the threshold. */
     int half_class = 0;
-    const char *half_class_env = getenv("HALF_CLASS");
-    if (worker_env_enabled(half_class_env)) {
+    if (worker_env_enabled(getenv("HALF_CLASS")) ||
+        worker_env_enabled(getenv("QUARTER_CLASS"))) {
         half_class = 1;
         fprintf(stderr,
                 "[Worker %u] HALF_CLASS scan: visible classes {1,7,11,13,17,19,23,29} mod 60; hidden classes verified on demand\n",
@@ -1572,7 +1580,9 @@ static void crt_scan_gaps(uint32_t worker_id, uint32_t height, uint32_t nonce,
                           const uint8_t *is_prime,
                           const uint64_t *candidate_offsets,
                           uint32_t tested_count, uint64_t owned_limit,
-                          int half_class);
+                          int half_class,
+                          struct gpu_fermat_ctx *resolve_fermat,
+                          int resolve_slot);
 
 /* Stage 1 (launch side): mark all primes on-device into bitmap buf, extract
    the head (or the full window when the closing range is empty) in ascending
@@ -1838,7 +1848,7 @@ static int crt_fused_collect_batch(struct gpu_sieve_ctx *gpu_sieve,
                       fl->merit_threshold, rt, wv->window_base, wv->nadd0,
                       fl->back_limit, p1, p2, nadd_full,
                       win_ip_ptr, win_off_ptr, tested, owned_limit,
-                      fl->half_class);
+                      fl->half_class, fermat, fl->slot);
         head_cum += head_count;
     }
     free(tail_off);
@@ -1846,6 +1856,112 @@ static int crt_fused_collect_batch(struct gpu_sieve_ctx *gpu_sieve,
     free(win_off);
     free(win_ip);
     return 1;
+}
+#endif /* WITH_CUDA */
+
+/* GPU-side hidden-class resolution: mini-sieve + template prefilter on the
+   host, base-2+3 MR batch on the GPU, BPSW only on the MR survivors.  MR has
+   no false negatives (a real prime always passes), so the emitted set is
+   identical to the CPU-only path; a composite survivor only wastes one BPSW
+   call.  Falls back to the CPU-only resolution on GPU failure. */
+#ifdef WITH_CUDA
+int crt_gpu_resolve_gap_ex(struct gpu_fermat_ctx *fermat, int slot,
+                                  mpz_t window_base, uint64_t off_a,
+                                  uint64_t off_b, uint64_t owned_offset_limit,
+                                  double merit_threshold,
+                                  const struct halfclass_tpl *tpl,
+                                  struct gap_result **out, uint32_t *out_count)
+{
+    *out = NULL;
+    *out_count = 0;
+    if (!fermat || off_b <= off_a || !window_base) return 1;
+
+    uint64_t interval = off_b - off_a;
+    uint32_t base_mod60 = (uint32_t)mpz_fdiv_ui(window_base, 60);
+    uint32_t sub_mod60 = (uint32_t)((base_mod60 + (off_a % 60ULL)) % 60ULL);
+
+    mpz_t bsub;
+    mpz_init(bsub);
+    mpz_set(bsub, window_base);
+    mpz_add_ui(bsub, bsub, off_a);
+
+    uint64_t *cand = NULL;
+    int64_t nc = halfclass_collect_hidden_candidates(bsub, interval, sub_mod60,
+                                                     off_a, tpl, 10000, &cand);
+    if (nc < 0) {
+        mpz_clear(bsub);
+        return 0;
+    }
+
+    uint64_t *hid = NULL;
+    uint32_t hid_count = 0;
+    int ok = 1;
+    /* The submit path strides candidates by the context's ACTIVE limb
+       count (set per shift), NOT by GPU_NLIMBS.  Using GPU_NLIMBS here
+       interleaves garbage into the MR inputs and silently drops interior
+       primes — the false-gap bug. */
+    int rl = gpu_fermat_get_limbs(fermat);
+    if (nc > 0) {
+        uint64_t *limb_buf = NULL;
+        uint8_t *flags = NULL;
+        if (rl >= 4) {
+            limb_buf = (uint64_t *)malloc(
+                (size_t)nc * (size_t)rl * sizeof(uint64_t));
+            flags = (uint8_t *)malloc((size_t)nc);
+        }
+        hid = (uint64_t *)malloc((size_t)nc * sizeof(uint64_t));
+        mpz_t c;
+        mpz_init(c);
+        if (!limb_buf || !flags || !hid) {
+            ok = 0;
+        } else {
+            for (int64_t i = 0; i < nc; i++) {
+                mpz_set(c, bsub);
+                mpz_add_ui(c, c, cand[i]);
+                uint64_t *limbs = limb_buf + (size_t)i * (size_t)rl;
+                memset(limbs, 0, (size_t)rl * sizeof(uint64_t));
+                size_t cnt = 0;
+                mpz_export(limbs, &cnt, -1, sizeof(uint64_t), 0, 0, c);
+            }
+            if (gpu_fermat_submit(fermat, slot, limb_buf, (size_t)nc) != 0 ||
+                gpu_fermat_collect(fermat, slot, flags, (size_t)nc) < 0) {
+                ok = 0;
+            } else {
+                for (int64_t i = 0; i < nc; i++) {
+                    if (!flags[i]) continue;
+                    mpz_set(c, bsub);
+                    mpz_add_ui(c, c, cand[i]);
+                    if (mpz_probab_prime_p(c, 15) >= 1) {
+                        hid[hid_count++] = cand[i];
+                    }
+                }
+            }
+        }
+        mpz_clear(c);
+        free(limb_buf);
+        free(flags);
+    }
+    if (getenv("GAPDEBUG")) {
+        fprintf(stderr,
+                "[HIDDBG] gpu resolve interval=%llu abs_delta=%llu tested=%lld found=%u%s\n",
+                (unsigned long long)interval,
+                (unsigned long long)off_a,
+                (long long)nc, hid_count, ok ? "" : " [FALLBACK]");
+    }
+    free(cand);
+    mpz_clear(bsub);
+
+    if (!ok) {
+        free(hid);
+        return halfclass_resolve_gap_ex(window_base, off_a, off_b,
+                                        owned_offset_limit, merit_threshold,
+                                        tpl, out, out_count);
+    }
+    int rc = halfclass_emit_resolved(window_base, off_a, off_b, hid,
+                                     (int64_t)hid_count, owned_offset_limit,
+                                     merit_threshold, out, out_count);
+    free(hid);
+    return rc;
 }
 #endif /* WITH_CUDA */
 
@@ -1862,7 +1978,9 @@ static void crt_scan_gaps(uint32_t worker_id, uint32_t height, uint32_t nonce,
                           const uint8_t *is_prime,
                           const uint64_t *candidate_offsets,
                           uint32_t tested_count, uint64_t owned_limit,
-                          int half_class)
+                          int half_class,
+                          struct gpu_fermat_ctx *resolve_fermat,
+                          int resolve_slot)
 {
     struct gap_result *gaps = NULL;
     uint32_t gap_count = 0;
@@ -1949,11 +2067,24 @@ static void crt_scan_gaps(uint32_t worker_id, uint32_t height, uint32_t nonce,
                     if (term_merit >= merit_threshold) {
                         struct gap_result *sub = NULL;
                         uint32_t sub_count = 0;
-                        if (!halfclass_resolve_gap_ex(
+                        int sub_rc;
+#ifdef WITH_CUDA
+                        if (resolve_fermat) {
+                            sub_rc = crt_gpu_resolve_gap_ex(
+                                resolve_fermat, resolve_slot, window_base,
+                                chain[cl - 1], vis_off[first_vis],
+                                owned_limit, merit_threshold, &tpl,
+                                &sub, &sub_count);
+                        } else
+#endif
+                        {
+                            sub_rc = halfclass_resolve_gap_ex(
                                 window_base, chain[cl - 1],
                                 vis_off[first_vis],
                                 owned_limit, merit_threshold, &tpl,
-                                &sub, &sub_count)) {
+                                &sub, &sub_count);
+                        }
+                        if (!sub_rc) {
                             dropped++;
                         } else if (sub_count > 0) {
                             struct gap_result *grown =
@@ -2006,10 +2137,23 @@ static void crt_scan_gaps(uint32_t worker_id, uint32_t height, uint32_t nonce,
         for (uint32_t i = 0; i < gap_count; i++) {
             struct gap_result *sub = NULL;
             uint32_t sub_count = 0;
-            if (!halfclass_resolve_gap_ex(window_base, gaps[i].offset_p1,
-                                          gaps[i].offset_p2, owned_limit,
-                                          merit_threshold, &tpl,
-                                          &sub, &sub_count)) {
+            int sub_rc;
+#ifdef WITH_CUDA
+            if (resolve_fermat) {
+                sub_rc = crt_gpu_resolve_gap_ex(
+                    resolve_fermat, resolve_slot, window_base,
+                    gaps[i].offset_p1, gaps[i].offset_p2, owned_limit,
+                    merit_threshold, &tpl, &sub, &sub_count);
+            } else
+#endif
+            {
+                sub_rc = halfclass_resolve_gap_ex(
+                    window_base, gaps[i].offset_p1,
+                    gaps[i].offset_p2, owned_limit,
+                    merit_threshold, &tpl,
+                    &sub, &sub_count);
+            }
+            if (!sub_rc) {
                 dropped++;
                 continue;
             }
@@ -2064,7 +2208,7 @@ static void crt_scan_gaps(uint32_t worker_id, uint32_t height, uint32_t nonce,
         static int gapdebug = -1;
         if (gapdebug < 0)
             gapdebug = getenv("GAPDEBUG") != NULL;
-        if (gapdebug && half_class) {
+        if (gapdebug) {
             uint32_t wbm60 = (uint32_t)mpz_fdiv_ui(window_base, 60);
             fprintf(stderr,
                     "[GAPDEBUG] window_base mod60=%u pre_n=%u vis_count=%u\n",
@@ -2219,13 +2363,14 @@ void *worker_thread_run_crt(void *arg) {
     double logbase = (256.0 + (double)rt->shift) * log(2.0);
 
     int half_class = 0;
-    const char *half_class_env = getenv("HALF_CLASS");
-    if (worker_env_enabled(half_class_env)) {
+    if (worker_env_enabled(getenv("HALF_CLASS")) ||
+        worker_env_enabled(getenv("QUARTER_CLASS"))) {
         half_class = 1;
         printf("[Worker %u] HALF_CLASS scan: visible classes "
                "{1,7,11,13,17,19,23,29} mod 60; hidden classes verified via "
                "CRT template on demand\n", worker_id);
     }
+    int quarter_mode = worker_env_enabled(getenv("QUARTER_CLASS"));
 
     printf("[Worker %u] CRT mode: n_primes=%u shift=%u gap_target=%llu "
            "design_merit=%.2f logbase=%.1f\n",
@@ -2541,6 +2686,13 @@ void *worker_thread_run_crt(void *arg) {
                                        sizeof(uint64_t), 0, 0, window_base);
                             uint64_t head_end_v =
                                 back_limit + rt->gap_target;
+                            /* QUARTER_CLASS: visible primes are ~2x rarer,
+                               so the closing range [need_off, head_end) must
+                               be ~2.5 visible spacings longer or the tail
+                               re-mark would run on ~1/3 of windows. */
+                            if (quarter_mode) {
+                                head_end_v += (uint64_t)(12.0 * logbase);
+                            }
                             uint64_t need_off_v =
                                 back_limit + needed_gap;
                             int split_v =
@@ -2896,7 +3048,7 @@ void *worker_thread_run_crt(void *arg) {
                                       merit_threshold, rt, window_base, nadd0,
                                       back_limit, p1, p2, nadd_full,
                                       is_prime, candidate_offsets, tested_count,
-                                      owned_limit, half_class);
+                                      owned_limit, half_class, NULL, 0);
                     }
                 }
             }

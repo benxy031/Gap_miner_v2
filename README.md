@@ -205,8 +205,11 @@ gap whose both endpoints are BPSW-verified and whose merit is at least
 
 Windows are `P` apart (not contiguous), so gaps are chained only within a
 window; the first prime of each window is skipped for gap measurement
-(unknown predecessor).  State is written to `--gap-hunt-state` every 1024
-windows and on `SIGINT`/`SIGTERM`; `k` resumes from the state file.
+(unknown predecessor).  Windows accumulate into **K=8 async MR batches**
+with two alternating flights: the host processes one collected batch while
+the GPU runs the next flight's MR kernel (measured on the dev host: **802
+win/s vs 480 synchronous, +67%**).  State is written to `--gap-hunt-state`
+every 1024 windows and on `SIGINT`/`SIGTERM`; `k` resumes from the state file.
 
 ```bash
 # Requires WITH_CUDA=1 build (the same binary as the miner)
@@ -217,9 +220,9 @@ windows and on `SIGINT`/`SIGTERM`; `k` resumes from the state file.
     --gap-hunt-out data/gap_hunt_records.txt
 ```
 
-Each out record is `k start gap merit` (one per line).  Validate with
-`bin/test_gap_hunt <out-file>` (checks `nextprime(start) == start + gap` for
-every record).
+Each out record is `<gap> <merit> <startprime>` (one per line).  Validate
+with `bin/test_gap_hunt <out-file>` (checks `nextprime(start) == start + gap`
+for every record).
 
 ## CLI reference
 
@@ -243,7 +246,7 @@ every record).
 | `--gap-hunt-start <hex>` | `2^762` | Base anchor for the walk (hex); CRT-aligned internally |
 | `--gap-hunt-min-merit <m>` | `15` | Report gaps with merit ≥ m |
 | `--gap-hunt-state <path>` | none | Resume state file (k and diagnostic last prime) |
-| `--gap-hunt-out <path>` | none | Results file (`k start gap merit` per line; stdout-only if unset) |
+| `--gap-hunt-out <path>` | none | Results file (`<gap> <merit> <startprime>` per line; stdout-only if unset) |
 | `--help` | — | Print the help message |
 
 Environment variables:

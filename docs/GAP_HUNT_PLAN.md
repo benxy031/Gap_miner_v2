@@ -141,6 +141,17 @@ Two lessons recorded (see AGENTS-adjacent memory):
    Fixed with persistent `sigaction(SA_RESTART)` handlers.  Clean shutdown
    now saves final state under `timeout -s TERM`.
 
-Next: M3 A/B vs prime-gap (24h, acceptance criteria in §6.2).  Optional
-M1.5: K-window async accumulation (GPU_MR_BATCH-style batching; plan
-documents the expected throughput gain).
+Next: M3 A/B vs prime-gap (24h, acceptance criteria in §6.2).
+
+### 2026-09-01 (later) — M1.5 DONE (K-window async MR batches)
+
+Replaced the synchronous per-window pipeline with K=8 accumulated MR batches:
+windows pack contiguously into the slot's device candidate buffer
+(`gpu_sieve_extract_pack_device_range_ex` with `slot_base` prefix sums) and
+one `gpu_fermat_submit_device` per flight; two flights alternate so host gap
+scanning overlaps the other flight's MR kernel.  Out format changed to
+`<gap> <merit> <startprime>` (k lives in state + progress lines; validator
+updated).  Measured on the dev host (RTX 3070, shared with live mining):
+**802 win/s vs 480 synchronous (+67%)**; 10 s run: 501 gaps ≥ 8 merit,
+`test_gap_hunt` 501/501 exact (nextprime + BPSW); clean shutdown under
+`timeout -s TERM` with both flights drained.

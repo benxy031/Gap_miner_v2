@@ -6,11 +6,10 @@
  *
  * Usage: test_gap_hunt <out-file> [bpsw]
  *
- * For every record `k start gap merit`:
+ * For every record `<gap> <merit> <startprime>`:
  *   1. gap == end - start where end = start + gap  (trivial identity, sanity)
  *   2. mpz_nextprime(start) == end                 (exactness: the gap is real)
  *   3. optional `bpsw`: both endpoints pass baillie_psw_test
- *   4. k values are non-decreasing (stream order)
  */
 
 #include <stdio.h>
@@ -35,8 +34,6 @@ int main(int argc, char *argv[]) {
     mpz_t start, end, next;
     mpz_inits(start, end, next, NULL);
     char buf[1024];
-    unsigned long long prev_k = 0;
-    int have_prev = 0;
     unsigned long long checked = 0, bad = 0;
     int lineno = 0;
 
@@ -44,17 +41,15 @@ int main(int argc, char *argv[]) {
         lineno++;
         if (buf[0] == '#' || buf[0] == '\n')
             continue;
-        unsigned long long k, gap;
+        unsigned long long gap;
         double merit;
-        char kstr[64], startstr[512], gapstr[64], meritstr[64];
-        int n = sscanf(buf, "%63s %511s %63s %63s",
-                       kstr, startstr, gapstr, meritstr);
-        if (n != 4) {
+        char gapstr[64], meritstr[64], startstr[512];
+        int n = sscanf(buf, "%63s %63s %511s", gapstr, meritstr, startstr);
+        if (n != 3) {
             fprintf(stderr, "line %d: malformed (%d fields)\n", lineno, n);
             bad++;
             continue;
         }
-        k = strtoull(kstr, NULL, 10);
         gap = strtoull(gapstr, NULL, 10);
         merit = atof(meritstr);
         (void)merit;
@@ -63,12 +58,6 @@ int main(int argc, char *argv[]) {
             bad++;
             continue;
         }
-        if (have_prev && k < prev_k) {
-            fprintf(stderr, "line %d: k out of order\n", lineno);
-            bad++;
-        }
-        prev_k = k;
-        have_prev = 1;
 
         mpz_add_ui(end, start, (unsigned long)gap);
 

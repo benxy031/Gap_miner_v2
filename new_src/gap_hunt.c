@@ -317,7 +317,9 @@ int gap_hunt_run(const struct gap_hunt_config *cfg) {
     uint64_t interval = back_limit + rt.window;
     uint64_t odd_interval_size = interval >> 1;
 
-    /* Anchor: 2^762 (or --gap-hunt-start), CRT-aligned. */
+    /* Anchor: default 2^(255+shift) — half the file's candidate width, so
+       merit uses the file-consistent logbase.  Override with
+       --gap-hunt-start (any hex anchor works; alignment is recomputed). */
     mpz_t target, b0, P, p1, p2, last_prime;
     mpz_init(target);
     if (cfg->start_hex && cfg->start_hex[0]) {
@@ -328,7 +330,7 @@ int gap_hunt_run(const struct gap_hunt_config *cfg) {
         }
     } else {
         mpz_set_ui(target, 1);
-        mpz_mul_2exp(target, target, 762);
+        mpz_mul_2exp(target, target, 255U + rt.shift);
     }
     mpz_inits(b0, P, p1, p2, last_prime, NULL);
     mpz_set(P, rt.primorial);

@@ -246,7 +246,7 @@ for every record).
 | `--record-log <path>` | `gapminer_records.log` | Log every BPSW-verified candidate with full parameters |
 | `--merit-records <path>` | `data/prime_gap_merits.txt` | Best-known-merit table used to flag `new_record=yes` |
 | `--gap-hunt` | off | Standalone record-hunting walk (requires `--crt-file` and a `WITH_CUDA=1` build; runs the walk and exits instead of starting the miner) |
-| `--gap-hunt-start <hex>` | `2^762` | Base anchor for the walk (hex); CRT-aligned internally |
+| `--gap-hunt-start <hex>` | `2^(255+shift)` | Base anchor for the walk (hex); default follows the CRT file's shift; CRT-aligned internally |
 | `--gap-hunt-min-merit <m>` | `15` | Report gaps with merit ≥ m |
 | `--gap-hunt-state <path>` | none | Resume state file (k and diagnostic last prime) |
 | `--gap-hunt-out <path>` | none | Results file (`<gap> <merit> <startprime>` per line; stdout-only if unset) |

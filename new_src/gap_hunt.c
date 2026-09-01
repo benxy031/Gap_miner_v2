@@ -4,10 +4,10 @@
  *
  * GAP_HUNT implementation (see gap_hunt.h for the design).
  *
- * M1.5: K-window accumulated MR batches (GAP_HUNT_BATCH windows per
- * gpu_fermat_submit_device call, two alternating flights so the host
- * processes one collected batch while the GPU runs the next).  Out format:
- * `<gap> <merit> <startprime>` per line.
+ * M1.5: K-window accumulated MR batches (GAP_HUNT_BATCH env, default 8,
+ * max GAP_HUNT_BATCH_MAX windows per gpu_fermat_submit_device call, two
+ * alternating flights so the host processes one collected batch while the
+ * GPU runs the next).  Out format: `<gap> <merit> <startprime>` per line.
  */
 
 /* POSIX sigaction/sigemptyset under -std=c99 */
@@ -136,23 +136,24 @@ static int load_state(const char *path, uint64_t *k, mpz_t last_prime,
 }
 
 /* ── M1.5: K-window accumulated MR batches ──────────────────────────────
-   One flight = GAP_HUNT_BATCH windows marked into ping-pong bitmaps and
-   packed contiguously into the slot's device candidate buffer, then ONE
-   async MR submission.  Two flights alternate: while the host processes
-   the collected flight, the GPU runs the other flight's MR kernel. */
+   One flight = K windows marked into ping-pong bitmaps and packed
+   contiguously into the slot's device candidate buffer, then ONE async MR
+   submission.  Two flights alternate: while the host processes the
+   collected flight, the GPU runs the other flight's MR kernel. */
 
-#define GAP_HUNT_BATCH 8
+#define GAP_HUNT_BATCH_MAX 16
+static int g_batch = 16;       /* GAP_HUNT_BATCH env, clamped 1..MAX */
 
 struct gh_batch {
     int active;                 /* submitted, not yet collected */
     int slot;                   /* fermat slot + candidate buffer (0/1) */
     uint32_t n_windows;
     uint32_t total;             /* MR candidates in the batch */
-    uint64_t base_k[GAP_HUNT_BATCH];
-    uint32_t count[GAP_HUNT_BATCH];
-    uint32_t cum[GAP_HUNT_BATCH + 1];   /* prefix sums into the flags array */
-    mpz_t win_base[GAP_HUNT_BATCH];
-    uint64_t *win_off[GAP_HUNT_BATCH];  /* host offset slices */
+    uint64_t base_k[GAP_HUNT_BATCH_MAX];
+    uint32_t count[GAP_HUNT_BATCH_MAX];
+    uint32_t cum[GAP_HUNT_BATCH_MAX + 1];   /* prefix sums into the flags array */
+    mpz_t win_base[GAP_HUNT_BATCH_MAX];
+    uint64_t *win_off[GAP_HUNT_BATCH_MAX];  /* host offset slices */
 };
 
 struct gh_ctx {
@@ -175,22 +176,22 @@ struct gh_ctx {
 
 static void gh_batch_init(struct gh_batch *b) {
     memset(b, 0, sizeof(*b));
-    for (int i = 0; i < GAP_HUNT_BATCH; i++)
+    for (int i = 0; i < GAP_HUNT_BATCH_MAX; i++)
         mpz_init(b->win_base[i]);
 }
 
 static void gh_batch_clear(struct gh_batch *b) {
-    for (int i = 0; i < GAP_HUNT_BATCH; i++)
+    for (int i = 0; i < GAP_HUNT_BATCH_MAX; i++)
         mpz_clear(b->win_base[i]);
 }
 
-/* Fill one flight with GAP_HUNT_BATCH windows (mark + extract into the
-   slot's candidate buffer) and submit ONE async MR batch.  Returns 1 on
-   success; on failure or an empty batch, active stays 0. */
+/* Fill one flight with K windows (mark + extract into the slot's candidate
+   buffer) and submit ONE async MR batch.  Returns 1 on success; on failure
+   or an empty batch, active stays 0. */
 static int gh_batch_fill(struct gh_batch *b, int slot, uint64_t k0,
                          struct gh_ctx *g) {
     uint32_t cum = 0;
-    for (uint32_t i = 0; i < GAP_HUNT_BATCH; i++) {
+    for (uint32_t i = 0; i < (uint32_t)g_batch; i++) {
         uint64_t k = k0 + i;
         b->base_k[i] = k;
         mpz_set(g->bk, g->b0);
@@ -225,12 +226,16 @@ static int gh_batch_fill(struct gh_batch *b, int slot, uint64_t k0,
             return 0;
         if ((uint64_t)nc > g->capacity)
             return 0;
+        /* gpu_fermat_submit_device silently clamps to GPU_ADAPTER_MAX_BATCH;
+           exceeding it would drop candidates and fabricate false gaps. */
+        if (cum + nc > GPU_ADAPTER_MAX_BATCH)
+            return 0;
         b->count[i] = nc;
         b->cum[i] = cum;
         cum += nc;
     }
-    b->cum[GAP_HUNT_BATCH] = cum;
-    b->n_windows = GAP_HUNT_BATCH;
+    b->cum[g_batch] = cum;
+    b->n_windows = (uint32_t)g_batch;
     b->total = cum;
     b->slot = slot;
     if (cum == 0)
@@ -303,6 +308,16 @@ int gap_hunt_run(const struct gap_hunt_config *cfg) {
 #else
     if (!cfg || !cfg->crt_file)
         return 1;
+
+    /* Runtime K (GAP_HUNT_BATCH env): windows per accumulated MR batch. */
+    {
+        const char *kb = getenv("GAP_HUNT_BATCH");
+        if (kb && kb[0]) {
+            int v = atoi(kb);
+            if (v >= 1 && v <= GAP_HUNT_BATCH_MAX)
+                g_batch = v;
+        }
+    }
 
     struct crt_runtime rt;
     if (!crt_runtime_load(&rt, cfg->crt_file)) {
@@ -388,13 +403,13 @@ int gap_hunt_run(const struct gap_hunt_config *cfg) {
         crt_runtime_free(&rt);
         return 1;
     }
-    gpu_sieve_set_extract_accum(gpu_sieve, GAP_HUNT_BATCH);
+    gpu_sieve_set_extract_accum(gpu_sieve, (uint32_t)g_batch);
     base_limbs = (uint64_t *)calloc((size_t)gpu_limbs, sizeof(uint64_t));
     size_t win_cap = (size_t)sieve.candidate_capacity;
     uint64_t *offsets = (uint64_t *)malloc(
-        2U * GAP_HUNT_BATCH * win_cap * sizeof(uint64_t));
+        2U * (size_t)g_batch * win_cap * sizeof(uint64_t));
     uint8_t *flags = (uint8_t *)malloc(
-        (size_t)GAP_HUNT_BATCH * win_cap);
+        (size_t)g_batch * win_cap);
     if (!base_limbs || !offsets || !flags) {
         fprintf(stderr, "[GAP_HUNT] host buffers failed\n");
         free(base_limbs);
@@ -438,10 +453,11 @@ int gap_hunt_run(const struct gap_hunt_config *cfg) {
 
     fprintf(stderr,
             "[GAP_HUNT] walk: shift=%u n_primes=%u P bits=%.0f window=%llu "
-            "sieve=%u min_merit=%.6f k0=%llu device=%d\n",
+            "sieve=%u batch=%d min_merit=%.6f k0=%llu device=%d\n",
             rt.shift, rt.n_primes,
             (double)mpz_sizeinbase(P, 2),
-            (unsigned long long)rt.window, sieve_primes, cfg->min_merit,
+            (unsigned long long)rt.window, sieve_primes, g_batch,
+            cfg->min_merit,
             (unsigned long long)k, cfg->device);
 
     uint64_t windows = 0, gaps_reported = 0;
@@ -470,10 +486,10 @@ int gap_hunt_run(const struct gap_hunt_config *cfg) {
     mpz_set(g.b0, b0);
     mpz_set(g.P, P);
 
-    for (int i = 0; i < GAP_HUNT_BATCH; i++) {
+    for (int i = 0; i < g_batch; i++) {
         A.win_off[i] = offsets + (size_t)i * win_cap;
         B.win_off[i] =
-            offsets + ((size_t)GAP_HUNT_BATCH + (size_t)i) * win_cap;
+            offsets + ((size_t)g_batch + (size_t)i) * win_cap;
     }
 
     uint64_t next_k = k;
@@ -487,7 +503,7 @@ int gap_hunt_run(const struct gap_hunt_config *cfg) {
                         (unsigned long long)next_k);
                 break;
             }
-            next_k += GAP_HUNT_BATCH;
+            next_k += (uint64_t)g_batch;
             if (!A.active) {
                 /* Empty batch: nothing submitted; process immediately. */
                 gh_batch_process(&A, flags, cfg, &windows,
@@ -502,7 +518,7 @@ int gap_hunt_run(const struct gap_hunt_config *cfg) {
                         (unsigned long long)next_k);
                 break;
             }
-            next_k += GAP_HUNT_BATCH;
+            next_k += (uint64_t)g_batch;
         }
 
         /* Collect + process the older active flight (the GPU overlaps

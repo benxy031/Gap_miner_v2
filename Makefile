@@ -88,6 +88,7 @@ TEST_SIEVE_CORE = $(BIN_DIR)/test_sieve_core
 TEST_GPU_FERMAT = $(BIN_DIR)/test_gpu_fermat
 TEST_GPU_SIEVE = $(BIN_DIR)/test_gpu_sieve
 TEST_GPU_RESOLVE = $(BIN_DIR)/test_gpu_resolve
+TEST_RUN_PROFILE = $(BIN_DIR)/test_run_profile
 TEST_GAP_DIST = $(BIN_DIR)/test_gap_dist
 TEST_HALFCLASS = $(BIN_DIR)/test_halfclass
 TEST_GAP_PRIORITY = $(BIN_DIR)/test_gap_priority
@@ -171,6 +172,11 @@ $(TEST_GPU_RESOLVE): $(OBJECTS) $(BUILD_DIR)/$(TEST_DIR)/test_gpu_resolve.o | $(
 
 # Link test_gap_dist
 $(TEST_GAP_DIST): $(BUILD_DIR)/$(SRC_DIR)/gap_dist.o $(BUILD_DIR)/$(TEST_DIR)/test_gap_dist.o | $(BIN_DIR)
+	$(CC) $(CFLAGS) $^ $(LDFLAGS) -o $@
+	@echo "✓ Built: $@"
+
+# Runtime run-profile tool (survivor constellation of a CRT file)
+$(TEST_RUN_PROFILE): $(BUILD_DIR)/$(SRC_DIR)/crt_runtime.o $(BUILD_DIR)/$(TEST_DIR)/test_run_profile.o | $(BIN_DIR)
 	$(CC) $(CFLAGS) $^ $(LDFLAGS) -o $@
 	@echo "✓ Built: $@"
 

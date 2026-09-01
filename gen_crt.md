@@ -53,6 +53,20 @@ Usage: bin/gen_crt --calc-ctr --ctr-primes N --ctr-file FILE [options]
                         before adopting as default
   --ctr-fixed  F        Primes frozen during evolution (default 8)
   --ctr-ivs    I        Population size for evolution (default 10)
+  --ctr-blocks-objective Expected-blocks objective: minimize the sum of
+                        1-P(gap>=D) over survivors (insurance for live
+                        difficulties above the design merit). MEASURED
+                        DEGENERATE (2026-09-01): runtime covered runs are
+                        10-90 offsets, never approaching the merit scale,
+                        so P(gap>=D) ~ 0 for every survivor and the
+                        objective reduces to min-survivors.  Sigma is
+                        CONDITIONING-driven (survivors avoid small-prime
+                        divisibility classes), not run-driven — keep the
+                        lex objective.  Flag retained for provenance;
+                        the test_run_profile tool measures the real
+                        runtime constellation.
+  --ctr-difficulty D    D (merit units) for --ctr-blocks-objective
+                        (default: the --ctr-merit value)
   --ctr-range  R        Percent deviation from --ctr-primes (default 0)
   --ctr-file   FILE     Output CRT file (required)
   --help                Show this help message

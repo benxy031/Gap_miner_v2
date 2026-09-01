@@ -53,6 +53,7 @@ int main(void) {
 
     uint64_t residues[MAX_PRIMES];
     struct covering_config cfg;
+    memset(&cfg, 0, sizeof(cfg));
     cfg.strength = 8;
     cfg.local_sweeps = 8;
     cfg.ils_rounds = 0;

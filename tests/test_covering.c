@@ -65,6 +65,7 @@ int main(void) {
         uint64_t *rand_res = (uint64_t *)malloc(n * sizeof(uint64_t));
 
         struct covering_config cfg;
+        memset(&cfg, 0, sizeof(cfg));
         cfg.strength = 4;
         cfg.local_sweeps = 8;
         cfg.pair_search = 0;
@@ -136,6 +137,7 @@ int main(void) {
 
         uint64_t *res = (uint64_t *)malloc(n * sizeof(uint64_t));
         struct covering_config cfg;
+        memset(&cfg, 0, sizeof(cfg));
         cfg.strength = 2;
         cfg.local_sweeps = 4;
         cfg.pair_search = 0;
@@ -152,6 +154,51 @@ int main(void) {
             printf("  OK: coverage >= 88%%\n");
         }
         free(res);
+    }
+
+    /* Test 3: blocks objective with D == design merit behaves like the
+       classic min-survivors objective (every survivor's run already reaches
+       D), and the run_ge helper reports a sane constellation count. */
+    {
+        uint32_t shift = 512;
+        size_t n = primes_for_shift(shift, PRIME_LIMIT);
+        double logbase = (256.0 + shift) * log(2.0);
+        uint64_t gap_target = (uint64_t)ceil(30.0 * logbase);
+
+        uint64_t *res_b = (uint64_t *)malloc(n * sizeof(uint64_t));
+        struct covering_config cfg;
+        memset(&cfg, 0, sizeof(cfg));
+        cfg.strength = 2;
+        cfg.local_sweeps = 4;
+        cfg.pair_search = 0;
+        cfg.blocks_objective = 1;
+        cfg.difficulty_merit = 30.0;
+        cfg.logbase = logbase;
+        cfg.seed = 7;
+
+        uint64_t surv_b = covering_optimize(primes, n, gap_target, res_b, &cfg);
+        double cov_b = 100.0 * (1.0 - (double)surv_b / (double)gap_target);
+        printf("  blocks objective survivors=%llu (%.2f%% covered)\n",
+               (unsigned long long)surv_b, cov_b);
+        if (cov_b < 88.0) {
+            printf("  FAIL: blocks coverage %.2f%% < 88%%\n", cov_b);
+            failures++;
+        } else {
+            printf("  OK: blocks coverage >= 88%%\n");
+        }
+
+        uint64_t run_ge = covering_survivors_run_ge(
+            primes, res_b, n, 2 * gap_target,
+            (uint64_t)ceil(30.0 * logbase));
+        printf("  run_ge_D(30-merit)=%llu (in 2x window; 0 is legal at low strength)\n",
+               (unsigned long long)run_ge);
+        if (run_ge > 2 * gap_target) {
+            printf("  FAIL: run_ge_D out of range\n");
+            failures++;
+        } else {
+            printf("  OK: run_ge_D bounded\n");
+        }
+        free(res_b);
     }
 
     if (failures == 0) {

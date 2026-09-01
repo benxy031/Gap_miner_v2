@@ -32,6 +32,13 @@ struct covering_config {
                                then maximize longest covered run.  This is
                                the mining-safe arrangement objective (the
                                run-first variant was measured worse). */
+    int blocks_objective;   /* 1 = expected-blocks objective: minimize
+                               SUM over survivors of 1 - P(gap >= D), with
+                               P ~ exp(-max(0,D-run)/logbase).  Reduces to
+                               min-survivors when D <= the guaranteed run.
+                               Uses difficulty_merit + logbase. */
+    double difficulty_merit; /* D for the blocks objective (merit units) */
+    double logbase;          /* absolute log base (256+shift)*ln2 */
     uint64_t seed;          /* deterministic seed (0 = fixed default) */
 };
 
@@ -45,6 +52,9 @@ struct covering_evo_config {
     uint32_t ils_rounds;    /* perturbation rounds after evolution */
     int run_objective;      /* same as covering_config.run_objective */
     int lex_objective;      /* same as covering_config.lex_objective */
+    int blocks_objective;   /* same as covering_config.blocks_objective */
+    double difficulty_merit; /* D for the blocks objective (merit units) */
+    double logbase;          /* absolute log base (256+shift)*ln2 */
     uint64_t seed;
 };
 
@@ -81,5 +91,14 @@ uint64_t covering_count_survivors(const uint64_t *primes,
 uint64_t covering_longest_run(const uint64_t *primes,
                               const uint64_t *residues,
                               size_t n_primes, uint64_t gap_target);
+
+/* Count survivors (in [1, window)) whose forward covered run reaches at
+ * least min_run positions.  Used to compare the run-length "constellation"
+ * of candidate files: higher is better when the difficulty exceeds the
+ * guaranteed gap target. */
+uint64_t covering_survivors_run_ge(const uint64_t *primes,
+                                  const uint64_t *residues,
+                                  size_t n_primes, uint64_t window,
+                                  uint64_t min_run);
 
 #endif /* COVERING_H */

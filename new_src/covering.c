@@ -9,14 +9,19 @@
 
 #include <stdlib.h>
 #include <string.h>
+#include <math.h>
 
 static uint64_t g_rng_state;
 
 /* Objective mode shared by both optimizers: 0 = minimize survivors
    (classic), 1 = maximize the longest contiguous covered run, 2 =
-   lexicographic (minimize survivors first, then maximize the run). */
+   lexicographic (minimize survivors first, then maximize the run),
+   3 = expected blocks for a difficulty D (see covering.h). */
 static int g_run_mode = 0;
 static int g_lex_mode = 0;
+static int g_blocks_mode = 0;
+static double g_blocks_D = 0.0;
+static double g_blocks_logbase = 1.0;
 
 static uint64_t rng_next(void) {
     uint64_t x = g_rng_state;
@@ -93,6 +98,37 @@ static uint64_t encode_score(uint64_t longest, uint64_t survivors,
     return survivors;
 }
 
+/* Expected-blocks cost over the bitmap: for every survivor, its forward
+   covered run r; cost = SUM (1 - P(gap >= D)) scaled by 2^20, where
+   P ~ exp(-max(0, D - r)/logbase).  A survivor whose run already reaches D
+   costs nothing.  Total O(gap_target). */
+static uint64_t blocks_cost(const uint8_t *covered, uint64_t gap_target) {
+    double d_abs = g_blocks_D * g_blocks_logbase;
+    double scale = 1048576.0;
+    uint64_t cost = 0;
+    uint64_t j = 1;
+    while (j < gap_target) {
+        if (!covered[j]) {
+            uint64_t r = 0;
+            uint64_t t = j + 1;
+            while (t < gap_target && covered[t]) {
+                t++;
+                r++;
+            }
+            double pen;
+            if ((double)r >= d_abs)
+                pen = 0.0;
+            else
+                pen = 1.0 - exp(-(d_abs - (double)r) / g_blocks_logbase);
+            cost += (uint64_t)(pen * scale + 0.5);
+            j++;
+            continue;
+        }
+        j++;
+    }
+    return cost;
+}
+
 /* Full evaluation of a residue set (builds its bitmap). */
 static uint64_t eval_solution(const uint64_t *primes, const uint64_t *residues,
                               size_t n_primes, uint64_t gap_target,
@@ -107,10 +143,17 @@ static uint64_t eval_solution(const uint64_t *primes, const uint64_t *residues,
         mark_cover(covered, gap_target, primes[i], residues[i]);
     uint64_t longest, surv;
     covered_stats(covered, gap_target, &longest, &surv);
+    uint64_t score;
+    if (g_blocks_mode) {
+        uint64_t cost = blocks_cost(covered, gap_target);
+        score = (cost << 32) | surv;
+    } else {
+        score = encode_score(longest, surv, gap_target);
+    }
     free(covered);
     if (longest_out) *longest_out = longest;
     if (survivors_out) *survivors_out = surv;
-    return encode_score(longest, surv, gap_target);
+    return score;
 }
 
 uint64_t covering_longest_run(const uint64_t *primes, const uint64_t *residues,
@@ -309,6 +352,9 @@ uint64_t covering_optimize(const uint64_t *primes, size_t n_primes,
 
     g_run_mode = cfg->run_objective != 0;
     g_lex_mode = cfg->lex_objective != 0;
+    g_blocks_mode = cfg->blocks_objective != 0;
+    g_blocks_D = cfg->difficulty_merit;
+    g_blocks_logbase = cfg->logbase > 0.0 ? cfg->logbase : 1.0;
     g_rng_state = cfg->seed ? cfg->seed : 0x9e3779b97f4a7c15ULL;
 
     uint8_t *covered = (uint8_t *)malloc(gap_target);
@@ -405,6 +451,9 @@ uint64_t covering_optimize_evolution(const uint64_t *primes, size_t n_primes,
 
     g_run_mode = cfg->run_objective != 0;
     g_lex_mode = cfg->lex_objective != 0;
+    g_blocks_mode = cfg->blocks_objective != 0;
+    g_blocks_D = cfg->difficulty_merit;
+    g_blocks_logbase = cfg->logbase > 0.0 ? cfg->logbase : 1.0;
     g_rng_state = cfg->seed ? cfg->seed : 0x9e3779b97f4a7c15ULL;
 
     uint32_t pop_size = cfg->population ? cfg->population : 20;
@@ -528,4 +577,37 @@ uint64_t covering_optimize_evolution(const uint64_t *primes, size_t n_primes,
     free(score);
     free(child);
     return final;
+}
+
+uint64_t covering_survivors_run_ge(const uint64_t *primes,
+                                  const uint64_t *residues,
+                                  size_t n_primes, uint64_t window,
+                                  uint64_t min_run) {
+    if (!primes || !residues || n_primes == 0 || window < 2 || min_run == 0)
+        return 0;
+    uint8_t *covered = (uint8_t *)calloc(window, 1);
+    if (!covered)
+        return 0;
+    for (size_t i = 0; i < n_primes; i++)
+        mark_cover(covered, window, primes[i], residues[i]);
+
+    uint64_t n = 0;
+    uint64_t j = 1;
+    while (j < window) {
+        if (!covered[j]) {
+            uint64_t r = 0;
+            uint64_t t = j + 1;
+            while (t < window && covered[t]) {
+                t++;
+                r++;
+            }
+            if (r >= min_run)
+                n++;
+            j++;
+            continue;
+        }
+        j++;
+    }
+    free(covered);
+    return n;
 }

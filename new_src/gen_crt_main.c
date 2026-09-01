@@ -64,6 +64,11 @@ static void usage(const char *prog) {
         "                        survivors) instead of minimizing survivors\n"
         "  --ctr-lex-objective   Lexicographic: minimize survivors first, then\n"
         "                        maximize longest covered run (mining-safe)\n"
+        "  --ctr-blocks-objective Expected-blocks objective: minimize the sum\n"
+        "                        of 1-P(gap>=D) over survivors (insurance for\n"
+        "                        difficulties above the target merit)\n"
+        "  --ctr-difficulty D    D (merit units) for --ctr-blocks-objective\n"
+        "                        (default: the --ctr-merit value)\n"
         "  --ctr-fixed  F        Primes frozen during evolution (default 8)\n"
         "  --ctr-ivs    I        Population size for evolution (default 10)\n"
         "  --ctr-range  R        Percent deviation from --ctr-primes (default 0)\n"
@@ -82,6 +87,8 @@ int main(int argc, char **argv) {
     int ctr_evolution = 0;
     int ctr_run_objective = 0;
     int ctr_lex_objective = 0;
+    int ctr_blocks_objective = 0;
+    double ctr_difficulty = 0.0;
     int ctr_fixed = 8;
     int ctr_ivs = 10;
     int ctr_range = 0;
@@ -96,6 +103,8 @@ int main(int argc, char **argv) {
         {"ctr-evolution",  no_argument,       NULL, 'e'},
         {"ctr-run-objective", no_argument,     NULL, 'R'},
         {"ctr-lex-objective", no_argument,     NULL, 'L'},
+        {"ctr-blocks-objective", no_argument,  NULL, 'B'},
+        {"ctr-difficulty", required_argument,  NULL, 'd'},
         {"ctr-fixed",      required_argument, NULL, 'f'},
         {"ctr-ivs",        required_argument, NULL, 'i'},
         {"ctr-range",      required_argument, NULL, 'r'},
@@ -105,7 +114,7 @@ int main(int argc, char **argv) {
     };
 
     int opt;
-    while ((opt = getopt_long(argc, argv, "Cp:m:b:s:eRLf:i:r:o:h", long_opts, NULL)) != -1) {
+    while ((opt = getopt_long(argc, argv, "Cp:m:b:s:eRLBd:f:i:r:o:h", long_opts, NULL)) != -1) {
         switch (opt) {
         case 'C': break;
         case 'p': ctr_primes = atoi(optarg); break;
@@ -115,6 +124,8 @@ int main(int argc, char **argv) {
         case 'e': ctr_evolution = 1; break;
         case 'R': ctr_run_objective = 1; break;
         case 'L': ctr_lex_objective = 1; break;
+        case 'B': ctr_blocks_objective = 1; break;
+        case 'd': ctr_difficulty = atof(optarg); break;
         case 'f': ctr_fixed = atoi(optarg); break;
         case 'i': ctr_ivs = atoi(optarg); break;
         case 'r': ctr_range = atoi(optarg); break;
@@ -142,6 +153,8 @@ int main(int argc, char **argv) {
     if (ctr_ivs < 2) ctr_ivs = 2;
     if (ctr_strength < 1) ctr_strength = 1;
     if (ctr_range < 0) ctr_range = 0;
+    if (ctr_blocks_objective && ctr_difficulty <= 0.0)
+        ctr_difficulty = ctr_merit;
 
     gen_primes();
 
@@ -177,6 +190,9 @@ int main(int argc, char **argv) {
             cfg.ils_rounds = 8;
             cfg.run_objective = ctr_run_objective;
             cfg.lex_objective = ctr_lex_objective;
+            cfg.blocks_objective = ctr_blocks_objective;
+            cfg.difficulty_merit = ctr_difficulty;
+            cfg.logbase = (256.0 + (double)shift) * log(2.0);
             cfg.seed = (uint64_t)time(NULL) ^ (uint64_t)n;
             cand = covering_optimize_evolution(g_primes, (size_t)n, gap_size,
                                                residues, &cfg);
@@ -188,6 +204,9 @@ int main(int argc, char **argv) {
             cfg.pair_search = 0;
             cfg.run_objective = ctr_run_objective;
             cfg.lex_objective = ctr_lex_objective;
+            cfg.blocks_objective = ctr_blocks_objective;
+            cfg.difficulty_merit = ctr_difficulty;
+            cfg.logbase = (256.0 + (double)shift) * log(2.0);
             cfg.seed = (uint64_t)time(NULL) ^ (uint64_t)n;
             cand = covering_optimize(g_primes, (size_t)n, gap_size, residues,
                                      &cfg);
@@ -223,12 +242,19 @@ int main(int argc, char **argv) {
 
     uint64_t best_run = covering_longest_run(g_primes, best_res,
                                              (size_t)best_n, best_gap);
+    uint64_t run_ge_d = covering_survivors_run_ge(
+        g_primes, best_res, (size_t)best_n, 2 * best_gap,
+        (uint64_t)ceil(ctr_difficulty * (256.0 + (double)best_shift) *
+                       log(2.0)));
     fprintf(stderr, "wrote %s  (%d primes, %llu candidates, shift=%d, "
-                    "gap_target=%llu, longest_run=%llu%s)\n",
+                    "gap_target=%llu, longest_run=%llu, run_ge_D=%llu%s)\n",
             ctr_file, best_n, (unsigned long long)best_cand,
             best_shift, (unsigned long long)best_gap,
             (unsigned long long)best_run,
-            ctr_run_objective ? " (run objective)"
-                              : (ctr_lex_objective ? " (lex objective)" : ""));
+            (unsigned long long)run_ge_d,
+            ctr_blocks_objective ? " (blocks objective)"
+                : (ctr_run_objective ? " (run objective)"
+                                     : (ctr_lex_objective ? " (lex objective)"
+                                                          : "")));
     return 0;
 }

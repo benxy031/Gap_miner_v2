@@ -250,3 +250,32 @@ tests with ~100x lower latency).  Also diagnostic: batch throughput is the
 same at merit 8 and 18 (143 vs 147 win/s), so shift1017 is MARK/EXTRACT-
 bound, not MR-bound — the jump was attacking a non-bottleneck.  Reopen
 trigger: a per-thread low-latency MR at AL=20, or >500 concurrent windows.
+
+### 2026-09-02 (late night) — bottleneck CORRECTED; deep-sieve default 2M -> 10M
+
+Diagnosis fix: shift1017 is CGBN-**MR**-bound, not mark/extract-bound.
+Evidence: 147 win/s x 2,675 survivors = 393k MR tests/s vs CGBN AL=20
+capacity scaled from the AL=12 measurement (907k x (12/20)^2 = 326k/s,
+within noise).  The m=8-vs-m=18 throughput equality only excludes
+BPSW/reporting.  GPU_FERMAT_TPI knob CLOSED at AL=20: TPI=8 (66 win/s) >
+16 (44) > 32 (24).
+
+Deep-sieve lever (survivors ~ 1/ln(limit), mark is cheap): 2M -> 10M gives
+shift1017 91 -> 154 win/s (+70%; 20M -> 161), shift507 667 -> 711 (+6.5%).
+Parity identical (411/411 gaps).  Default changed to 10M in main.c and
+gap_hunt.c; README updated.
+
+NOVELTY REGISTER (dormant, this milestone):
+- N1 chunk-parallel jump: GAP_HUNT_JUMP reopen refinement — test the
+  backward pass in CGBN-instance-parallel chunks (16-way) instead of one
+  candidate at a time; chain stays serial but each link costs ONE test
+  latency.  Needs a quiet dedicated GPU to measure (dev box is shared with
+  mining, which inflates chain latency ~10x).
+- N2 factor-first certification: for survivors whose smallest factor is
+  < 2^40 (~10-20% of survivor composites), bounded rho/ECM beats one CGBN
+  MR; hybrid could shave ~5-15% of MR at comparable kernel cost.  Untested,
+  marginal, falsifiable.
+- N3 first-ever distribution dataset at 10^229-10^383: at min-merit 8 the
+  hunt emits ~800+ exact gaps/hour at sizes with ZERO prior data.  Archiving
+  m>=8 results is a by-product nobody else can produce today; costs one
+  log file.

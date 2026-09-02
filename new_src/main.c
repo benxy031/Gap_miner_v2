@@ -308,7 +308,7 @@ int main(int argc, char *argv[]) {
         gh.min_merit = gap_hunt_min_merit;
         gh.state_path = gap_hunt_state;
         gh.out_path = gap_hunt_out;
-        gh.sieve_primes = sieve_primes_overridden ? sieve_primes : 2000000U;
+        gh.sieve_primes = sieve_primes_overridden ? sieve_primes : 10000000U;
         gh.device = gap_hunt_device;
         return gap_hunt_run(&gh);
     }

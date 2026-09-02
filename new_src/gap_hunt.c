@@ -635,7 +635,7 @@ int gap_hunt_run(const struct gap_hunt_config *cfg) {
     }
 
     /* Deep-sieve prime table (same engine the miner uses). */
-    uint32_t sieve_primes = cfg->sieve_primes ? cfg->sieve_primes : 2000000U;
+    uint32_t sieve_primes = cfg->sieve_primes ? cfg->sieve_primes : 10000000U;
     struct sieve_core sieve;
     memset(&sieve, 0, sizeof(sieve));
     if (!sieve_core_init_window(&sieve, interval, sieve_primes)) {

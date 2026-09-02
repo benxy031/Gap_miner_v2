@@ -158,12 +158,12 @@ def main():
         print(f"   P(next reported gap is a record): easiest target "
               f"merit={m_easy:.3f} (gap {tgt[0][1]})")
         if small:
-            print(f"      fitted sigma {sig_fit:.2f} -> {p_fit:.3f} "
+            print(f"      fitted sigma {sig_fit:.2f} -> {p_fit:.3e} "
                   f"(unreliable, n<30)")
-            print(f"      prior  sigma 1.29 -> {p_prior:.3f} "
+            print(f"      prior  sigma 1.29 -> {p_prior:.3e} "
                   f"-> expected reported gaps ~{1.0/p_prior:.0f}")
         else:
-            print(f"      fitted sigma {sig_fit:.2f} -> {p_fit:.3f} "
+            print(f"      fitted sigma {sig_fit:.2f} -> {p_fit:.3e} "
                   f"-> expected reported gaps ~{1.0/p_fit:.0f}")
         print("   easiest recordable targets (needed merit, gap):")
         for m, g, bm in tgt[:8]:

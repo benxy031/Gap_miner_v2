@@ -309,3 +309,24 @@ docs/wcnt-problems-2021.pdf):
   has freer moduli than Z, so studying what works there may localize our
   entropy wall (Euclid + one-residue-per-prime).  No constructible
   transfer yet; keep as a dormant pointer.
+
+N4 UPDATE — construction ATTEMPTED, problem ANSWERED (2026-09-02):
+WCNT 021:13 has a POSITIVE answer, and stronger than asked — FIVE
+consecutive reducible cubics exist: P(x) = 4x^3 - 18x^2 + 22x + D for
+D = -8..-4, with factors (x-1), (2x-1), (2x-3), (2x-5), (x-2); a second
+family 4x^3 - 24x^2 + 43x + D (D = -24..-20) also gives length 5.
+The problem statement's MONIC CRT route is rigorously closed: A != 0 forces
+some denominator <= 12, hence all coordinates <= 24, and an exact
+exhaustive search of that box finds only the degenerate P = +-x (every
+reducible integer cubic has an integer root; the roots of shifted values
+are distinct; the shift makes x | P the general monic case).
+The escape is NON-MONIC moduli (2x - r_j), r_j a permutation of {1..5}
+satisfying the 5-points-on-a-cubic condition.  No run of 6 in
+A<=12, |B,C,D|<=60.  Tool: tools/poly_gap_search.py.
+INTEGER-WORLD LESSON: the polynomial freedom lives in the modulus space
+(non-monic); its integer counterpart is a COMPOSITE modulus, and composite-
+modulus covering systems reduce to prime-modulus congruences — adding
+nothing beyond the prime covers we already run.  Euclid + the exact
+survivor-entropy bound still apply: construction wins over polynomials,
+sampling remains the only route in Z.  N4 stays closed as a pointer with
+this verdict.

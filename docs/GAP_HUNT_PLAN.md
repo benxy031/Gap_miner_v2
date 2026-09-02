@@ -288,3 +288,13 @@ lines for continuous collection (one walker per GPU; shares throughput with
 the record hunt if both run):
     data/crt/m23/shift507_p74_lex_m30.txt    0   8
     data/crt/m23/shift1017_p130_lex_m30.txt  0   8
+
+N3 first scientific result (2026-09-02, ~24k + ~7.4k samples): the gap
+tail sigma is SIZE-DEPENDENT at these scales — sigma(763-bit) = 1.274 +/-
+0.008 (n=23,406) vs sigma(1273-bit) = 1.351 +/- 0.016 (n=7,381): a 4.3-sigma
+separation.  Fatter tail at larger sizes => the big-bit frontier is even
+better than the flat-sigma landscape assumed.  Confound to rule out: the
+covers differ in density (0.0719 vs 0.0590).  Discriminating tests: (a) same
+size, different cover: shift1017 m23 vs lex (both files exist); (b) a third
+size (e.g. shift998) for monotonicity.  Record projection at 1017 with
+sigma=1.35: ~183k reported gaps to the first record (progress ~4%).

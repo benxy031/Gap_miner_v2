@@ -346,3 +346,11 @@ N4 six-run follow-up #2: A<=6 all q |D|<=20,000 -> 0 six-runs (poly_gap_six).
 Combined coverage so far: box A<=12,|B|,|C|,|D|<=120; A<=4 q in {1,2}
 |D|<=500k; A<=4 all q |D|<=50k; A<=6 all q |D|<=20k — all zero.  Conjecture
 "cubic maximum is 5" now probed from three independent directions.
+
+N3 dataset update #2 (2026-09-02 late, 3060 fleet): f1 n=277,307 sigma
+1.262 +/- 0.002; f2 n=85,813 sigma 1.363 +/- 0.005 -> separation now
+~19 sigma (size-dependence solid).  New 1017 best: gap 21366 merit 24.233
+(0.139 below the easiest record target 21488/24.372).  Record projection
+at 1017: P=6.06e-6 per reported gap, expected ~165k gaps, progress 52%.
+Corrected gap throughput: ~50k exact gaps/hour per 3060 at shift1017
+(earlier "~860/h" notes were wrong — that is per ~minute).

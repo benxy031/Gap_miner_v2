@@ -194,6 +194,7 @@ void print_usage(const char *prog_name) {
     printf("  --gap-hunt-min-merit <m>  Report gaps with merit >= m (default 15)\n");
     printf("  --gap-hunt-state <path>  Resume state file\n");
     printf("  --gap-hunt-out <path>    Results file (default: stdout only)\n");
+    printf("  --gap-hunt-device <n>    CUDA device id (default 0; multi-GPU fleets)\n");
     printf("  --help                Show this help message\n");
 }
 
@@ -226,6 +227,7 @@ int main(int argc, char *argv[]) {
     double gap_hunt_min_merit = 15.0;
     const char *gap_hunt_state = NULL;
     const char *gap_hunt_out = NULL;
+    int gap_hunt_device = 0;
     
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--host") == 0 && i + 1 < argc) {
@@ -286,6 +288,8 @@ int main(int argc, char *argv[]) {
             gap_hunt_state = argv[++i];
         } else if (strcmp(argv[i], "--gap-hunt-out") == 0 && i + 1 < argc) {
             gap_hunt_out = argv[++i];
+        } else if (strcmp(argv[i], "--gap-hunt-device") == 0 && i + 1 < argc) {
+            gap_hunt_device = atoi(argv[++i]);
         } else if (strcmp(argv[i], "--help") == 0) {
             print_usage(argv[0]);
             return 0;
@@ -305,7 +309,7 @@ int main(int argc, char *argv[]) {
         gh.state_path = gap_hunt_state;
         gh.out_path = gap_hunt_out;
         gh.sieve_primes = sieve_primes_overridden ? sieve_primes : 2000000U;
-        gh.device = 0;
+        gh.device = gap_hunt_device;
         return gap_hunt_run(&gh);
     }
 

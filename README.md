@@ -239,6 +239,22 @@ compares each gap against `data/prime_gap_merits.txt`, appends new records to
 scripts/watch_gap_hunt_records.py data/gap_hunt_records.txt &
 ```
 
+Multi-size / multi-GPU fleets: `scripts/gap_hunt_fleet.sh` reads
+`gap_hunt_fleet.conf` (one `<crt-file> <device> <min-merit>` line per walker),
+launches one walker + one record watcher per line with separate
+state/out/log files, and stops all of them losslessly on `SIGINT`/`SIGTERM`
+(each walker resumes from its own state file).  The record landscape is
+nearly flat across sizes (easiest record merit ≈ 24.35 at shift 1017 vs
+26.44 at shift 507), so several sizes in parallel sum independent record
+lotteries.  Example config:
+
+```bash
+# gap_hunt_fleet.conf
+# crt-file                                device  min-merit
+data/crt/m23/shift507_p74_lex_m30.txt     0       18
+data/crt/m23/shift998_p128_m23.txt        1       18
+```
+
 ## CLI reference
 
 | Option | Default | Description |
@@ -262,6 +278,7 @@ scripts/watch_gap_hunt_records.py data/gap_hunt_records.txt &
 | `--gap-hunt-min-merit <m>` | `15` | Report gaps with merit ≥ m (true record merit `gap/ln(start)`) |
 | `--gap-hunt-state <path>` | none | Resume state file (k and diagnostic last prime) |
 | `--gap-hunt-out <path>` | none | Results file (`<gap> <merit> <startprime>` per line; stdout-only if unset) |
+| `--gap-hunt-device <n>` | `0` | CUDA device id for the walk (multi-GPU fleets) |
 | `--help` | — | Print the help message |
 
 Environment variables:

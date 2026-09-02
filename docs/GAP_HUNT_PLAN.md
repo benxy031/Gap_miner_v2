@@ -210,3 +210,19 @@ an earlier session, so mining was NOT losing gaps; record_log uses the
 accepts file arguments and loads every fleet CRT file (139/139 OK).
 Validation after fix: 60s at shift1017/min-merit 8 -> 837 gaps, best
 15.58; 837/837 exact (nextprime + merit arithmetic).
+
+### 2026-09-02 (evening) — external review: briankehrig/prime-gaps-cuda
+
+Studied Kehrig's exhaustive gap hunter (2^64..2^78, driver of the search that
+found maximal gaps 1676/1724/1854).  Key transferable idea: his jump-by-
+minGap + backward-search gap finder tests ~1.5 survivors per confirmed prime
+instead of all survivors — for GAP_HUNT at shift1017 that is ~70 CGBN tests
+per window instead of 2,675 (~38x less MR work); windows are independent so
+one CGBN thread-block per window running the serial chain in parallel across
+windows is the natural mapping (candidate next milestone, needs a parity
+test).  Dormant idea: fixed-high-limb Montgomery (his HIGH_64 magic/
+derivative trick) — all candidates in a window share the top ~19 limbs.
+Not transferable: pseudoprime sieving (we BPSW + make no completeness
+claim), 1.4 GB wheel bitmaps, exhaustive labeling.  Confirms our choices:
+skip-half = QUARTER_CLASS economics (viable there, falsified here), A/B
+flight overlap, process-per-GPU fleets, FIRST_KNOWN_OCCURRENCE claims.

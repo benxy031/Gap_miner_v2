@@ -279,3 +279,12 @@ NOVELTY REGISTER (dormant, this milestone):
   hunt emits ~800+ exact gaps/hour at sizes with ZERO prior data.  Archiving
   m>=8 results is a by-product nobody else can produce today; costs one
   log file.
+
+N3 UPDATE (trial run): 120 s at shift1017 / min-merit 8 -> 1,723 exact gaps
+(860/hour), merit span 8.003-19.186, mean 9.34, 1723/1723 validated
+(nextprime + merit arithmetic).  Size anchors already exist: shift507 =
+763-bit = 10^229, shift1017 = 1273-bit = 10^383 — no new CRT needed.  Fleet
+lines for continuous collection (one walker per GPU; shares throughput with
+the record hunt if both run):
+    data/crt/m23/shift507_p74_lex_m30.txt    0   8
+    data/crt/m23/shift1017_p130_lex_m30.txt  0   8

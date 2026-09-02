@@ -330,3 +330,14 @@ nothing beyond the prime covers we already run.  Euclid + the exact
 survivor-entropy bound still apply: construction wins over polynomials,
 sampling remains the only route in Z.  N4 stays closed as a pointer with
 this verdict.
+
+N4 six-run follow-up (2026-09-02 late): is the cubic maximum 5?  Extended
+searches, all NEGATIVE for length 6:
+- coefficient box A<=12, |B,C,D|<=120 (C tool tools/poly_gap_box.c): longest
+  run 5, eight 5-families, 0 six-runs;
+- divisor-recursion search (tools/poly_gap_six.c, exhaustive over |D| with
+  NO bound on B,C): A<=4 q in {1,2} |D|<=500,000 -> 0; A<=4 all q
+  |D|<=50,000 -> 0.
+CONJECTURE: no six consecutive reducible cubics exist (max = 5); unproven
+for A>=5 and |D|>500k.  Python reference: tools/poly_gap_search.py
+search_six().

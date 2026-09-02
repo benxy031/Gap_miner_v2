@@ -44,6 +44,7 @@ Usage:
 """
 
 from math import gcd
+from fractions import Fraction as F
 
 
 def roots3(A, B, C, D):
@@ -103,6 +104,73 @@ def search_runs(A_max, C_max):
     return bestabc, best
 
 
+def search_six(A_max, dmax):
+    """Search for SIX consecutive reducible cubics, exhaustive over |D|.
+
+    P+j reducible => rational root p_j/q_j with q_j | A (leading coeff) and
+    p_j | D+j.  For each D, the only possible p_j are the divisors of D+j.
+    Enumerate p_0,p_1, solve B and C exactly (2x2 over Fractions), then for
+    j = 2..5 check whether ANY divisor of D+j satisfies the cubic — early
+    exit per j.  No bound on B or C; scales to dmax ~ 10^4 in Python, and
+    the C version (tools/poly_gap_six.c) reaches |D| = 500000.
+    """
+    found = []
+
+    def divisors_table(dmax):
+        table = [[] for _ in range(2 * dmax + 11)]
+        for d in range(1, dmax + 6):
+            for m in range(d, dmax + 6, d):
+                table[dmax + 5 + m].append(d)
+                table[dmax + 5 - m].append(-d)
+        return table
+
+    table = divisors_table(dmax)
+
+    def cand(j, D):
+        return table[dmax + 5 + D + j]
+
+    def check(A, qs, D):
+        for p0 in cand(0, D):
+            q0 = qs[0]
+            for p1 in cand(1, D):
+                q1 = qs[1]
+                # A p^3 + B p^2 q + C p q^2 + D q^3 = 0  for j=0,1
+                a0, b0 = F(p0 * p0 * q0), F(p0 * q0 * q0)
+                r0 = F(-A * p0**3) - F(D * q0**3)
+                a1, b1 = F(p1 * p1 * q1), F(p1 * q1 * q1)
+                r1 = F(-A * p1**3) - F((D + 1) * q1**3)
+                det = a0 * b1 - a1 * b0
+                if det == 0:
+                    continue
+                B = (r0 * b1 - r1 * b0) / det
+                C = (a0 * r1 - a1 * r0) / det
+                ok = True
+                ps = [p0, p1]
+                for j in range(2, 6):
+                    hit = False
+                    for p in cand(j, D):
+                        if A * p**3 + B * p * p * qs[j] + C * p * qs[j]**2 \
+                                + (D + j) * qs[j]**3 == 0:
+                            ps.append(p)
+                            hit = True
+                            break
+                    if not hit:
+                        ok = False
+                        break
+                if ok and B.denominator == 1 and C.denominator == 1:
+                    found.append((A, D, ps, list(qs)))
+                    return  # one representative per (A, qs, D) is enough
+        return None
+
+    import itertools
+    for A in range(1, A_max + 1):
+        dvs = [q for q in range(1, A + 1) if A % q == 0]
+        for qs in itertools.product(dvs, repeat=6):
+            for D in range(-dmax, dmax + 1):
+                check(A, qs, D)
+    return found
+
+
 if __name__ == "__main__":
     print("== found family 1 (length 5) ==")
     verify_family(4, -18, 22, -8, -4)
@@ -112,3 +180,11 @@ if __name__ == "__main__":
     abc, run = search_runs(12, 60)
     print(f"longest run in A<=12, |B,C,D|<=60: {abc} D in {run} "
           f"length {len(run)}")
+    print("\n== six-run search (demo range; use tools/poly_gap_six.c for "
+          "large |D|) ==")
+    six = search_six(3, 40)
+    print(f"6-runs found with A<=3, |D|<=40: {len(six)}")
+    for s in six:
+        print(f"  A={s[0]} D={s[1]} p={s[2]} q={s[3]}")
+    print("  (C search results: A<=4, q in {1,2}, |D|<=500000 -> 0; "
+          "A<=4, all q, |D|<=50000 -> 0; box A<=12,|B,C,D|<=120 -> 0)")

@@ -27,7 +27,7 @@
    Raised from 8192 to 40000: the CGBN kernel is latency-bound, so larger
    batches amortize the per-launch/tail overhead (measured 1.28M/s @10k →
    1.52M/s @40k candidates, still climbing). */
-#define GPU_ADAPTER_MAX_BATCH 80000U
+#define GPU_ADAPTER_MAX_BATCH 160000U
 
 /* GPU candidate batch (input to GPU) */
 struct gpu_batch {

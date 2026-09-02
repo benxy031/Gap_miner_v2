@@ -217,8 +217,13 @@ static int gh_batch_fill(struct gh_batch *b, int slot, uint64_t k0,
         size_t exported = 0;
         mpz_export(g->base_limbs, &exported, -1, sizeof(uint64_t), 0, 0,
                    g->wb);
-        if (exported > (size_t)g->gpu_limbs)
+        if (exported > (size_t)g->gpu_limbs) {
+            fprintf(stderr,
+                    "[GAP_HUNT] fill fail: base export %zu > %d limbs "
+                    "(k=%llu i=%u)\n",
+                    exported, g->gpu_limbs, (unsigned long long)k, i);
             return 0;
+        }
         uint64_t first_odd_offset = (g->base_limbs[0] & 1ULL) ? 0U : 1U;
         uint64_t odd_size = 0;
         if (g->interval > first_odd_offset)
@@ -228,8 +233,14 @@ static int gh_batch_fill(struct gh_batch *b, int slot, uint64_t k0,
         if (!gpu_sieve_mark_from_base(g->sieve, odd_size, first_odd_offset,
                                       g->base_limbs, g->gpu_limbs, buf,
                                       g->primes, g->inv_p, g->prime_count,
-                                      NULL, 0))
+                                      NULL, 0)) {
+            fprintf(stderr, "[GAP_HUNT] fill fail: mark "
+                    "(k=%llu i=%u odd=%llu fo=%llu)\n",
+                    (unsigned long long)k, i,
+                    (unsigned long long)odd_size,
+                    (unsigned long long)first_odd_offset);
             return 0;
+        }
 
         uint64_t class_mask =
             g->quarter ? halfclass_visible_mask() : UINT64_MAX;
@@ -252,12 +263,26 @@ static int gh_batch_fill(struct gh_batch *b, int slot, uint64_t k0,
                 g->sieve, odd_size, first_odd_offset, 0, lo_tail_odd,
                 buf, slot, g->base_limbs, g->fermat_limbs, &d_cands,
                 b->win_off[i], &nc, base_mod60, class_mask,
-                g->region_start, cum))
+                g->region_start, cum)) {
+            fprintf(stderr, "[GAP_HUNT] fill fail: extract "
+                    "(k=%llu i=%u lo_tail_odd=%llu)\n",
+                    (unsigned long long)k, i,
+                    (unsigned long long)lo_tail_odd);
             return 0;
-        if ((uint64_t)nc > g->capacity)
+        }
+        if ((uint64_t)nc > g->capacity) {
+            fprintf(stderr, "[GAP_HUNT] fill fail: nc=%u > capacity=%llu "
+                    "(k=%llu i=%u)\n", nc,
+                    (unsigned long long)g->capacity,
+                    (unsigned long long)k, i);
             return 0;
-        if (cum + nc > GPU_ADAPTER_MAX_BATCH)
+        }
+        if (cum + nc > GPU_ADAPTER_MAX_BATCH) {
+            fprintf(stderr, "[GAP_HUNT] fill fail: cum=%u + nc=%u > %u "
+                    "(k=%llu i=%u)\n", cum, nc, GPU_ADAPTER_MAX_BATCH,
+                    (unsigned long long)k, i);
             return 0;
+        }
         b->count[i] = nc;
         b->cum[i] = cum;
         cum += nc;
@@ -285,8 +310,12 @@ static int gh_batch_fill(struct gh_batch *b, int slot, uint64_t k0,
     if (cum == 0)
         return 1;               /* nothing to MR-test; process as empty */
     uint64_t *d_batch = gpu_sieve_candidate_buffer(g->sieve, slot);
-    if (gpu_fermat_submit_device(g->fermat, slot, d_batch, (size_t)cum) != 0)
+    if (gpu_fermat_submit_device(g->fermat, slot, d_batch, (size_t)cum) != 0) {
+        fprintf(stderr, "[GAP_HUNT] fill fail: fermat submit "
+                "(slot=%d cum=%u k0=%llu)\n", slot, cum,
+                (unsigned long long)k0);
         return 0;
+    }
     b->active = 1;
     return 1;
 }

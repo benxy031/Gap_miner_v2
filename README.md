@@ -303,7 +303,7 @@ Environment variables:
 | `GAPMINER_CPU_WINDOW_OVERRIDE` | `4` | Force the CPU limb path's exponentiation window width (`3`, `4` or `5`; `4` is the specialized default) |
 | `GAPMINER_CPU_WINDOW_LOG` | off | Log the selected window width once per limb count (diagnostic) |
 | `GAPDEBUG` | off | CRT gap diagnostics (HALF_CLASS and full-class modes): for every emitted gap, log to stderr the window class, gap class endpoints, and the interior candidates with their MR flags; in HALF_CLASS mode also logs `[HIDDBG]` hidden-class resolution counters (candidates tested / primes found per resolved interval). Used to trace false-gap regressions; verbose — development only |
-| `GAP_HUNT_BATCH` | `32` | GAP_HUNT windows per accumulated MR batch (`1..32`). Measured on the dev host (RTX 3070, mining running): **893 win/s at 32 vs 706 at 16 vs 808 at K=8**; batches are guarded against silent truncation at the 80000-candidate MR limit (fail-closed) |
+| `GAP_HUNT_BATCH` | `32` | GAP_HUNT windows per accumulated MR batch (`1..32`). Measured on the dev host (RTX 3070, mining running): **893 win/s at 32 vs 706 at 16 vs 808 at K=8**; batches are guarded against silent truncation at the 160000-candidate MR limit (fail-closed) |
 | `GAP_HUNT_QUARTER` | off | **FALSIFIED experiment** — 4-visible-class scan + on-demand hidden resolution (containment lemma, exact — parity-tested identical to full-class). At record thresholds (merit ≥ 15) the visible-gap trigger fires ~1.3×/window (visible gaps inherit the σ-tail with mean merit ≈ 8) and CPU resolution costs ~40 ms each → 46 win/s vs 893 full-class. Kept off; exact but not profitable |
 | `GAP_HUNT_KMAX` | none | Stop the walk at this k (tests/benchmarks) |
 

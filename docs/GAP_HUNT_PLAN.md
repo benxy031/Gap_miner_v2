@@ -180,3 +180,16 @@ the miner's nominal protocol merit `gap / ln(2^(256+shift))` (they differ by
 ~0.13% at shift507 — an external verifier flagged gap 11182 as
 21.1709 vs our 21.1431; gap and endpoints were correct).  The validator now
 also re-derives merit from each record's start and fails on any mismatch.
+
+### 2026-09-02 — shift 1017 CRT support (MR batch limit 80k -> 160k)
+
+First GAP_HUNT run at shift > 507 exposed the 80k MR batch cap: the 1017
+window is ~65% longer (interval 78,215 vs 48,521), giving ~2,675
+survivors/window x 32 = ~85,600 > 80,000, so the fail-closed guard rejected
+the whole batch at i=29 (`cum=77586 + nc=2619 > 80000`).  Fixed by raising
+`GPU_ADAPTER_MAX_BATCH` to 160,000 (uint8 result buffers: +80 KB/slot, no
+mining impact).  Smoke test: CGBN kernel active at AL=20 (1280-bit) and 96
+windows processed cleanly on shift1017_p130_lex_m30.  Note: the Makefile has
+no header dependencies — a header-only change needs `make clean` before the
+rebuild (stale `gpu_adapter.o` masked the fix initially).  For shift >=
+~2000 use `GAP_HUNT_BATCH=16` (per-window survivors scale with logbase).

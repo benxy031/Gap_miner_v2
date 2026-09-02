@@ -341,3 +341,8 @@ searches, all NEGATIVE for length 6:
 CONJECTURE: no six consecutive reducible cubics exist (max = 5); unproven
 for A>=5 and |D|>500k.  Python reference: tools/poly_gap_search.py
 search_six().
+
+N4 six-run follow-up #2: A<=6 all q |D|<=20,000 -> 0 six-runs (poly_gap_six).
+Combined coverage so far: box A<=12,|B|,|C|,|D|<=120; A<=4 q in {1,2}
+|D|<=500k; A<=4 all q |D|<=50k; A<=6 all q |D|<=20k — all zero.  Conjecture
+"cubic maximum is 5" now probed from three independent directions.

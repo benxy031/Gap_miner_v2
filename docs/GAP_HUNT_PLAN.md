@@ -226,3 +226,10 @@ Not transferable: pseudoprime sieving (we BPSW + make no completeness
 claim), 1.4 GB wheel bitmaps, exhaustive labeling.  Confirms our choices:
 skip-half = QUARTER_CLASS economics (viable there, falsified here), A/B
 flight overlap, process-per-GPU fleets, FIRST_KNOWN_OCCURRENCE claims.
+
+Follow-up applicability verdict: jump-strategy -> GAP_HUNT only (windows are
+independent, parallel across SMs, MR dominates at high shifts).  NOT for
+gap_miner: one window per nonce => latency-bound serial chain, MR is not the
+dominant cost, and the jump misses small gaps that RGM/gap_dist accumulate
+in stride=1 mode.  For mining the transferable candidate would be
+fixed-high-limb Montgomery instead.

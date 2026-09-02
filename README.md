@@ -231,6 +231,14 @@ with 6 decimals, the record-submission precision).  Validate with
 `bin/test_gap_hunt <out-file>` (checks `nextprime(start) == start + gap` for
 every record).
 
+Automatic record checking while the hunt runs (follows the results file,
+compares each gap against `data/prime_gap_merits.txt`, appends new records to
+`gap_hunt_records_found.txt`):
+
+```bash
+scripts/watch_gap_hunt_records.py data/gap_hunt_records.txt &
+```
+
 ## CLI reference
 
 | Option | Default | Description |

@@ -41,7 +41,7 @@ static double primorial_log2(size_t n) {
     return acc;
 }
 
-int main(void) {
+int main(int argc, char **argv) {
     gen_primes();
 
     int failures = 0;
@@ -202,6 +202,25 @@ int main(void) {
     mpz_clears(nadd0, base0, cand, NULL);
     crt_runtime_free(&rt);
     remove(tmp);
+
+    /* Per-file load check (mining fleet sanity): load every file passed on
+       the command line and verify it parses + window/template build. */
+    for (int a = 1; a < argc; a++) {
+        struct crt_runtime frt;
+        memset(&frt, 0, sizeof(frt));
+        if (!crt_runtime_load(&frt, argv[a])) {
+            printf("FAIL: load %s\n", argv[a]);
+            failures++;
+            continue;
+        }
+        printf("load OK: %s  n_primes=%u shift=%u gap_target=%llu "
+               "window=%llu survivors=%llu\n",
+               argv[a], frt.n_primes, frt.shift,
+               (unsigned long long)frt.gap_target,
+               (unsigned long long)frt.window,
+               (unsigned long long)frt.n_survivors);
+        crt_runtime_free(&frt);
+    }
 
     if (failures == 0) {
         printf("\nALL TESTS PASSED\n");

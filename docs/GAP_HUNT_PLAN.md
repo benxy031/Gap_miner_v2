@@ -193,3 +193,20 @@ windows processed cleanly on shift1017_p130_lex_m30.  Note: the Makefile has
 no header dependencies — a header-only change needs `make clean` before the
 rebuild (stale `gpu_adapter.o` masked the fix initially).  For shift >=
 ~2000 use `GAP_HUNT_BATCH=16` (per-window survivors scale with logbase).
+
+### 2026-09-02 (later) — double-overflow merit bug: shift >= ~770 lost ALL gaps
+
+`mpz_get_d` overflows to +inf for values > 2^1024, so `merit =
+gap / log(mpz_get_d(start))` silently became 0 at shift 1017 (1273-bit
+starts): every gap fell at the threshold gate — 0 gaps over 468k windows at
+merit 20, and 0 over 8,608 windows even at merit 8 (expected ~570).  Fixed
+with an overflow-safe `gh_log_mpz` (mantissa + exponent via mpz_get_d_2exp).
+Same class found and fixed in `gap_candidate.c` (density heuristic, no
+readers yet) and in `test_gap_hunt.c` (the validator's own merit arithmetic
+— it flagged all 837 post-fix records as failures).  The MINING scan
+(`gap_detection.c`) already had `mpz_ln` + a 1254-bit regression test from
+an earlier session, so mining was NOT losing gaps; record_log uses the
+`_big` (full-decimal) variants in the CRT path.  `test_crt_runtime` now
+accepts file arguments and loads every fleet CRT file (139/139 OK).
+Validation after fix: 60s at shift1017/min-merit 8 -> 837 gaps, best
+15.58; 837/837 exact (nextprime + merit arithmetic).

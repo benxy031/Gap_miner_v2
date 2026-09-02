@@ -340,6 +340,16 @@ static void gh_report_gap(FILE *out, uint64_t *gaps, double *best,
     (*gaps)++;
 }
 
+/* ln(n) via mantissa+exponent: mpz_get_d overflows (>2^1024) to +inf,
+   which silently zeroed every merit at shift 1017 (1273-bit starts). */
+static double gh_log_mpz(const mpz_t n) {
+    if (mpz_sgn(n) <= 0)
+        return 0.0;
+    signed long int e = 0;
+    double m = mpz_get_d_2exp(&e, n); /* n = m * 2^e, 0.5 <= |m| < 1 */
+    return log(m) + (double)e * 0.69314718055994530942;
+}
+
 /* Chain consecutive primes within each window of a collected flight,
    report every BPSW-verified gap with merit >= min_merit in the
    `<gap> <merit> <startprime>` format, and advance the counters.
@@ -369,7 +379,7 @@ static void gh_batch_process(struct gh_batch *b, const uint8_t *flags,
             if (*have_last) {
                 mpz_sub(p2, p1, last_prime);
                 /* True merit (record convention): gap / ln(start). */
-                double merit = mpz_get_d(p2) / log(mpz_get_d(last_prime));
+                double merit = mpz_get_d(p2) / gh_log_mpz(last_prime);
                 if (merit >= cfg->min_merit) {
                     int direct = !g->quarter ||
                         (prev_off < g->region_start &&
@@ -434,7 +444,7 @@ static void gh_batch_process(struct gh_batch *b, const uint8_t *flags,
                                 mpz_add_ui(re, re, res[r].offset_p2);
                                 double tm =
                                     (double)res[r].gap_length /
-                                    log(mpz_get_d(rs));
+                                    gh_log_mpz(rs);
                                 if (baillie_psw_test(rs) &&
                                     baillie_psw_test(re)) {
                                     char *sd = mpz_get_str(NULL, 10, rs);

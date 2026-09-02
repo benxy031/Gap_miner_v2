@@ -51,13 +51,18 @@ void gap_candidate_finalize(struct gap_candidate *gc) {
         return;
     }
     
-    /* Density heuristic: count / ln(base) */
-    double base_d = mpz_get_d(gc->base);
-    if (base_d > 1.0) {
-        gc->candidate_density = (double)gc->count / log(base_d);
-    } else {
+    /* Density heuristic: count / ln(base).  Overflow-safe: mpz_get_d
+       overflows to +inf above 2^1024 (shift >= ~770), silently zeroing
+       the density for large shifts. */
+    if (mpz_sgn(gc->base) <= 0) {
         gc->candidate_density = 0.0;
+        return;
     }
+    signed long int e = 0;
+    double m = mpz_get_d_2exp(&e, gc->base); /* base = m * 2^e */
+    double ln_base = log(m) + (double)e * 0.69314718055994530942;
+    gc->candidate_density = ln_base > 0.0
+        ? (double)gc->count / ln_base : 0.0;
 }
 
 void gap_candidate_get(const struct gap_candidate *gc, uint32_t idx, mpz_t dest) {

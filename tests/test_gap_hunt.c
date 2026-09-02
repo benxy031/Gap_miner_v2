@@ -62,10 +62,14 @@ int main(int argc, char *argv[]) {
 
         mpz_add_ui(end, start, (unsigned long)gap);
 
-        /* True merit arithmetic: merit must equal gap / ln(start). */
+        /* True merit arithmetic: merit must equal gap / ln(start).
+           Overflow-safe ln: mpz_get_d overflows above 2^1024 (shift >=
+           ~770), which would zero the expected merit here. */
         {
-            double true_merit =
-                (double)gap / log(mpz_get_d(start));
+            signed long int e = 0;
+            double m = mpz_get_d_2exp(&e, start); /* start = m * 2^e */
+            double ln_start = log(m) + (double)e * 0.69314718055994530942;
+            double true_merit = (double)gap / ln_start;
             if (fabs(merit - true_merit) > 0.002) {
                 fprintf(stderr,
                         "line %d: FAIL merit %.4f != gap/ln(start) %.6f\n",

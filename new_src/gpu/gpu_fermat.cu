@@ -551,34 +551,17 @@ struct CgbnFermatParams {
     static const uint32_t TPI           = TPI_VAL;
 };
 
-/* Single kernel template: instantiated for each (BITS, TPI) pair.
-   uint64_t[BITS/64] and cgbn_mem_t<BITS> share the same little-endian
-   uint32_t layout, so reinterpret_cast between them is safe.           */
-
-template<uint32_t BITS, uint32_t TPI_VAL>
-__global__ static
-void cgbn_fermat_kernel_t(cgbn_mem_t<BITS> *cands,
-                          uint8_t * __restrict__ results,
-                          uint32_t n)
+/* Miller-Rabin base 2 on an already-loaded odd N.  Returns 1 = probable
+   prime, 0 = composite.  Shared by the batch kernel and the jump-scan walk
+   kernel (Kehrig-style serial chains) so both paths use IDENTICAL math. */
+template<uint32_t BITS, uint32_t TPI_VAL, typename env_t>
+__device__ static __forceinline__
+uint8_t cgbn_mr2(env_t &env, typename env_t::cgbn_t &N)
 {
-    int32_t id = (int32_t)((blockIdx.x * blockDim.x + threadIdx.x) / TPI_VAL);
-    if ((uint32_t)id >= n) return;
-
-    typedef cgbn_context_t<TPI_VAL, CgbnFermatParams<TPI_VAL>> ctx_t;
-    typedef cgbn_env_t<ctx_t, BITS>                             env_t;
-    typedef typename env_t::cgbn_t                              bn_t;
-
-    ctx_t    ctx(cgbn_no_checks);
-    env_t    env(ctx);
-    bn_t     N, e, d, r, t, base, mont_one, mont_nm1;
+    typename env_t::cgbn_t e, d, r, t, base, mont_one, mont_nm1;
     uint32_t np0;
     int32_t  pos;
 
-    cgbn_load    (env, N,    cands + id);
-    if ((cgbn_extract_bits_ui32(env, N, 0, 1) & 1u) == 0u) {
-        results[id] = 0;
-        return;
-    }
     cgbn_sub_ui32(env, e,    N, 1);              /* e = n-1 */
 
     /* Miller-Rabin base 2: n-1 = d · 2^s, d odd */
@@ -616,7 +599,36 @@ void cgbn_fermat_kernel_t(cgbn_mem_t<BITS> *cands,
         if (!ok && cgbn_compare(env, r, mont_nm1) == 0)
             ok = 1;
     }
-    results[id] = ok;
+    return ok;
+}
+
+/* Single kernel template: instantiated for each (BITS, TPI) pair.
+   uint64_t[BITS/64] and cgbn_mem_t<BITS> share the same little-endian
+   uint32_t layout, so reinterpret_cast between them is safe.           */
+
+template<uint32_t BITS, uint32_t TPI_VAL>
+__global__ static
+void cgbn_fermat_kernel_t(cgbn_mem_t<BITS> *cands,
+                          uint8_t * __restrict__ results,
+                          uint32_t n)
+{
+    int32_t id = (int32_t)((blockIdx.x * blockDim.x + threadIdx.x) / TPI_VAL);
+    if ((uint32_t)id >= n) return;
+
+    typedef cgbn_context_t<TPI_VAL, CgbnFermatParams<TPI_VAL>> ctx_t;
+    typedef cgbn_env_t<ctx_t, BITS>                             env_t;
+    typedef typename env_t::cgbn_t                              bn_t;
+
+    ctx_t    ctx(cgbn_no_checks);
+    env_t    env(ctx);
+    bn_t     N;
+
+    cgbn_load    (env, N,    cands + id);
+    if ((cgbn_extract_bits_ui32(env, N, 0, 1) & 1u) == 0u) {
+        results[id] = 0;
+        return;
+    }
+    results[id] = cgbn_mr2<BITS, TPI_VAL>(env, N);
 }
 
 /* SoA variant for CGBN path.
@@ -699,6 +711,131 @@ void cgbn_fermat_kernel_soa_t(const uint64_t * __restrict__ cands_soa,
             ok = 1;
     }
     results[id] = ok;
+}
+
+/* ═══════════════════════════════════════════════════════════════════
+ *  Jump-scan walk kernel (Kehrig-style gap finding)
+ *
+ *  One thread block per window runs a SERIAL Miller-Rabin chain over the
+ *  window's survivors: confirm the first prime, then jump forward by the
+ *  gap threshold and walk backward until a prime is found.  If the walk
+ *  reaches the chain prime itself, the gap is >= threshold — the true
+ *  upper endpoint is found by a forward scan and the pair is recorded.
+ *  This tests ~1.5 survivors per prime instead of ALL survivors; windows
+ *  are independent, so many windows run in parallel across SMs.
+ *
+ *  Output per window: packed (start_off << 32 | end_off) pairs and a
+ *  count.  A count of max_gaps_per_window+1 is the fail-closed overflow
+ *  sentinel (the host rejects the batch).
+ * ═══════════════════════════════════════════════════════════════════ */
+template<uint32_t BITS, uint32_t TPI_VAL>
+__global__ static
+void cgbn_jump_scan_kernel_t(const uint64_t * __restrict__ cands_aos,
+                             const uint64_t * __restrict__ offs,
+                             const uint32_t * __restrict__ counts,
+                             const uint32_t * __restrict__ cums,
+                             const uint64_t * __restrict__ thresholds,
+                             uint32_t active_limbs,
+                             uint32_t max_gaps_per_window,
+                             uint64_t * __restrict__ out_gaps,
+                             uint32_t * __restrict__ out_counts)
+{
+    uint32_t w = blockIdx.x;
+
+    typedef cgbn_context_t<TPI_VAL, CgbnFermatParams<TPI_VAL>> ctx_t;
+    typedef cgbn_env_t<ctx_t, BITS>                             env_t;
+    typedef typename env_t::cgbn_t                              bn_t;
+
+    ctx_t    ctx(cgbn_no_checks);
+    env_t    env(ctx);
+    bn_t     N;
+
+    uint32_t base_idx = cums[w];
+    uint32_t nc       = counts[w];
+    const uint64_t *cand = cands_aos + (size_t)base_idx * (size_t)active_limbs;
+    const uint64_t *woff = offs + base_idx;
+    uint64_t thresh = thresholds[w];
+
+    uint32_t out = 0;
+    uint32_t overflow = 0;
+
+    /* First prime in the window: its predecessor is unknown (windows are
+       the primorial P apart), so no gap can end at it — same semantics as
+       the batch-path host chaining. */
+    uint32_t p = 0;
+    int found = 0;
+    for (uint32_t i = 0; i < nc; i++) {
+        const cgbn_mem_t<BITS> *cp =
+            reinterpret_cast<const cgbn_mem_t<BITS> *>(
+                cand + (size_t)i * (size_t)active_limbs);
+        cgbn_load(env, N, const_cast<cgbn_mem_t<BITS> *>(cp));
+        if ((cgbn_extract_bits_ui32(env, N, 0, 1) & 1u) != 0u &&
+            cgbn_mr2<BITS, TPI_VAL>(env, N)) {
+            p = i;
+            found = 1;
+            break;
+        }
+    }
+    if (!found) {
+        out_counts[w] = 0;
+        return;
+    }
+
+    while (1) {
+        uint32_t q = p + 1;
+        while (q < nc && (woff[q] - woff[p]) < thresh)
+            q++;
+        if (q >= nc)
+            break;
+
+        /* Walk backward from q-1 down to p+1; the first prime found is the
+           chain's next link (everything above it is composite). */
+        uint32_t r = 0;
+        int have_r = 0;
+        for (uint32_t j = q - 1; j > p; j--) {
+            const cgbn_mem_t<BITS> *cp =
+                reinterpret_cast<const cgbn_mem_t<BITS> *>(
+                    cand + (size_t)j * (size_t)active_limbs);
+            cgbn_load(env, N, const_cast<cgbn_mem_t<BITS> *>(cp));
+            if ((cgbn_extract_bits_ui32(env, N, 0, 1) & 1u) != 0u &&
+                cgbn_mr2<BITS, TPI_VAL>(env, N)) {
+                r = j;
+                have_r = 1;
+                break;
+            }
+        }
+        if (have_r) {
+            p = r;
+            continue;
+        }
+
+        /* Backward walk hit p: all of (p, q) is composite, so the gap
+           p -> next-prime is >= threshold.  Find the true upper endpoint. */
+        uint32_t u = q;
+        int have_u = 0;
+        for (; u < nc; u++) {
+            const cgbn_mem_t<BITS> *cp =
+                reinterpret_cast<const cgbn_mem_t<BITS> *>(
+                    cand + (size_t)u * (size_t)active_limbs);
+            cgbn_load(env, N, const_cast<cgbn_mem_t<BITS> *>(cp));
+            if ((cgbn_extract_bits_ui32(env, N, 0, 1) & 1u) != 0u &&
+                cgbn_mr2<BITS, TPI_VAL>(env, N)) {
+                have_u = 1;
+                break;
+            }
+        }
+        if (!have_u)
+            break;   /* window cut — same semantics as the batch path */
+
+        if (out < max_gaps_per_window)
+            out_gaps[(size_t)w * (size_t)max_gaps_per_window + out] =
+                ((uint64_t)(uint32_t)woff[p] << 32) | (uint32_t)woff[u];
+        else
+            overflow = 1;
+        out++;
+        p = u;
+    }
+    out_counts[w] = overflow ? (max_gaps_per_window + 1) : out;
 }
 
 #define CGBN_FERMAT_AVAILABLE 1
@@ -1027,6 +1164,15 @@ struct gpu_fermat_ctx {
        the sum of cudaEventElapsedTime(start, end) over every batch, i.e.
        GPU-busy time excluding host launch/sync gaps. */
     uint64_t    accounted_us;
+
+    /* Jump-scan walk buffers (GAP_HUNT jump mode, Kehrig-style chains) */
+    uint64_t *d_jump_gaps;
+    uint32_t *d_jump_counts;
+    uint32_t *d_jump_counts_in;   /* per-window nc upload       */
+    uint32_t *d_jump_cums_in;     /* per-window cum upload      */
+    uint64_t *d_jump_thresh_in;   /* per-window gap thresholds  */
+    uint32_t  jump_windows_cap;
+    uint32_t  jump_gap_cap;
 };
 
 static __host__ __forceinline__ cudaError_t ensure_device(int device_id)
@@ -1518,6 +1664,174 @@ const char *gpu_fermat_kernel_label(int limbs)
     return scalar_buf;
 }
 
+/* ═══════════════════════════════════════════════════════════════════
+ *  Jump-scan walk API (GAP_HUNT jump mode)
+ * ═══════════════════════════════════════════════════════════════════ */
+
+/* Allocate the jump-scan device buffers (once per context). */
+int gpu_fermat_jump_alloc(gpu_fermat_ctx *ctx, uint32_t n_windows,
+                          uint32_t max_gaps_per_window)
+{
+    if (!ctx || n_windows == 0 || max_gaps_per_window == 0)
+        return -1;
+    if (ctx->d_jump_gaps &&
+        ctx->jump_windows_cap >= n_windows &&
+        ctx->jump_gap_cap == max_gaps_per_window)
+        return 0;   /* already sized */
+
+    cudaError_t err = ensure_device(ctx->device_id);
+    if (err != cudaSuccess)
+        return -1;
+
+    if (ctx->d_jump_gaps)       cudaFree(ctx->d_jump_gaps);
+    if (ctx->d_jump_counts)     cudaFree(ctx->d_jump_counts);
+    if (ctx->d_jump_counts_in)  cudaFree(ctx->d_jump_counts_in);
+    if (ctx->d_jump_cums_in)    cudaFree(ctx->d_jump_cums_in);
+    if (ctx->d_jump_thresh_in)  cudaFree(ctx->d_jump_thresh_in);
+    ctx->d_jump_gaps = NULL;
+    ctx->d_jump_counts = NULL;
+    ctx->d_jump_counts_in = NULL;
+    ctx->d_jump_cums_in = NULL;
+    ctx->d_jump_thresh_in = NULL;
+    ctx->jump_windows_cap = 0;
+    ctx->jump_gap_cap = 0;
+
+    if (cudaMalloc(&ctx->d_jump_gaps,
+                   (size_t)n_windows * max_gaps_per_window *
+                       sizeof(uint64_t)) != cudaSuccess)
+        return -1;
+    if (cudaMalloc(&ctx->d_jump_counts,
+                   (size_t)n_windows * sizeof(uint32_t)) != cudaSuccess)
+        return -1;
+    if (cudaMalloc(&ctx->d_jump_counts_in,
+                   (size_t)n_windows * sizeof(uint32_t)) != cudaSuccess)
+        return -1;
+    if (cudaMalloc(&ctx->d_jump_cums_in,
+                   (size_t)n_windows * sizeof(uint32_t)) != cudaSuccess)
+        return -1;
+    if (cudaMalloc(&ctx->d_jump_thresh_in,
+                   (size_t)n_windows * sizeof(uint64_t)) != cudaSuccess)
+        return -1;
+
+    ctx->jump_windows_cap = n_windows;
+    ctx->jump_gap_cap = max_gaps_per_window;
+    return 0;
+}
+
+/* Synchronous jump-scan over n_windows windows.  Uploads the per-window
+   counts/cums/thresholds, runs one thread block per window, and downloads
+   the packed (start_off<<32 | end_off) gap pairs + per-window counts.
+   Returns 0 on success, -1 on error (or fail-closed overflow sentinel:
+   out_counts[i] == max_gaps_per_window + 1). */
+int gpu_fermat_jump_scan(gpu_fermat_ctx *ctx,
+                         const uint64_t *d_cands,
+                         const uint64_t *d_offsets,
+                         const uint32_t *h_counts,
+                         const uint32_t *h_cums,
+                         const uint64_t *h_thresholds,
+                         int active_limbs,
+                         uint32_t n_windows,
+                         uint64_t *h_gaps,
+                         uint32_t *h_counts_out)
+{
+    if (!ctx || !d_cands || !d_offsets || !h_counts || !h_cums ||
+        !h_thresholds || !h_gaps || !h_counts_out || n_windows == 0)
+        return -1;
+    if (!ctx->d_jump_gaps || ctx->jump_windows_cap < n_windows)
+        return -1;
+    const uint32_t cap = ctx->jump_gap_cap;
+    if (cap == 0)
+        return -1;
+
+    cudaError_t err = ensure_device(ctx->device_id);
+    if (err != cudaSuccess)
+        return -1;
+
+    err = cudaMemcpy(ctx->d_jump_counts_in, h_counts,
+                     (size_t)n_windows * sizeof(uint32_t),
+                     cudaMemcpyHostToDevice);
+    if (err != cudaSuccess) return -1;
+    err = cudaMemcpy(ctx->d_jump_cums_in, h_cums,
+                     (size_t)n_windows * sizeof(uint32_t),
+                     cudaMemcpyHostToDevice);
+    if (err != cudaSuccess) return -1;
+    err = cudaMemcpy(ctx->d_jump_thresh_in, h_thresholds,
+                     (size_t)n_windows * sizeof(uint64_t),
+                     cudaMemcpyHostToDevice);
+    if (err != cudaSuccess) return -1;
+
+    if (cudaMemsetAsync(ctx->d_jump_counts, 0,
+                        (size_t)n_windows * sizeof(uint32_t),
+                        ctx->stream[0]) != cudaSuccess)
+        return -1;
+
+#if defined(CGBN_FERMAT_AVAILABLE)
+    /* Same (BITS, TPI) instantiation set as launch_fermat's CGBN switch. */
+    #define JUMP_LAUNCH(AL_VAL, TPI_VAL) \
+        do { \
+            cgbn_jump_scan_kernel_t<(AL_VAL)*64u, (TPI_VAL)> \
+                <<<(unsigned int)n_windows, (unsigned int)(TPI_VAL), 0, \
+                   ctx->stream[0]>>>( \
+                    d_cands, d_offsets, \
+                    ctx->d_jump_counts_in, ctx->d_jump_cums_in, \
+                    ctx->d_jump_thresh_in, (uint32_t)active_limbs, cap, \
+                    ctx->d_jump_gaps, ctx->d_jump_counts); \
+            err = cudaGetLastError(); \
+        } while (0)
+
+    switch (active_limbs) {
+        #if NL >= 2
+        case 2:  JUMP_LAUNCH( 2, 4);  break;
+        #endif
+        #if NL >= 4
+        case 4:  JUMP_LAUNCH( 4, 8);  break;
+        #endif
+        #if NL >= 6
+        case 6:  JUMP_LAUNCH( 6, 4);  break;
+        #endif
+        #if NL >= 8
+        case 8:  JUMP_LAUNCH( 8, 8);  break;
+        #endif
+        #if NL >= 12
+        case 12: JUMP_LAUNCH(12, 8);  break;
+        #endif
+        #if NL >= 16
+        case 16: JUMP_LAUNCH(16, 8);  break;
+        #endif
+        #if NL >= 20
+        case 20: JUMP_LAUNCH(20, 8);  break;
+        #endif
+        default:
+            return -1;
+    }
+    #undef JUMP_LAUNCH
+    if (err != cudaSuccess)
+        return -1;
+#else
+    (void)active_limbs;
+    return -1;
+#endif
+
+    err = cudaStreamSynchronize(ctx->stream[0]);
+    if (err != cudaSuccess)
+        return -1;
+    err = cudaMemcpy(h_counts_out, ctx->d_jump_counts,
+                     (size_t)n_windows * sizeof(uint32_t),
+                     cudaMemcpyDeviceToHost);
+    if (err != cudaSuccess)
+        return -1;
+    for (uint32_t w = 0; w < n_windows; w++) {
+        if (h_counts_out[w] > cap)
+            return -1;   /* overflow sentinel: fail-closed */
+    }
+    err = cudaMemcpy(h_gaps, ctx->d_jump_gaps,
+                     (size_t)n_windows * cap * sizeof(uint64_t),
+                     cudaMemcpyDeviceToHost);
+    if (err != cudaSuccess)
+        return -1;
+    return 0;
+}
+
 void gpu_fermat_destroy(gpu_fermat_ctx *ctx)
 {
     if (!ctx) return;
@@ -1549,5 +1863,10 @@ void gpu_fermat_destroy(gpu_fermat_ctx *ctx)
             pthread_mutex_destroy(&ctx->slot_mu[s]);
         }
     }
+    if (ctx->d_jump_gaps)       cudaFree(ctx->d_jump_gaps);
+    if (ctx->d_jump_counts)     cudaFree(ctx->d_jump_counts);
+    if (ctx->d_jump_counts_in)  cudaFree(ctx->d_jump_counts_in);
+    if (ctx->d_jump_cums_in)    cudaFree(ctx->d_jump_cums_in);
+    if (ctx->d_jump_thresh_in)  cudaFree(ctx->d_jump_thresh_in);
     free(ctx);
 }

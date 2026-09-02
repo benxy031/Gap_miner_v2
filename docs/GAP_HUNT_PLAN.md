@@ -233,3 +233,20 @@ gap_miner: one window per nonce => latency-bound serial chain, MR is not the
 dominant cost, and the jump misses small gaps that RGM/gap_dist accumulate
 in stride=1 mode.  For mining the transferable candidate would be
 fixed-high-limb Montgomery instead.
+
+### 2026-09-02 (night) — jump-strategy IMPLEMENTED and FALSIFIED for throughput
+
+Implemented the Kehrig-style walk for GAP_HUNT behind `GAP_HUNT_JUMP`: the
+CGBN Miller-Rabin test was factored into a shared `__device__` function and
+a new `cgbn_jump_scan_kernel_t` runs one serial chain per window (one CGBN
+block per window, 32 windows in parallel), reporting gaps >= threshold in
+offset units; `gpu_fermat_jump_scan()` API + `gpu_sieve_device_offsets()`
+accessor.  CORRECTNESS: parity-exact — identical gap sets to the batch path
+on shift507 (299/299) and shift1017 (411/411), byte-for-byte after sorting.
+THROUGHPUT: 6.3x SLOWER at shift1017 (23.5 vs 147 win/s) — the cooperative
+CGBN test has ~10 ms latency per test under load, which 32-way window
+parallelism cannot hide (Kehrig's win comes from per-thread 128-bit scalar
+tests with ~100x lower latency).  Also diagnostic: batch throughput is the
+same at merit 8 and 18 (143 vs 147 win/s), so shift1017 is MARK/EXTRACT-
+bound, not MR-bound — the jump was attacking a non-bottleneck.  Reopen
+trigger: a per-thread low-latency MR at AL=20, or >500 concurrent windows.

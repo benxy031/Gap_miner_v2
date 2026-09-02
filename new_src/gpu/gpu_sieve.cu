@@ -1135,6 +1135,11 @@ uint64_t *gpu_sieve_candidate_buffer(gpu_sieve_ctx *ctx, int buf) {
     return ctx ? ctx->d_cands_aos[buf & 1] : NULL;
 }
 
+/* Device-side survivor offsets (scratch, see gpu_sieve.h). */
+const uint64_t *gpu_sieve_device_offsets(gpu_sieve_ctx *ctx) {
+    return ctx ? ctx->d_offsets : NULL;
+}
+
 void gpu_sieve_destroy(gpu_sieve_ctx *ctx) {
     if (!ctx) return;
 

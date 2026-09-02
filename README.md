@@ -306,6 +306,7 @@ Environment variables:
 | `GAP_HUNT_BATCH` | `32` | GAP_HUNT windows per accumulated MR batch (`1..32`). Measured on the dev host (RTX 3070, mining running): **893 win/s at 32 vs 706 at 16 vs 808 at K=8**; batches are guarded against silent truncation at the 160000-candidate MR limit (fail-closed) |
 | `GAP_HUNT_QUARTER` | off | **FALSIFIED experiment** — 4-visible-class scan + on-demand hidden resolution (containment lemma, exact — parity-tested identical to full-class). At record thresholds (merit ≥ 15) the visible-gap trigger fires ~1.3×/window (visible gaps inherit the σ-tail with mean merit ≈ 8) and CPU resolution costs ~40 ms each → 46 win/s vs 893 full-class. Kept off; exact but not profitable |
 | `GAP_HUNT_KMAX` | none | Stop the walk at this k (tests/benchmarks) |
+| `GAP_HUNT_JUMP` | off | **FALSIFIED experiment** — Kehrig-style per-window serial CGBN walk (jump-by-threshold + backward search, ~1.5 MR tests per prime instead of all survivors). Exact: parity-identical gap sets on shift507 (299/299) and shift1017 (411/411). But 6.3× slower at shift1017 (23.5 vs 147 win/s) — CGBN cooperative-test latency (~10 ms/test under load) cannot be hidden by 32-way window parallelism, and the 1017 batch path is mark/extract-bound, not MR-bound. Kept off |
 
 ## Testing
 

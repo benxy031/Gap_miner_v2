@@ -146,6 +146,8 @@ static int load_state(const char *path, uint64_t *k, mpz_t last_prime,
 static int g_batch = 32;       /* GAP_HUNT_BATCH env, clamped 1..MAX */
 static int g_quarter = 0;      /* GAP_HUNT_QUARTER env: 4-visible-class scan */
 static uint64_t g_kmax = 0;    /* GAP_HUNT_KMAX env: stop hook (tests/bench) */
+#define GAP_HUNT_JUMP_CAP 16   /* per-window gap capacity in jump mode */
+static int g_jump = 0;         /* GAP_HUNT_JUMP env: Kehrig-style walk */
 
 struct gh_batch {
     int active;                 /* submitted, not yet collected */
@@ -158,6 +160,10 @@ struct gh_batch {
     mpz_t win_base[GAP_HUNT_BATCH_MAX];
     uint64_t *win_off[GAP_HUNT_BATCH_MAX];  /* host offset slices */
     uint8_t base_even[GAP_HUNT_BATCH_MAX];  /* template prefilter validity */
+    /* jump mode results (host copies of the device walk's output) */
+    uint32_t jump_n[GAP_HUNT_BATCH_MAX];
+    uint32_t jump_s[GAP_HUNT_BATCH_MAX][GAP_HUNT_JUMP_CAP];
+    uint32_t jump_e[GAP_HUNT_BATCH_MAX][GAP_HUNT_JUMP_CAP];
 };
 
 struct gh_ctx {
@@ -181,6 +187,11 @@ struct gh_ctx {
     mpz_t bk, wb;               /* scratch */
     mpz_t b0;
     mpz_t P;
+    int jump;                   /* GAP_HUNT_JUMP active */
+    double min_merit;           /* report threshold (jump thresholds) */
+    uint64_t jump_thresh[GAP_HUNT_BATCH_MAX];
+    uint64_t jump_gaps[GAP_HUNT_BATCH_MAX * GAP_HUNT_JUMP_CAP];
+    uint32_t jump_n[GAP_HUNT_BATCH_MAX];
 };
 
 static void gh_batch_init(struct gh_batch *b) {
@@ -192,6 +203,16 @@ static void gh_batch_init(struct gh_batch *b) {
 static void gh_batch_clear(struct gh_batch *b) {
     for (int i = 0; i < GAP_HUNT_BATCH_MAX; i++)
         mpz_clear(b->win_base[i]);
+}
+
+/* ln(n) via mantissa+exponent: mpz_get_d overflows (>2^1024) to +inf,
+   which silently zeroed every merit at shift 1017 (1273-bit starts). */
+static double gh_log_mpz(const mpz_t n) {
+    if (mpz_sgn(n) <= 0)
+        return 0.0;
+    signed long int e = 0;
+    double m = mpz_get_d_2exp(&e, n); /* n = m * 2^e, 0.5 <= |m| < 1 */
+    return log(m) + (double)e * 0.69314718055994530942;
 }
 
 /* Fill one flight with K windows (mark + extract into the slot's candidate
@@ -309,6 +330,44 @@ static int gh_batch_fill(struct gh_batch *b, int slot, uint64_t k0,
     b->slot = slot;
     if (cum == 0)
         return 1;               /* nothing to MR-test; process as empty */
+    if (g->jump) {
+        /* Jump mode: per-window serial MR chain on the GPU (Kehrig-style),
+           ~1.5 tests per prime instead of all survivors.  Synchronous, so
+           the batch is processed immediately (active stays 0). */
+        for (uint32_t i = 0; i < (uint32_t)g_batch; i++) {
+            g->jump_thresh[i] = (uint64_t)ceil(
+                g->min_merit * gh_log_mpz(b->win_base[i]));
+            if (g->jump_thresh[i] < 1)
+                g->jump_thresh[i] = 1;
+        }
+        uint64_t *d_batch = gpu_sieve_candidate_buffer(g->sieve, slot);
+        const uint64_t *d_offs = gpu_sieve_device_offsets(g->sieve);
+        if (!d_offs ||
+            gpu_fermat_jump_scan(g->fermat, d_batch, d_offs,
+                                 b->count, b->cum, g->jump_thresh,
+                                 g->fermat_limbs, (uint32_t)g_batch,
+                                 g->jump_gaps, g->jump_n) != 0) {
+            fprintf(stderr, "[GAP_HUNT] fill fail: jump scan (k0=%llu)\n",
+                    (unsigned long long)k0);
+            return 0;
+        }
+        for (uint32_t i = 0; i < (uint32_t)g_batch; i++) {
+            if (g->jump_n[i] > GAP_HUNT_JUMP_CAP) {
+                fprintf(stderr, "[GAP_HUNT] fill fail: jump overflow "
+                        "(k=%llu i=%u n=%u)\n",
+                        (unsigned long long)(k0 + i), i, g->jump_n[i]);
+                return 0;       /* fail-closed */
+            }
+            b->jump_n[i] = g->jump_n[i];
+            for (uint32_t jj = 0; jj < b->jump_n[i]; jj++) {
+                uint64_t pair = g->jump_gaps[
+                    (size_t)i * GAP_HUNT_JUMP_CAP + jj];
+                b->jump_s[i][jj] = (uint32_t)(pair >> 32);
+                b->jump_e[i][jj] = (uint32_t)pair;
+            }
+        }
+        return 1;
+    }
     uint64_t *d_batch = gpu_sieve_candidate_buffer(g->sieve, slot);
     if (gpu_fermat_submit_device(g->fermat, slot, d_batch, (size_t)cum) != 0) {
         fprintf(stderr, "[GAP_HUNT] fill fail: fermat submit "
@@ -340,16 +399,6 @@ static void gh_report_gap(FILE *out, uint64_t *gaps, double *best,
     (*gaps)++;
 }
 
-/* ln(n) via mantissa+exponent: mpz_get_d overflows (>2^1024) to +inf,
-   which silently zeroed every merit at shift 1017 (1273-bit starts). */
-static double gh_log_mpz(const mpz_t n) {
-    if (mpz_sgn(n) <= 0)
-        return 0.0;
-    signed long int e = 0;
-    double m = mpz_get_d_2exp(&e, n); /* n = m * 2^e, 0.5 <= |m| < 1 */
-    return log(m) + (double)e * 0.69314718055994530942;
-}
-
 /* Chain consecutive primes within each window of a collected flight,
    report every BPSW-verified gap with merit >= min_merit in the
    `<gap> <merit> <startprime>` format, and advance the counters.
@@ -365,6 +414,35 @@ static void gh_batch_process(struct gh_batch *b, const uint8_t *flags,
                              uint64_t *gaps, double *best,
                              FILE *out, mpz_t p1, mpz_t p2,
                              mpz_t last_prime, int *have_last) {
+    if (g->jump) {
+        /* Jump mode: the device walk already certified the chains; only
+           BPSW-verify the reported endpoints and emit (the walk tests the
+           same MR2 the batch path uses, so the gap set is identical). */
+        for (uint32_t i = 0; i < b->n_windows; i++) {
+            for (uint32_t jj = 0; jj < b->jump_n[i]; jj++) {
+                uint64_t off_s = b->jump_s[i][jj];
+                uint64_t off_e = b->jump_e[i][jj];
+                mpz_set(p1, b->win_base[i]);
+                mpz_add_ui(p1, p1, off_s);
+                mpz_set(p2, b->win_base[i]);
+                mpz_add_ui(p2, p2, off_e);
+                double merit = (double)(off_e - off_s) / gh_log_mpz(p1);
+                if (merit < cfg->min_merit)
+                    continue;   /* exact gate (threshold was on wb) */
+                if (baillie_psw_test(p1) && baillie_psw_test(p2)) {
+                    char *sd = mpz_get_str(NULL, 10, p1);
+                    char *ed = mpz_get_str(NULL, 10, p2);
+                    gh_report_gap(out, gaps, best,
+                                  (uint64_t)(off_e - off_s), merit,
+                                  sd, ed);
+                    free(sd);
+                    free(ed);
+                }
+            }
+        }
+        *windows += b->n_windows;
+        return;
+    }
     for (uint32_t i = 0; i < b->n_windows; i++) {
         /* Windows are P apart (NOT contiguous): chain only within the
            window; its first prime has an unknown predecessor. */
@@ -495,6 +573,9 @@ int gap_hunt_run(const struct gap_hunt_config *cfg) {
         const char *km = getenv("GAP_HUNT_KMAX");
         if (km && km[0])
             g_kmax = strtoull(km, NULL, 10);
+        const char *jv = getenv("GAP_HUNT_JUMP");
+        if (jv && jv[0] && atoi(jv) > 0)
+            g_jump = 1;
     }
 
     struct crt_runtime rt;
@@ -599,6 +680,19 @@ int gap_hunt_run(const struct gap_hunt_config *cfg) {
         return 1;
     }
     gpu_sieve_set_extract_accum(gpu_sieve, (uint32_t)g_batch);
+    if (g_jump) {
+        if (gpu_fermat_jump_alloc(fermat, (uint32_t)g_batch,
+                                  GAP_HUNT_JUMP_CAP) != 0) {
+            fprintf(stderr, "[GAP_HUNT] jump buffer alloc failed\n");
+            free(base_limbs);
+            gpu_sieve_destroy(gpu_sieve);
+            gpu_adapter_free(gpu);
+            sieve_core_free(&sieve);
+            mpz_clears(target, b0, P, p1, p2, last_prime, NULL);
+            crt_runtime_free(&rt);
+            return 1;
+        }
+    }
     base_limbs = (uint64_t *)calloc((size_t)gpu_limbs, sizeof(uint64_t));
     size_t win_cap = (size_t)sieve.candidate_capacity;
     uint64_t *offsets = (uint64_t *)malloc(
@@ -648,11 +742,12 @@ int gap_hunt_run(const struct gap_hunt_config *cfg) {
 
     fprintf(stderr,
             "[GAP_HUNT] walk: shift=%u n_primes=%u P bits=%.0f window=%llu "
-            "sieve=%u batch=%d quarter=%d kmax=%llu min_merit=%.6f k0=%llu "
-            "device=%d\n",
+            "sieve=%u batch=%d quarter=%d jump=%d kmax=%llu min_merit=%.6f "
+            "k0=%llu device=%d\n",
             rt.shift, rt.n_primes,
             (double)mpz_sizeinbase(P, 2),
             (unsigned long long)rt.window, sieve_primes, g_batch, g_quarter,
+            g_jump,
             (unsigned long long)g_kmax, cfg->min_merit,
             (unsigned long long)k, cfg->device);
 
@@ -682,6 +777,8 @@ int gap_hunt_run(const struct gap_hunt_config *cfg) {
     mpz_set(g.b0, b0);
     mpz_set(g.P, P);
     g.quarter = g_quarter;
+    g.jump = g_jump;
+    g.min_merit = cfg->min_merit;
     g.region_start = g_quarter ? back_limit : 0;
     g.tail_start = back_limit + rt.window;
     g.owned_limit = interval;   /* the whole scan is ours */

@@ -118,6 +118,23 @@ const char *gpu_fermat_device_name(gpu_fermat_ctx *ctx);
    compute the acc/wall (GPU utilization) metric in the rolling STATS. */
 uint64_t gpu_fermat_accounted_us(gpu_fermat_ctx *ctx);
 
+/* Jump-scan walk API (GAP_HUNT jump mode): one thread block per window runs
+   a serial Miller-Rabin chain (Kehrig-style), testing ~1.5 survivors per
+   confirmed prime instead of all survivors, and reports gaps >= threshold
+   in offset units.  Synchronous; windows are independent. */
+int gpu_fermat_jump_alloc(gpu_fermat_ctx *ctx, uint32_t n_windows,
+                          uint32_t max_gaps_per_window);
+int gpu_fermat_jump_scan(gpu_fermat_ctx *ctx,
+                         const uint64_t *d_cands,
+                         const uint64_t *d_offsets,
+                         const uint32_t *h_counts,
+                         const uint32_t *h_cums,
+                         const uint64_t *h_thresholds,
+                         int active_limbs,
+                         uint32_t n_windows,
+                         uint64_t *h_gaps,
+                         uint32_t *h_counts_out);
+
 /* Set the arithmetic limb count for this context.
    active_limbs = ceil((256 + shift) / 64) for Gapcoin.
    Reduces Montgomery multiplication from O(GPU_NLIMBS²) to O(active²).

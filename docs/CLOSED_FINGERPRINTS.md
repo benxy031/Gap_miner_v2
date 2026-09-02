@@ -35,6 +35,7 @@ the stronger labels require coverage or network evidence we do not have.
 | Producer-consumer overlap at shift=512 | 30% window queue drops (sieve outproduces GPU) | memory: monolithic 4T best | a consumer ≥ 2× faster |
 | `GPU_SIEVE_PAIR` (see above) | −58% | README | — |
 | Smart-scan tail-skip with per-pair hidden resolution at record thresholds | resolution cost > MR savings (same trigger-rate law as QUARTER_CLASS) | quarter-class parity/benchmark | — |
+| GAP_HUNT_JUMP (Kehrig-style serial per-window CGBN walk) | exact (parity 299/299 at 507, 411/411 at 1017) but 6.3x slower (23.5 vs 147 win/s): CGBN cooperative test latency ~10 ms under load, unhideable by 32-window parallelism; 1017 is mark/extract-bound anyway (143 win/s at m=8 vs 147 at m=18) | new_src/gpu/gpu_fermat.cu (cgbn_jump_scan_kernel_t), gap_hunt.c GAP_HUNT_JUMP | a per-thread low-latency MR at AL=20 (or >500 concurrent windows) |
 
 ## House rules
 

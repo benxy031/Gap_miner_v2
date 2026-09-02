@@ -168,6 +168,12 @@ void gpu_sieve_set_extract_accum(gpu_sieve_ctx *ctx, uint32_t k);
 /* Device AoS candidate buffer of ping-pong buf (0/1). */
 uint64_t *gpu_sieve_candidate_buffer(gpu_sieve_ctx *ctx, int buf);
 
+/* Device-side survivor offsets buffer (all extracted windows packed
+   contiguously at their slot_base).  GAP_HUNT jump mode reads it directly
+   on the GPU.  Scratch semantics: valid until the next extract into the
+   same buffer. */
+const uint64_t *gpu_sieve_device_offsets(gpu_sieve_ctx *ctx);
+
 /* Batched variant for multiple windows that share odd interval geometry.
    base_offsets: array of per-window base offsets (window starts), length=batch_count.
    host_bitmaps: contiguous output buffer packed as [batch_count][bitmap_words],

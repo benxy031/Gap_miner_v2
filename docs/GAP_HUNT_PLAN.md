@@ -298,3 +298,14 @@ covers differ in density (0.0719 vs 0.0590).  Discriminating tests: (a) same
 size, different cover: shift1017 m23 vs lex (both files exist); (b) a third
 size (e.g. shift998) for monotonicity.  Record projection at 1017 with
 sigma=1.35: ~183k reported gaps to the first record (progress ~4%).
+
+NOVELTY REGISTER additions (2026-09-02, from WCNT 2021 problemset,
+docs/wcnt-problems-2021.pdf):
+- N4 polynomial-gap analog (WCNT 021:13): "can there be more than n
+  consecutive reducible polynomials of degree n?" — the polynomial-world
+  twin of our integer prime-gap problem, with an explicit CRT construction
+  (P ≡ 0 mod x, P ≡ −1 mod x+r, ...) that is exactly our covering game over
+  polynomial moduli.  Status: speculative reference; the polynomial world
+  has freer moduli than Z, so studying what works there may localize our
+  entropy wall (Euclid + one-residue-per-prime).  No constructible
+  transfer yet; keep as a dormant pointer.

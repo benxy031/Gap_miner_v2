@@ -332,7 +332,8 @@ sampling remains the only route in Z.  N4 stays closed as a pointer with
 this verdict.
 
 N4 six-run follow-up (2026-09-02 late): is the cubic maximum 5?  Extended
-searches, all NEGATIVE for length 6:
+searches, all NEGATIVE for length 6:  [SUPERSEDED — external review
+2026-09-03 found the tools non-exhaustive; see correction block below.]
 - coefficient box A<=12, |B,C,D|<=120 (C tool tools/poly_gap_box.c): longest
   run 5, eight 5-families, 0 six-runs;
 - divisor-recursion search (tools/poly_gap_six.c, exhaustive over |D| with
@@ -342,10 +343,38 @@ CONJECTURE: no six consecutive reducible cubics exist (max = 5); unproven
 for A>=5 and |D|>500k.  Python reference: tools/poly_gap_search.py
 search_six().
 
-N4 six-run follow-up #2: A<=6 all q |D|<=20,000 -> 0 six-runs (poly_gap_six).
-Combined coverage so far: box A<=12,|B|,|C|,|D|<=120; A<=4 q in {1,2}
-|D|<=500k; A<=4 all q |D|<=50k; A<=6 all q |D|<=20k — all zero.  Conjecture
-"cubic maximum is 5" now probed from three independent directions.
+N4 six-run follow-up #2 [SUPERSEDED]: A<=6 all q |D|<=20,000 -> 0 six-runs
+(poly_gap_six).  Old coverage (box A<=12,|B|,|C|,|D|<=120; A<=4 q in {1,2}
+|D|<=500k; A<=4 all q |D|<=50k; A<=6 all q |D|<=20k) was produced by the
+non-exhaustive tools; replaced by the corrected reruns below.
+
+N4 external-review corrections + corrected reruns (2026-09-03, sources =
+commit 8a33edc): an external review found both tools NON-EXHAUSTIVE as
+written.  poly_gap_box.c skipped p==0, so D=0 was never marked and any run
+crossing D=0 was split.  poly_gap_six.c stored only +d divisors for
+positive and -d for negative constants (roots of the other sign were
+missed), gave the zero constant an empty divisor list, and always anchored
+the B,C solve at shifts 0,1 (dead when D or D+1 is 0).  Fixes: D=0
+explicit; both divisor signs; zero constant -> root 0; anchors = first two
+nonzero shifts; reduced p/q only; dynamic tables; __int128 throughout;
+bounds/allocation checks.  Both compile clean with
+-std=c11 -O2 -Wall -Wextra -Werror.  Discriminating test: box A<=1, BC=0,
+D<=1 reports longest run 3 (x^3-1, x^3, x^3+1) — old code reported 1.
+Known family recovered: box 4 24 24 -> longest 5, 4x^3-18x^2+22x,
+D=[-8..-4].
+
+CORRECTED reruns (commands, runtime and complete output preserved in
+/tmp/poly_gap_*.log; timing of the two concurrent runs includes
+contention):
+- box 12 120 120: longest run 5, P=4x^3-36x^2+103x, D=[-95..-91];
+  13 maximal runs reaching >=5 (old code said 8), 0 reaching >=6; 8.6s.
+- six 4 500000 1 (q in {1,2}): 0 witnesses; 1854s.
+- six 4 50000 0 (all q): 0 witnesses; 813s.
+- six 6 20000 0 (all q): 0 witnesses; 1601s.
+CONJECTURE RE-STATED on corrected code: no six consecutive reducible
+cubics exist (cubic maximum = 5), now validly probed in box
+A<=12,|B|,|C|,|D|<=120; A<=4 q in {1,2} |D|<=500k; A<=4 all q |D|<=50k;
+A<=6 all q |D|<=20k.  Still open for A>=5 and |D|>500k.
 
 N3 dataset update #2 (2026-09-02 late, 3060 fleet): f1 n=277,307 sigma
 1.262 +/- 0.002; f2 n=85,813 sigma 1.363 +/- 0.005 -> separation now

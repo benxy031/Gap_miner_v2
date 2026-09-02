@@ -354,3 +354,22 @@ N3 dataset update #2 (2026-09-02 late, 3060 fleet): f1 n=277,307 sigma
 at 1017: P=6.06e-6 per reported gap, expected ~165k gaps, progress 52%.
 Corrected gap throughput: ~50k exact gaps/hour per 3060 at shift1017
 (earlier "~860/h" notes were wrong — that is per ~minute).
+
+N5 mixed-precision transfer exam (2026-09-03, GTC SJ20 S21725 "Effective
+Use of Mixed Precision for HPC", Kate Clark/NVIDIA, QUDA): LQCD mixed
+precision = (a) defect correction — FP32/FP16 solver + FP64 residual
+check, valid because the solver problem is LINEAR; (b) 8/16-bit
+gauge-field compression + on-the-fly decompression, valid because LQCD
+is MEMORY-BANDWIDTH-bound; (c) TF32/FP16 tensor-core contractions with
+FP32 accumulate.  GAP_HUNT MR path is the opposite class: integer
+modular, NONLINEAR recurrence (every squaring feeds the next), register-
+bound at AL=20.  (a) has no mechanism here (no residual to correct —
+"approximate MR then correct" is the same work twice); (b) has nothing
+to compress (each candidate N_i shares no structure).  Only candidate
+transfer (hypothesis, low prior, UNTESTED): FP-ASSISTED reduction —
+q = floor(T/N) computed in FP64 FMA with +-1..2 integer correction
+(Bernstein-class); at 1280-bit needs ~13-double multi-double with no
+demonstrated win over CGBN integer Montgomery.  LESSON RECORDED: "mixed
+precision" is a conditional transfer, not a generic speedup — it only
+pays when the precision-loss mechanism matches (linearity / bandwidth /
+exact quotient correction).  N5 closed as a pointer with this verdict.

@@ -1,130 +1,273 @@
 /* poly_gap_six.c — direct search for SIX consecutive reducible cubics.
  *
- * For each D in [-DMAX,DMAX] and each q-combination (q_j | A), the only
- * possible root numerators of P+j are the DIVISORS of D+j (rational root
- * theorem).  Enumerate p_0,p_1 from the divisor lists of D, D+1, solve
- * B,C exactly (2x2, __int128 arithmetic), then verify j=2..5 by scanning
- * the divisor lists of D+2..D+5.  Exhaustive over |D| <= DMAX with NO
- * bound on B or C.
+ * For each nonzero constant N=D+j, every reduced rational root p/q has
+ * p | N and q | A.  Both signs of p must be enumerated.  If N==0, x=0 is
+ * already a root.  Two nonzero shifts are selected as anchors, B and C are
+ * solved exactly (2x2, __int128 arithmetic), and all remaining shifts are
+ * checked exactly.  Exhaustive over |D| <= DMAX with NO bound on B or C.
  *
- * Build: cc -O2 -o poly_gap_six poly_gap_six.c
+ * 2026-09-03 external-review corrections: both divisor signs stored (the
+ * original kept only +d for positive and -d for negative constants),
+ * zero constants automatically have root 0, anchors are the first two
+ * nonzero shifts (was fixed shifts 0,1), reduced p/q only, dynamically
+ * sized divisor/denominator tables, output labeled as witnesses.
+ *
+ * Build with GCC/Clang: cc -O2 -o poly_gap_six poly_gap_six.c
  * Run:   ./poly_gap_six A_MAX DMAX [q_restrict]
  *        q_restrict: 0 = all q_j | A, 1 = only q_j in {1,2}
  */
+#include <limits.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
-#include <string.h>
 
 typedef __int128 i128;
 
-static i128 iabs128(i128 x) { return x < 0 ? -x : x; }
+static int *divcnt;
+static long long **divlists;
+static long long table_center;
+static size_t table_size;
 
-static long long gcdll(long long a, long long b) {
-    long long t;
-    if (a < 0) a = -a;
-    if (b < 0) b = -b;
-    while (b) { t = a % b; a = b; b = t; }
+static void die(const char *message)
+{
+    fprintf(stderr, "%s\n", message);
+    exit(EXIT_FAILURE);
+}
+
+static long long gcdll(long long a, long long b)
+{
+    if (a < 0)
+        a = -a;
+    if (b < 0)
+        b = -b;
+    while (b != 0) {
+        const long long t = a % b;
+        a = b;
+        b = t;
+    }
     return a;
 }
 
-/* divisor lists for n in [-DMAX-5, DMAX+5] -> index n + DMAX + 5 */
-static int *divcnt;
-static int **divlists;
+static size_t index_of(long long n)
+{
+    return (size_t)(table_center + n);
+}
 
-static void build_divtables(long long dmax) {
-    long long size = 2 * dmax + 11;
-    divcnt = calloc(size, sizeof(int));
-    divlists = calloc(size, sizeof(int *));
-    for (long long d = 1; d <= dmax + 5; d++) {
-        for (long long m = d; m <= dmax + 5; m += d) {
-            divcnt[dmax + 5 + m]++;
-            divcnt[dmax + 5 - m]++;
+static void build_divtables(long long dmax)
+{
+    if (dmax < 0 || dmax > (LLONG_MAX - 11) / 2)
+        die("Invalid DMAX.");
+    if ((unsigned long long)dmax > (SIZE_MAX - 11u) / 2u)
+        die("DMAX is too large for this address space.");
+
+    table_center = dmax + 5;
+    table_size = (size_t)dmax * 2u + 11u;
+    divcnt = (int *)calloc(table_size, sizeof(*divcnt));
+    divlists = (long long **)calloc(table_size, sizeof(*divlists));
+    if (!divcnt || !divlists)
+        die("Unable to allocate divisor-table headers.");
+
+    const long long limit = dmax + 5;
+    for (long long d = 1; d <= limit; ++d) {
+        for (long long m = d; m <= limit; m += d) {
+            divcnt[index_of(m)] += 2;  /* +d and -d both divide +m. */
+            divcnt[index_of(-m)] += 2; /* +d and -d both divide -m. */
         }
     }
-    for (long long i = 0; i < size; i++)
-        divlists[i] = malloc(sizeof(int) * (divcnt[i] ? divcnt[i] : 1));
-    memset(divcnt, 0, size * sizeof(int));
-    for (long long d = 1; d <= dmax + 5; d++) {
-        for (long long m = d; m <= dmax + 5; m += d) {
-            divlists[dmax + 5 + m][divcnt[dmax + 5 + m]++] = (int)d;
-            divlists[dmax + 5 - m][divcnt[dmax + 5 - m]++] = (int)-d;
+
+    for (size_t i = 0; i < table_size; ++i) {
+        const size_t count = divcnt[i] ? (size_t)divcnt[i] : 1u;
+        divlists[i] = (long long *)malloc(count * sizeof(**divlists));
+        if (!divlists[i])
+            die("Unable to allocate a divisor list.");
+        divcnt[i] = 0;
+    }
+
+    for (long long d = 1; d <= limit; ++d) {
+        for (long long m = d; m <= limit; m += d) {
+            const size_t positive = index_of(m);
+            const size_t negative = index_of(-m);
+            divlists[positive][divcnt[positive]++] = d;
+            divlists[positive][divcnt[positive]++] = -d;
+            divlists[negative][divcnt[negative]++] = d;
+            divlists[negative][divcnt[negative]++] = -d;
         }
     }
 }
 
-static void put128(i128 x) {
-    if (x < 0) { putchar('-'); x = -x; }
-    char buf[64]; int n = 0;
-    do { buf[n++] = (char)('0' + (int)(x % 10)); x /= 10; } while (x);
-    while (n) putchar(buf[--n]);
+static void free_divtables(void)
+{
+    if (divlists) {
+        for (size_t i = 0; i < table_size; ++i)
+            free(divlists[i]);
+    }
+    free(divlists);
+    free(divcnt);
+}
+
+static void put128(i128 x)
+{
+    if (x < 0) {
+        putchar('-');
+        x = -x;
+    }
+    char buffer[64];
+    int length = 0;
+    do {
+        buffer[length++] = (char)('0' + (int)(x % 10));
+        x /= 10;
+    } while (x != 0);
+    while (length != 0)
+        putchar(buffer[--length]);
 }
 
 int main(int argc, char **argv)
 {
-    long long A_MAX = argc > 1 ? atoll(argv[1]) : 4;
-    long long DMAX = argc > 2 ? atoll(argv[2]) : 500000;
-    int q_restrict = argc > 3 ? atoi(argv[3]) : 1;
+    const long long amax = argc > 1 ? atoll(argv[1]) : 4;
+    const long long dmax = argc > 2 ? atoll(argv[2]) : 500000;
+    const int q_restrict = argc > 3 ? atoi(argv[3]) : 1;
 
-    build_divtables(DMAX);
-    long long nfound = 0;
+    if (amax < 1 || dmax < 0)
+        die("Expected A_MAX >= 1 and DMAX >= 0.");
 
-    for (long long A = 1; A <= A_MAX; A++) {
-        long long q[16]; int nq = 0;
-        for (long long d = 1; d <= A; d++)
-            if (A % d == 0 && (!q_restrict || (d == 1 || d == 2)))
-                q[nq++] = d;
-        /* q-combination enumeration via mixed-radix over 6 positions */
-        unsigned long long combos = 1;
-        for (int j = 0; j < 6; j++) combos *= (unsigned long long)nq;
-        for (unsigned long long cc = 0; cc < combos; cc++) {
-            long long qs[6]; unsigned long long t = cc;
-            for (int j = 0; j < 6; j++) { qs[j] = q[t % nq]; t /= nq; }
-            for (long long D = -DMAX; D <= DMAX; D++) {
-                int *c0 = divlists[DMAX + 5 + D];
-                int *c1 = divlists[DMAX + 5 + D + 1];
-                for (int i0 = 0; i0 < divcnt[DMAX + 5 + D]; i0++) {
-                    i128 p0 = c0[i0], q0 = qs[0];
-                    for (int i1 = 0; i1 < divcnt[DMAX + 5 + D + 1]; i1++) {
-                        i128 p1 = c1[i1], q1 = qs[1];
-                        /* solve B,C:  A p^3 + B p^2 q + C p q^2 + D q^3 = 0 */
-                        i128 a0 = p0 * p0 * q0, b0 = p0 * q0 * q0;
-                        i128 r0 = -A * p0 * p0 * p0 - D * q0 * q0 * q0;
-                        i128 a1 = p1 * p1 * q1, b1 = p1 * q1 * q1;
-                        i128 r1 = -A * p1 * p1 * p1 - (D + 1) * q1 * q1 * q1;
-                        i128 det = a0 * b1 - a1 * b0;
-                        if (det == 0) continue;
-                        i128 Bn = r0 * b1 - r1 * b0;
-                        i128 Cn = a0 * r1 - a1 * r0;
-                        if (Bn % det || Cn % det) continue;
-                        i128 B = Bn / det, C = Cn / det;
-                        int ok = 1;
-                        for (int j = 2; j < 6 && ok; j++) {
-                            long long idx = DMAX + 5 + D + j;
-                            int *cj = divlists[idx];
-                            int nj = divcnt[idx];
+    build_divtables(dmax);
+    unsigned long long witnesses = 0;
+
+    for (long long A = 1; A <= amax; ++A) {
+        size_t nq = 0;
+        for (long long d = 1; d <= A; ++d) {
+            if (A % d == 0 && (!q_restrict || d == 1 || d == 2))
+                ++nq;
+        }
+        if (nq == 0)
+            continue;
+
+        long long *q = (long long *)malloc(nq * sizeof(*q));
+        if (!q)
+            die("Unable to allocate denominator list.");
+        size_t qpos = 0;
+        for (long long d = 1; d <= A; ++d) {
+            if (A % d == 0 && (!q_restrict || d == 1 || d == 2))
+                q[qpos++] = d;
+        }
+
+        unsigned long long combinations = 1;
+        for (int j = 0; j < 6; ++j) {
+            if (nq > ULLONG_MAX / combinations)
+                die("Too many denominator combinations.");
+            combinations *= (unsigned long long)nq;
+        }
+
+        for (unsigned long long code = 0; code < combinations; ++code) {
+            long long qs[6];
+            unsigned long long value = code;
+            for (int j = 0; j < 6; ++j) {
+                qs[j] = q[value % nq];
+                value /= nq;
+            }
+
+            for (long long D = -dmax; D <= dmax; ++D) {
+                /* Use the first two nonzero constants as independent anchors. */
+                int u = -1;
+                int v = -1;
+                for (int j = 0; j < 6; ++j) {
+                    if (D + j == 0)
+                        continue;
+                    if (u < 0)
+                        u = j;
+                    else {
+                        v = j;
+                        break;
+                    }
+                }
+                if (v < 0)
+                    die("Internal error: fewer than two nonzero shifts.");
+
+                const size_t iu = index_of(D + u);
+                const size_t iv = index_of(D + v);
+                for (int ku = 0; ku < divcnt[iu]; ++ku) {
+                    const long long pu64 = divlists[iu][ku];
+                    if (gcdll(pu64, qs[u]) != 1)
+                        continue;
+                    const i128 pu = (i128)pu64;
+                    const i128 qu = (i128)qs[u];
+
+                    for (int kv = 0; kv < divcnt[iv]; ++kv) {
+                        const long long pv64 = divlists[iv][kv];
+                        if (gcdll(pv64, qs[v]) != 1)
+                            continue;
+                        const i128 pv = (i128)pv64;
+                        const i128 qv = (i128)qs[v];
+
+                        const i128 au = pu * pu * qu;
+                        const i128 bu = pu * qu * qu;
+                        const i128 ru =
+                            -(i128)A * pu * pu * pu -
+                            (i128)(D + u) * qu * qu * qu;
+                        const i128 av = pv * pv * qv;
+                        const i128 bv = pv * qv * qv;
+                        const i128 rv =
+                            -(i128)A * pv * pv * pv -
+                            (i128)(D + v) * qv * qv * qv;
+
+                        const i128 determinant = au * bv - av * bu;
+                        if (determinant == 0)
+                            continue;
+                        const i128 Bn = ru * bv - rv * bu;
+                        const i128 Cn = au * rv - av * ru;
+                        if (Bn % determinant != 0 || Cn % determinant != 0)
+                            continue;
+                        const i128 B = Bn / determinant;
+                        const i128 C = Cn / determinant;
+
+                        int valid = 1;
+                        for (int j = 0; j < 6 && valid; ++j) {
+                            if (j == u || j == v || D + j == 0)
+                                continue;
+
+                            const size_t index = index_of(D + j);
                             int hit = 0;
-                            for (int k = 0; k < nj; k++) {
-                                i128 p = cj[k], qq = qs[j];
-                                i128 v = A * p * p * p + B * p * p * qq
-                                       + C * p * qq * qq + (D + j) * qq * qq * qq;
-                                if (v == 0) { hit = 1; break; }
+                            for (int k = 0; k < divcnt[index]; ++k) {
+                                const long long p64 = divlists[index][k];
+                                if (gcdll(p64, qs[j]) != 1)
+                                    continue;
+                                const i128 p = (i128)p64;
+                                const i128 denominator = (i128)qs[j];
+                                const i128 equation =
+                                    (i128)A * p * p * p +
+                                    B * p * p * denominator +
+                                    C * p * denominator * denominator +
+                                    (i128)(D + j) * denominator * denominator * denominator;
+                                if (equation == 0) {
+                                    hit = 1;
+                                    break;
+                                }
                             }
-                            if (!hit) ok = 0;
+                            if (!hit)
+                                valid = 0;
                         }
-                        if (ok) {
-                            printf("RUN6: A=%lld D=%lld B=", A, D);
-                            put128(B); printf(" C="); put128(C);
-                            printf(" p=(%lld,%lld,..) q=(%lld,%lld,..)\n",
-                                   (long long)p0, (long long)p1, (long long)q0,
-                                   (long long)q1);
-                            nfound++;
+
+                        if (valid) {
+                            printf("RUN6 witness: A=%lld D=%lld B=", A, D);
+                            put128(B);
+                            printf(" C=");
+                            put128(C);
+                            printf(" anchors=(%d,%d) roots=(%lld/%lld,%lld/%lld)\n",
+                                   u, v, pu64, qs[u], pv64, qs[v]);
+                            ++witnesses;
                         }
                     }
                 }
             }
         }
+        free(q);
     }
-    printf("six-runs found (A<=%lld, |D|<=%lld, q%s): %lld\n",
-           A_MAX, DMAX, q_restrict ? " in {1,2}" : " all", nfound);
-    return 0;
+
+    printf("six-run witnesses (A<=%lld, |D|<=%lld, q%s): %llu\n",
+           amax, dmax, q_restrict ? " in {1,2}" : " all",
+           witnesses);
+    puts("Note: multiple witnesses may describe the same polynomial.");
+
+    free_divtables();
+    return EXIT_SUCCESS;
 }

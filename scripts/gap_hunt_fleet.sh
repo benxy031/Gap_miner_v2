@@ -21,12 +21,18 @@ if [ ! -f "$CONF" ]; then
     exit 1
 fi
 
+mkdir -p "$OUTDIR"
+
 PIDS=()
 ID=0
 while IFS= read -r line; do
     line="${line%%#*}"
     set -- $line
-    [ -z "$1" ] && continue
+    [ -z "${1:-}" ] && continue
+    if [ "$#" -lt 3 ]; then
+        echo "[fleet] skipping malformed line: '$line'" >&2
+        continue
+    fi
     crt=$1; dev=$2; merit=$3
     ID=$((ID + 1))
     state="$OUTDIR/gap_hunt_state_f${ID}.txt"

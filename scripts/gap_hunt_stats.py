@@ -13,8 +13,12 @@ are skipped) it reports:
   * record proximity: the closest records to FIRST_KNOWN_OCCURRENCE
     (per-gap comparison against the merits table) and any already-found
     records;
-  * P(next reported gap is a record) under the fitted sigma, and the implied
-    expected number of reported gaps until the first record;
+  * P(next reported gap is a record): exact tail probability under the
+    exponential model, P(merit >= easiest_target | merit >= threshold) =
+    exp(-(m_easy - m_min)/sigma).  With fewer than 30 records the fitted
+    sigma is noise, so the projection is also shown for the prior
+    sigma ~= 1.29 (three independent rate anchors from the shift-507
+    corpus);
   * the easiest recordable targets at this size.
 
 Usage:
@@ -126,20 +130,23 @@ def main():
         found = [d for d in deltas if d[0] < 0]
         near = [d for d in deltas if d[0] >= 0][:5]
 
-        # P(next reported gap is a record) at the fitted sigma
-        sig = sig_me if sig_me > 0 else 1.29
-        p_next = 0.0
-        for g, bm in table.items():
-            if 8000 <= g <= 70000 and g / bm >= L:
-                mg = g / L
-                if mg >= m_min:
-                    p_next += (2.0 / L / sig) * math.exp(-(mg - m_min) / sig)
+        # P(next reported gap is a record) = P(merit >= easiest target
+        # merit | merit >= threshold) — exact for the exponential tail.
+        tgt = sorted(
+            ((g / L, g, bm) for g, bm in table.items()
+             if 8000 <= g <= 70000 and g / bm >= L))
+        m_easy = tgt[0][0] if tgt else None
+        small = n < 30
+        sig_fit = sig_me if sig_me > 0 else 1.29
+        p_fit = math.exp(-(m_easy - m_min) / sig_fit) if m_easy else 0.0
+        p_prior = math.exp(-(m_easy - m_min) / 1.29) if m_easy else 0.0
 
         print(f"== {path}")
         print(f"   records={n} threshold={m_min:.4f} best={best:.6f} "
               f"(gap {best_gap}) logbase~{L:.1f}")
         print(f"   sigma: mean-excess={sig_me:.3f}"
-              + (f"  quantile={sig_q:.3f}" if sig_q else ""))
+              + (f"  quantile={sig_q:.3f}" if sig_q else "")
+              + ("  [n<30: NOISY — prior 1.29 used below]" if small else ""))
         if found:
             print(f"   *** {len(found)} RECORD(S) ALREADY FOUND ***")
             for d, g, m, _ in found:
@@ -148,15 +155,18 @@ def main():
         for d, g, m, tag in near:
             print(f"      gap={g} merit={m:.6f} "
                   f"needed={table[g]:.6f} delta={d:.6f}")
-        print(f"   P(next reported gap is a record) ~ {p_next:.2e}"
-              f"  -> expected reported gaps until record ~ "
-              f"{1.0/p_next if p_next > 0 else float('inf'):.3e}")
-        # easiest targets at this size
-        tgt = sorted(
-            ((g / L, g, bm) for g, bm in table.items()
-             if 8000 <= g <= 70000 and g / bm >= L))[:8]
+        print(f"   P(next reported gap is a record): easiest target "
+              f"merit={m_easy:.3f} (gap {tgt[0][1]})")
+        if small:
+            print(f"      fitted sigma {sig_fit:.2f} -> {p_fit:.3f} "
+                  f"(unreliable, n<30)")
+            print(f"      prior  sigma 1.29 -> {p_prior:.3f} "
+                  f"-> expected reported gaps ~{1.0/p_prior:.0f}")
+        else:
+            print(f"      fitted sigma {sig_fit:.2f} -> {p_fit:.3f} "
+                  f"-> expected reported gaps ~{1.0/p_fit:.0f}")
         print("   easiest recordable targets (needed merit, gap):")
-        for m, g, bm in tgt:
+        for m, g, bm in tgt[:8]:
             print(f"      {m:.3f}  {g}  (table {bm:.4f})")
         print()
     return 0

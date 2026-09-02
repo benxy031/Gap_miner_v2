@@ -233,11 +233,18 @@ every record).
 
 Automatic record checking while the hunt runs (follows the results file,
 compares each gap against `data/prime_gap_merits.txt`, appends new records to
-`gap_hunt_records_found.txt`):
+`gap_hunt_records_found.txt` with a versioned comparison snapshot and the
+strongest claim label):
 
 ```bash
 scripts/watch_gap_hunt_records.py data/gap_hunt_records.txt &
 ```
+
+Record lines carry `claim=FIRST_KNOWN_OCCURRENCE` and
+`coverage=known_table_<sha256[:12]>` — the taxonomy labels are defined in
+`docs/CLOSED_FINGERPRINTS.md` (the watcher never claims `FIRST_OCCURRENCE`,
+`MAXIMAL_GAP`, `MERIT_RECORD`, or `NETWORK_ACCEPTED`, which require coverage
+or network evidence it does not have).
 
 Multi-size / multi-GPU fleets: `scripts/gap_hunt_fleet.sh` reads
 `gap_hunt_fleet.conf` (one `<crt-file> <device> <min-merit>` line per walker),
@@ -271,7 +278,7 @@ data/crt/m23/shift998_p128_m23.txt        1       18
 | `--enable-submission` | off | Submit BPSW-verified gaps via `submitblock` |
 | `--coinbase-script-hex <hex>` | none (`OP_TRUE`) | Payout scriptPubKey for submitted blocks |
 | `--enable-gpu-fermat` | off | Use the CUDA base-2 MR kernel as the primality filter (requires `WITH_CUDA=1`; falls back to CPU on failure) |
-| `--record-log <path>` | `gapminer_records.log` | Log every BPSW-verified candidate with full parameters |
+| `--record-log <path>` | `gapminer_records.log` | Log every BPSW-verified candidate with full parameters; each line carries `new_record=yes/no/unknown` and the strongest claim label `claim=FIRST_KNOWN_OCCURRENCE` (known-corpus first occurrence) or `none` — never a bare "record" |
 | `--merit-records <path>` | `data/prime_gap_merits.txt` | Best-known-merit table used to flag `new_record=yes` |
 | `--gap-hunt` | off | Standalone record-hunting walk (requires `--crt-file` and a `WITH_CUDA=1` build; runs the walk and exits instead of starting the miner) |
 | `--gap-hunt-start <hex>` | `2^(255+shift)` | Base anchor for the walk (hex); default follows the CRT file's shift; CRT-aligned internally |
@@ -387,7 +394,7 @@ data/crt/m23/     Prebuilt merit-23 CRT covering files (shift 450..1017)
 data/prime_gap_merits.txt  Best-known-merit reference table
 scripts/          gen_crt_batch.sh, update_merits.sh, ab_shift_compare.sh
 gen_crt.md        CRT covering-file generator guide
-docs/             Architecture references
+docs/             Architecture references, GAP_HUNT plan, closed-fingerprints registry (dead routes and their reopen triggers)
 ```
 
 ## License

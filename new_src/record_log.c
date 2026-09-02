@@ -69,17 +69,20 @@ void record_log_write_big(uint32_t height, uint32_t shift, uint32_t header_nonce
 
     fprintf(g_record_log,
             "%s height=%u shift=%u header_nonce=%u nAdd=%s start=%s "
-            "gap=%u merit=%.4f best_known_merit=%s new_record=%s status=%s\n",
+            "gap=%u merit=%.4f best_known_merit=%s new_record=%s "
+            "claim=%s status=%s\n",
             timestamp, height, shift, header_nonce, nadd_dec ? nadd_dec : "?",
             start_dec ? start_dec : "?", gap_length, merit, best_merit_str,
-            is_new_record ? "yes" : (has_record ? "no" : "unknown"), status);
+            is_new_record ? "yes" : (has_record ? "no" : "unknown"),
+            is_new_record ? "FIRST_KNOWN_OCCURRENCE" : "none", status);
 
     fflush(g_record_log);
 
     if (is_new_record) {
         fprintf(stderr,
-                "[RecordLog] *** POSSIBLE NEW RECORD *** gap=%u merit=%.4f "
-                "(best known: %.4f) height=%u nAdd=%s -- see the record log for the full number\n",
+                "[RecordLog] *** POSSIBLE FIRST_KNOWN_OCCURRENCE *** "
+                "gap=%u merit=%.4f (best known: %.4f) height=%u nAdd=%s "
+                "-- see the record log for the full number\n",
                 gap_length, merit, best_merit, height, nadd_dec ? nadd_dec : "?");
     }
 

@@ -37,24 +37,35 @@ import time
 import datetime
 
 
+import sys
+import os
+import re
+import time
+import hashlib
+import datetime
+
+
 def load_table(path):
-    """Return {gap: best_known_merit} from the merits table."""
+    """Return ({gap: best_known_merit}, sha12, gap_count)."""
     table = {}
-    with open(path, "r") as f:
-        for line in f:
-            line = line.strip()
-            if not line or line.startswith("#"):
-                continue
-            parts = line.split()
-            if len(parts) < 2:
-                continue
-            try:
-                gap = int(parts[0])
-                merit = float(parts[1])
-            except ValueError:
-                continue
-            table[gap] = merit
-    return table
+    raw = b""
+    with open(path, "rb") as f:
+        raw = f.read()
+    sha12 = hashlib.sha256(raw).hexdigest()[:12]
+    for line in raw.decode("utf-8", errors="replace").splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        parts = line.split()
+        if len(parts) < 2:
+            continue
+        try:
+            gap = int(parts[0])
+            merit = float(parts[1])
+        except ValueError:
+            continue
+        table[gap] = merit
+    return table, sha12, len(table)
 
 
 RE_STDERR = re.compile(
@@ -108,10 +119,19 @@ def main():
         print("missing log file argument", file=sys.stderr)
         return 2
 
-    table = load_table(table_path)
-    print(f"[watch] table: {len(table)} gaps from {table_path}")
+    table, sha12, n_gaps = load_table(table_path)
+    print(f"[watch] table: {n_gaps} gaps from {table_path} (sha256[:12]={sha12})")
     print(f"[watch] log: {log_path}  records out: {out_path}"
           + ("  (follow mode, Ctrl+C to stop)" if not once else "  (once)"))
+
+    # Snapshot header: the comparison corpus is versioned, so every record
+    # line states exactly which table it was compared against.
+    if not os.path.exists(out_path) or os.path.getsize(out_path) == 0:
+        stamp = datetime.datetime.now(datetime.timezone.utc).strftime(
+            "%Y-%m-%dT%H:%M:%SZ")
+        with open(out_path, "a") as fo:
+            fo.write(f"# snapshot table={table_path} sha256[:12]={sha12} "
+                     f"gaps={n_gaps} date={stamp}\n")
 
     checked = 0
     records = 0
@@ -129,11 +149,14 @@ def main():
         best = table[gap]
         if merit > best:
             records += 1
-            stamp = datetime.datetime.now().strftime("%Y-%m-%dT%H:%M:%S")
-            print(f"[RECORD] gap={gap} merit={merit:.6f} "
+            stamp = datetime.datetime.now(datetime.timezone.utc).strftime(
+                "%Y-%m-%dT%H:%M:%SZ")
+            print(f"[FIRST_KNOWN_OCCURRENCE] gap={gap} merit={merit:.6f} "
                   f"best_known={best:.6f} start={start_str[:32]}...")
             with open(f_out, "a") as fo:
-                fo.write(f"{gap} {merit:.6f} {start_str} {best:.6f} {stamp}\n")
+                fo.write(f"{gap} {merit:.6f} {start_str} {best:.6f} {stamp} "
+                         f"claim=FIRST_KNOWN_OCCURRENCE "
+                         f"coverage=known_table_{sha12}\n")
                 fo.flush()
             table[gap] = merit  # don't re-log the same gap
 

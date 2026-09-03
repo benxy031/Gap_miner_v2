@@ -21,6 +21,15 @@ Runs without numpy/matplotlib for the text part (fleet boxes).
 """
 import sys
 import math
+import os
+
+
+def resolve(path):
+    """Fall back to data/<path> so fleet boxes (results in data/) work."""
+    if os.path.exists(path):
+        return path
+    alt = os.path.join("data", os.path.basename(path))
+    return alt if os.path.exists(alt) else path
 
 
 def load(path):
@@ -59,7 +68,7 @@ def main():
         pos = ["gap_hunt_records_f1.txt", "gap_hunt_records_f2.txt"]
     elif len(pos) == 1:
         pos.append("gap_hunt_records_f2.txt")
-    fa, fb = pos[0], pos[1]
+    fa, fb = resolve(pos[0]), resolve(pos[1])
     m0 = float(pos[2]) if len(pos) > 2 else 10.0
 
     ma = load(fa)

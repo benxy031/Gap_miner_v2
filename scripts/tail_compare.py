@@ -7,9 +7,11 @@ vs lex).  If their tail sigmas differ significantly, the cover shapes the
 tail (a new hunt-quality lever); if they agree, the tail is size-driven.
 
 Usage:
-    tail_compare.py FILE_A FILE_B [M0] [--plot PREFIX]
+    tail_compare.py [FILE_A FILE_B] [M0] [--plot PREFIX]
 
-  FILE_A/B   gap-hunt results files (`<gap> <merit> <startprime>` lines)
+  FILE_A/B   gap-hunt results files (`<gap> <merit> <startprime>` lines).
+             Default: gap_hunt_records_f1.txt (763-bit) vs
+             gap_hunt_records_f2.txt (1273-bit) — the N3 size comparison.
   M0         primary tail-fit threshold (default 10; a sweep M0..M0+4 is
              always printed)
   --plot     also write PREFIX_cdf.png (requires numpy/matplotlib; skipped
@@ -52,11 +54,13 @@ def main():
         i = args.index("--plot")
         plot = args[i + 1] if i + 1 < len(args) else "tail_compare"
         del args[i:i + 2]
-    if len(args) < 2:
-        print(__doc__, file=sys.stderr)
-        return 2
-    fa, fb = args[0], args[1]
-    m0 = float(args[2]) if len(args) > 2 else 10.0
+    pos = [a for a in args if not a.startswith("--")]
+    if len(pos) == 0:
+        pos = ["gap_hunt_records_f1.txt", "gap_hunt_records_f2.txt"]
+    elif len(pos) == 1:
+        pos.append("gap_hunt_records_f2.txt")
+    fa, fb = pos[0], pos[1]
+    m0 = float(pos[2]) if len(pos) > 2 else 10.0
 
     ma = load(fa)
     mb = load(fb)

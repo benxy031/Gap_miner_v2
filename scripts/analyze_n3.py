@@ -50,6 +50,12 @@ def tail_fit(merits, m0):
     return sigma, se, n
 
 
+def caption(fig, text):
+    """English explanation under each graph."""
+    fig.text(0.02, 0.012, text, fontsize=8.5, style="italic",
+             color="dimgray", wrap=True)
+
+
 def main():
     os.makedirs(OUTDIR, exist_ok=True)
     print(f"loading {F1} ...", flush=True)
@@ -99,7 +105,12 @@ def main():
     ax.set_title(f"N3: gap merit distribution, two sizes (tail fits: "
                  f"$\\sigma_1$={s1:.3f}, $\\sigma_2$={s2:.3f}, {z:.1f}$\\sigma$ apart)")
     ax.legend()
-    fig.tight_layout()
+    fig.tight_layout(rect=(0, 0.045, 1, 1))
+    caption(fig, "Gap merits from the N3 fleet (dual RTX 3060), report "
+                "threshold m>=8. The 1273-bit histogram is visibly shifted "
+                "to the right: its exponential tail slope sigma=1.372 vs "
+                "sigma=1.262 at 763-bit — a 34.4-sigma size dependence "
+                "(fatter tail at larger numbers).")
     fig.savefig(f"{OUTDIR}/n3_merit_hist.png", dpi=130)
     plt.close(fig)
 
@@ -118,7 +129,11 @@ def main():
     ax.set_title("N3: exponential tail is size-dependent "
                  "(larger numbers => fatter tail)")
     ax.legend(fontsize=9)
-    fig.tight_layout()
+    fig.tight_layout(rect=(0, 0.045, 1, 1))
+    caption(fig, "Survival probability P(merit >= m), log scale. Dashed "
+                "lines: maximum-likelihood exponential fits (slope = 1/sigma). "
+                "The 1273-bit curve lies above the 763-bit curve at every "
+                "threshold — larger numbers produce extreme gaps more often.")
     fig.savefig(f"{OUTDIR}/n3_tail_cdf.png", dpi=130)
     plt.close(fig)
 
@@ -140,7 +155,11 @@ def main():
     ax.set_ylabel("tail sigma (MLE, m>=10)")
     ax.set_title("N3: sigma estimates are stable — separation is not noise")
     ax.legend()
-    fig.tight_layout()
+    fig.tight_layout(rect=(0, 0.045, 1, 1))
+    caption(fig, "Running maximum-likelihood estimate of the tail slope sigma "
+                "as records accumulate, with 95% confidence bands. Both curves "
+                "converge early and never overlap: the 763-bit vs 1273-bit "
+                "sigma difference is real, not sampling noise.")
     fig.savefig(f"{OUTDIR}/n3_sigma_convergence.png", dpi=130)
     plt.close(fig)
 
@@ -154,7 +173,11 @@ def main():
     ax.set_ylabel("best merit so far")
     ax.set_title(f"N3: exploration progress (f1 best {b1:.3f}, f2 best {b2:.3f})")
     ax.legend()
-    fig.tight_layout()
+    fig.tight_layout(rect=(0, 0.045, 1, 1))
+    caption(fig, "Best merit found so far vs records processed (chronological). "
+                "Each step is a new personal record. The 1273-bit walker is "
+                "currently ahead despite fewer records — consistent with its "
+                "fatter tail (graph 2).")
     fig.savefig(f"{OUTDIR}/n3_best_progression.png", dpi=130)
     plt.close(fig)
 
@@ -169,7 +192,11 @@ def main():
     ax.set_ylabel("count per log bin")
     ax.set_title("N3: raw gap sizes (log-binned)")
     ax.legend()
-    fig.tight_layout()
+    fig.tight_layout(rect=(0, 0.045, 1, 1))
+    caption(fig, "Raw gap lengths on log-log axes. The 1273-bit distribution "
+                "extends to larger absolute gaps because gaps scale with "
+                "log(start); merit (gap / ln start) in graphs 1-2 is the "
+                "size-normalized comparison where the real difference shows.")
     fig.savefig(f"{OUTDIR}/n3_gap_hist.png", dpi=130)
     plt.close(fig)
 
@@ -196,7 +223,12 @@ def main():
     ax.set_title("N3: sigma size-separation is robust across thresholds "
                  "(tail not a pure exponential)")
     ax.legend()
-    fig.tight_layout()
+    fig.tight_layout(rect=(0, 0.045, 1, 1))
+    caption(fig, "The 1273-bit sigma exceeds the 763-bit sigma by 7.4 to "
+                "34.4 sigma depending on the tail-fit threshold M0 — the size "
+                "dependence is significant under every reasonable choice. The "
+                "drift of fitted sigma with M0 shows the tail is not a "
+                "perfectly pure exponential.")
     fig.savefig(f"{OUTDIR}/n3_sigma_threshold.png", dpi=130)
     plt.close(fig)
 

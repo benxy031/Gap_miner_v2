@@ -801,43 +801,15 @@ int gap_hunt_run(const struct gap_hunt_config *cfg) {
 
     uint64_t next_k = k;
     uint64_t last_save = windows;
+    struct gh_batch *fls[2] = { &A, &B };
+    int turn = 0;
 
+    /* Alternate the two fermat slots so one flight's host processing
+       overlaps the other flight's in-flight MR kernel. */
     while (!g_stop) {
-        if (g_kmax && next_k >= g_kmax)
-            g_stop = 1;
-        /* Fill A (then B while A's MR is in flight). */
-        if (!A.active && A.n_windows == 0) {
-            if (!gh_batch_fill(&A, 0, next_k, &g)) {
-                fprintf(stderr, "[GAP_HUNT] batch fill failed (k=%llu)\n",
-                        (unsigned long long)next_k);
-                break;
-            }
-            next_k += (uint64_t)g_batch;
-            if (!A.active) {
-                /* Empty batch: nothing submitted; process immediately. */
-                gh_batch_process(&A, flags, cfg, &g, &windows,
-                                 &gaps_reported, &best_merit, out,
-                                 p1, p2, last_prime, &have_last);
-                A.n_windows = 0;
-            }
-        }
-        if (!B.active && B.n_windows == 0 && A.active) {
-            if (!gh_batch_fill(&B, 1, next_k, &g)) {
-                fprintf(stderr, "[GAP_HUNT] batch fill failed (k=%llu)\n",
-                        (unsigned long long)next_k);
-                break;
-            }
-            next_k += (uint64_t)g_batch;
-        }
+        struct gh_batch *fl = fls[turn];
 
-        /* Collect + process the older active flight (the GPU overlaps
-           this host work with the other flight's MR kernel). */
-        struct gh_batch *fl = NULL;
-        if (A.active)
-            fl = &A;
-        else if (B.active)
-            fl = &B;
-        if (fl) {
+        if (fl->active) {
             if (gpu_fermat_collect(fermat, fl->slot, flags,
                                    (size_t)fl->total) < 0) {
                 fprintf(stderr, "[GAP_HUNT] GPU collect failed\n");
@@ -851,6 +823,25 @@ int gap_hunt_run(const struct gap_hunt_config *cfg) {
             fl->total = 0;
         }
 
+        /* Refill and resubmit this flight so it is in flight while the other
+           is collected next; empty batches (cum==0) process inline. */
+        if (!g_stop && !(g_kmax && next_k >= g_kmax)) {
+            if (!gh_batch_fill(fl, turn, next_k, &g)) {
+                fprintf(stderr, "[GAP_HUNT] batch fill failed (k=%llu)\n",
+                        (unsigned long long)next_k);
+                break;
+            }
+            next_k += (uint64_t)g_batch;
+            if (!fl->active) {
+                gh_batch_process(fl, flags, cfg, &g, &windows,
+                                 &gaps_reported, &best_merit, out,
+                                 p1, p2, last_prime, &have_last);
+                fl->n_windows = 0;
+            }
+        } else if (!A.active && !B.active) {
+            g_stop = 1;         /* KMAX reached and both flights drained */
+        }
+
         if (windows - last_save >= 1024ULL) {
             save_state(cfg->state_path, next_k, last_prime, have_last);
             last_save = windows;
@@ -860,6 +851,8 @@ int gap_hunt_run(const struct gap_hunt_config *cfg) {
                     (unsigned long long)windows,
                     (unsigned long long)gaps_reported, best_merit);
         }
+
+        turn ^= 1;
     }
 
     /* Drain the in-flight flights so no window is lost. */

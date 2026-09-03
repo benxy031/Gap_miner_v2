@@ -176,9 +176,9 @@ static int64_t halfclass_collect_hidden_candidates_impl(
        no candidate is ever silently dropped (a dropped interior prime
        would fabricate a false gap). */
     uint64_t cap_off =
-        (uint32_t)((interval / 60ULL) *
-                       (uint64_t)__builtin_popcountll(halfclass_hidden_mask()) +
-                   16ULL);
+        (interval / 60ULL) *
+            (uint64_t)__builtin_popcountll(halfclass_hidden_mask()) +
+        16ULL;
     uint64_t *cand = (uint64_t *)malloc((size_t)cap_off * sizeof(uint64_t));
     if (!cand) {
         free(bits);

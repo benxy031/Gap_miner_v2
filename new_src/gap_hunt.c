@@ -774,6 +774,8 @@ int gap_hunt_run(const struct gap_hunt_config *cfg) {
     g.prime_count = sieve.small_primes_count;
     mpz_init(g.bk);
     mpz_init(g.wb);
+    mpz_init(g.b0);
+    mpz_init(g.P);
     mpz_set(g.b0, b0);
     mpz_set(g.P, P);
     g.quarter = g_quarter;
@@ -877,7 +879,7 @@ int gap_hunt_run(const struct gap_hunt_config *cfg) {
     }
     gh_batch_clear(&A);
     gh_batch_clear(&B);
-    mpz_clears(g.bk, g.wb, NULL);
+    mpz_clears(g.bk, g.wb, g.b0, g.P, NULL);
 
     save_state(cfg->state_path, next_k, last_prime, have_last);
     fprintf(stderr,

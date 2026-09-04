@@ -215,7 +215,11 @@ K=16**; the M1 synchronous baseline was 480).  The walk is single-threaded by
 design — `--threads` and the other miner flags are ignored in this mode; GPU
 concurrency comes from the K flights.  State is written to
 `--gap-hunt-state` every 1024 windows and on `SIGINT`/`SIGTERM`; `k` resumes
-from the state file.
+from the state file.  The same 1024-window tick prints the walk rate:
+`[GAP_HUNT] k=… windows=… gaps=… best_merit=… win_s=… win_s_avg=…` —
+`win_s` is the instantaneous windows/s since the previous tick and
+`win_s_avg` the average since the walk started (the `stopped:` line also
+carries `win_s_avg`).
 
 ```bash
 # Requires WITH_CUDA=1 build (the same binary as the miner)

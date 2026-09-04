@@ -20,6 +20,7 @@
 #include <string.h>
 #include <signal.h>
 #include <math.h>
+#include <time.h>
 #include <gmp.h>
 
 #include "crt_runtime.h"
@@ -986,6 +987,14 @@ int gap_hunt_run(const struct gap_hunt_config *cfg) {
     uint64_t windows = 0, gaps_reported = 0;
     double best_merit = 0.0;
 
+    /* Walk-rate timing (monotonic): the periodic line reports the
+       instantaneous windows/s since the last save and the average since
+       the walk started. */
+    struct timespec t0, t_last;
+    clock_gettime(CLOCK_MONOTONIC, &t0);
+    t_last = t0;
+    uint64_t win_last = 0;
+
     /* Two alternating flights (fermat slots 0/1). */
     struct gh_batch A, B;
     gh_batch_init(&A);
@@ -1077,13 +1086,27 @@ int gap_hunt_run(const struct gap_hunt_config *cfg) {
         }
 
         if (windows - last_save >= 1024ULL) {
+            struct timespec tn;
+            clock_gettime(CLOCK_MONOTONIC, &tn);
+            double dt_avg = (double)(tn.tv_sec - t0.tv_sec) +
+                            (double)(tn.tv_nsec - t0.tv_nsec) * 1e-9;
+            double dt_now = (double)(tn.tv_sec - t_last.tv_sec) +
+                            (double)(tn.tv_nsec - t_last.tv_nsec) * 1e-9;
+            double win_s_now =
+                dt_now > 0.0 ? (double)(windows - win_last) / dt_now : 0.0;
+            double win_s_avg =
+                dt_avg > 0.0 ? (double)windows / dt_avg : 0.0;
+            t_last = tn;
+            win_last = windows;
             save_state(cfg->state_path, next_k, last_prime, have_last);
             last_save = windows;
             fprintf(stderr,
-                    "[GAP_HUNT] k=%llu windows=%llu gaps=%llu best_merit=%.6f\n",
+                    "[GAP_HUNT] k=%llu windows=%llu gaps=%llu best_merit=%.6f "
+                    "win_s=%.1f win_s_avg=%.1f\n",
                     (unsigned long long)next_k,
                     (unsigned long long)windows,
-                    (unsigned long long)gaps_reported, best_merit);
+                    (unsigned long long)gaps_reported, best_merit,
+                    win_s_now, win_s_avg);
         }
 
         turn ^= 1;
@@ -1109,11 +1132,18 @@ int gap_hunt_run(const struct gap_hunt_config *cfg) {
     mpz_clears(g.bk, g.wb, g.b0, g.P, NULL);
 
     save_state(cfg->state_path, next_k, last_prime, have_last);
-    fprintf(stderr,
-            "[GAP_HUNT] stopped: windows=%llu gaps=%llu best_merit=%.6f "
-            "next_k=%llu\n",
-            (unsigned long long)windows, (unsigned long long)gaps_reported,
-            best_merit, (unsigned long long)next_k);
+    {
+        struct timespec tn;
+        clock_gettime(CLOCK_MONOTONIC, &tn);
+        double dt = (double)(tn.tv_sec - t0.tv_sec) +
+                    (double)(tn.tv_nsec - t0.tv_nsec) * 1e-9;
+        double win_s = dt > 0.0 ? (double)windows / dt : 0.0;
+        fprintf(stderr,
+                "[GAP_HUNT] stopped: windows=%llu gaps=%llu best_merit=%.6f "
+                "next_k=%llu win_s_avg=%.1f\n",
+                (unsigned long long)windows, (unsigned long long)gaps_reported,
+                best_merit, (unsigned long long)next_k, win_s);
+    }
 
     if (out)
         fclose(out);

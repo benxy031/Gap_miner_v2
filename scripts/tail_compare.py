@@ -12,10 +12,13 @@ Usage:
   FILE_A/B   gap-hunt results files (`<gap> <merit> <startprime>` lines).
              Default: gap_hunt_records_f1.txt (763-bit) vs
              gap_hunt_records_f2.txt (1273-bit) — the N3 size comparison.
-  M0         primary tail-fit threshold (default 10; a sweep M0..M0+4 is
-             always printed)
-  --plot     also write PREFIX_cdf.png (requires numpy/matplotlib; skipped
-             gracefully if unavailable)
+  M0         primary tail-fit threshold for the VERDICT (default 10).
+  The sigma table sweeps the fixed record-merit grid 16, 18, 19, 20, ..., 35;
+  thresholds with fewer than MIN_N records in either file are printed as
+  skipped (no fit).
+  --plot     also write PREFIX_cdf.png (empirical + exp-fit survival at M0)
+             and PREFIX_sigma.png (tail sigma vs threshold over the sweep);
+             requires numpy/matplotlib, skipped gracefully if unavailable
 
 Runs without numpy/matplotlib for the text part (fleet boxes).
 """
@@ -56,6 +59,11 @@ def fit(merits, m0):
     return s, s / math.sqrt(len(excess)), len(excess)
 
 
+# Record-merit grid for the sigma table: 16, 18, 19, 20, ..., 35.
+SWEEP = [16.0] + [float(t) for t in range(18, 36)]
+MIN_N = 5    # fewer records per file than this -> no meaningful exp-fit
+
+
 def main():
     args = sys.argv[1:]
     plot = None
@@ -79,24 +87,38 @@ def main():
 
     print(f"A: {fa}  n={len(ma)}  best={max(ma):.4f}")
     print(f"B: {fb}  n={len(mb)}  best={max(mb):.4f}")
-    print(f"{'M0':>5} {'sigmaA':>8} {'+/-':>8} {'sigmaB':>8} {'+/-':>8} "
-          f"{'sep':>7}")
-    sa, sea, _ = fit(ma, m0)
-    sb, seb, _ = fit(mb, m0)
+
+    # Verdict fit at M0 (may lie outside the table sweep).
+    sa, sea, na0 = fit(ma, m0)
+    sb, seb, nb0 = fit(mb, m0)
     z_main = None
-    for t in (m0, m0 + 1, m0 + 2, m0 + 3, m0 + 4):
+    if na0 >= MIN_N and nb0 >= MIN_N:
+        z_main = (sb - sa) / math.sqrt(sea**2 + seb**2)
+
+    print(f"{'m':>5} {'sigmaA':>8} {'+/-':>8} {'sigmaB':>8} {'+/-':>8} "
+          f"{'sep':>7}   (nA, nB)")
+    sweep_rows = []   # (t, a1, e1, a2, e2, z, n1, n2) for the sigma plot
+    for t in SWEEP:
         a1, e1, n1 = fit(ma, t)
         a2, e2, n2 = fit(mb, t)
-        z = (a2 - a1) / math.sqrt(e1**2 + e2**2) if e1 and e2 else 0.0
-        if t == m0:
-            sa, sea, sb, seb, z_main = a1, e1, a2, e2, z
-        print(f"{t:5.1f} {a1:8.4f} {e1:8.4f} {a2:8.4f} {e2:8.4f} "
-              f"{z:7.1f} sigma   (nA={n1}, nB={n2})")
+        ok = n1 >= MIN_N and n2 >= MIN_N
+        z = (a2 - a1) / math.sqrt(e1**2 + e2**2) if ok else None
+        if ok:
+            sweep_rows.append((t, a1, e1, a2, e2, z, n1, n2))
+            print(f"{t:5.1f} {a1:8.4f} {e1:8.4f} {a2:8.4f} {e2:8.4f} "
+                  f"{z:7.1f}   (nA={n1}, nB={n2})")
+        else:
+            print(f"{t:5.1f} {'--':>8} {'--':>8} {'--':>8} {'--':>8} "
+                  f"{'--':>7}   (nA={n1}, nB={n2} <{MIN_N}: fit skipped)")
 
+    if z_main is None:
+        print(f"\nVERDICT at M0={m0:.1f}: too few records for a fit "
+              f"(nA={na0}, nB={nb0}); pass a lower M0")
+        return 2
     print(f"\nVERDICT at M0={m0:.1f}: sigmaB - sigmaA = {sb-sa:+.4f} "
           f"= {z_main:.1f} sigma "
           f"-> {'SIGNIFICANT tail difference' if abs(z_main) > 5 else 'no significant tail difference'}"
-          f" (interpret as cover effect ONLY if the two files are same-size)" )
+          f" (interpret as cover effect ONLY if the two files are same-size)")
 
     if plot:
         try:
@@ -124,6 +146,26 @@ def main():
         fig.tight_layout()
         fig.savefig(f"{plot}_cdf.png", dpi=130)
         print(f"wrote {plot}_cdf.png")
+
+        if sweep_rows:
+            fig2, ax2 = plt.subplots(figsize=(10, 5.5))
+            xs2 = [r[0] for r in sweep_rows]
+            ya = [r[1] for r in sweep_rows]
+            ea = [r[2] for r in sweep_rows]
+            yb = [r[3] for r in sweep_rows]
+            eb = [r[4] for r in sweep_rows]
+            ax2.errorbar(xs2, ya, yerr=ea, fmt="o-", color="tab:blue",
+                         capsize=3, markersize=4, label="A " + fa)
+            ax2.errorbar(xs2, yb, yerr=eb, fmt="o-", color="tab:orange",
+                         capsize=3, markersize=4, label="B " + fb)
+            ax2.set_xlabel("merit threshold m")
+            ax2.set_ylabel("tail sigma (mean excess)")
+            ax2.set_title("tail sigma vs threshold (sweep 16..35)")
+            ax2.legend(fontsize=8)
+            ax2.grid(alpha=0.3)
+            fig2.tight_layout()
+            fig2.savefig(f"{plot}_sigma.png", dpi=130)
+            print(f"wrote {plot}_sigma.png")
     return 0
 
 

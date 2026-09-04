@@ -263,6 +263,12 @@ static int gh_jump2_scan(struct gh_batch *b, int slot, struct gh_ctx *g,
     uint32_t chi[GAP_HUNT_BATCH_MAX];
 
     for (uint32_t i = 0; i < K; i++) {
+        /* Reset per-fill record slots: the flight struct is reused across
+           fills, and stale jump_s/jump_e pairs from earlier windows were
+           re-emitted (with the new win_base) whenever both stale offsets
+           happened to be prime in a later window — false gaps whose length
+           equals the original record's (the "identical gaps" bug). */
+        b->jump_n[i] = 0;
         double t = g->min_merit * gh_log_mpz(b->win_base[i]);
         thr[i] = (uint64_t)ceil(t);
         if (thr[i] < 1)

@@ -148,6 +148,9 @@ static int g_quarter = 0;      /* GAP_HUNT_QUARTER env: 4-visible-class scan */
 static uint64_t g_kmax = 0;    /* GAP_HUNT_KMAX env: stop hook (tests/bench) */
 #define GAP_HUNT_JUMP_CAP 16   /* per-window gap capacity in jump mode */
 static int g_jump = 0;         /* GAP_HUNT_JUMP env: Kehrig-style walk */
+#define GAP_HUNT_JUMP2_CHUNK_DEFAULT 64
+static int g_jump2 = 0;        /* GAP_HUNT_JUMP2 env: chunk-parallel walk */
+static int g_jump2_chunk = GAP_HUNT_JUMP2_CHUNK_DEFAULT;
 
 struct gh_batch {
     int active;                 /* submitted, not yet collected */
@@ -188,6 +191,8 @@ struct gh_ctx {
     mpz_t b0;
     mpz_t P;
     int jump;                   /* GAP_HUNT_JUMP active */
+    int jump2;                  /* GAP_HUNT_JUMP2 active (chunk-parallel) */
+    int jump2_chunk;            /* per-window chunk size for jump2 rounds */
     double min_merit;           /* report threshold (jump thresholds) */
     uint64_t jump_thresh[GAP_HUNT_BATCH_MAX];
     uint64_t jump_gaps[GAP_HUNT_BATCH_MAX * GAP_HUNT_JUMP_CAP];
@@ -218,8 +223,195 @@ static double gh_log_mpz(const mpz_t n) {
 /* Fill one flight with K windows (mark + extract into the slot's candidate
    buffer) and submit ONE async MR batch.  Returns 1 on success; on failure
    or an empty batch, active stays 0. */
+
+/* First index > p whose offset gap reaches thr (offsets are ascending). */
+static uint32_t gh_jump2_find_q(struct gh_batch *b, uint32_t i, uint32_t p,
+                                uint64_t thr) {
+    uint32_t lo = p + 1, hi = b->count[i];
+    uint64_t target = b->win_off[i][p] + thr;
+    while (lo < hi) {
+        uint32_t mid = lo + (hi - lo) / 2;
+        if (b->win_off[i][mid] >= target)
+            hi = mid;
+        else
+            lo = mid + 1;
+    }
+    return lo < b->count[i] ? lo : UINT32_MAX;
+}
+
+/* ── Jump2: chunk-parallel backward search (Kehrig-exact, latency-free) ───
+   Same chain semantics as cgbn_jump_scan_kernel_t (parity-exact), but every
+   step tests a CHUNK of candidates batched across all windows in one tight
+   MR submit, so the cooperative-test latency that killed the serial jump is
+   hidden.  Fills b->jump_n/s/e for the existing jump-mode reporter. */
+enum { J2_FIND_FIRST = 0, J2_JUMP_BACK = 1, J2_FIND_END = 2, J2_DONE = 3 };
+
+static int gh_jump2_scan(struct gh_batch *b, int slot, struct gh_ctx *g,
+                         uint8_t *flags) {
+    const uint32_t C = (uint32_t)g->jump2_chunk;
+    const uint32_t K = b->n_windows;
+    if (K == 0)
+        return 1;
+    if (K > GAP_HUNT_BATCH_MAX)
+        return 0;
+
+    uint64_t thr[GAP_HUNT_BATCH_MAX];
+    uint32_t pidx[GAP_HUNT_BATCH_MAX];
+    uint32_t qidx[GAP_HUNT_BATCH_MAX];
+    uint8_t  phase[GAP_HUNT_BATCH_MAX];
+    uint32_t clo[GAP_HUNT_BATCH_MAX];
+    uint32_t chi[GAP_HUNT_BATCH_MAX];
+
+    for (uint32_t i = 0; i < K; i++) {
+        double t = g->min_merit * gh_log_mpz(b->win_base[i]);
+        thr[i] = (uint64_t)ceil(t);
+        if (thr[i] < 1)
+            thr[i] = 1;
+        pidx[i] = UINT32_MAX;
+        qidx[i] = UINT32_MAX;
+        phase[i] = J2_FIND_FIRST;
+        clo[i] = 0;
+        chi[i] = b->count[i] < C ? b->count[i] : C;
+    }
+
+    uint32_t lo[GAP_HUNT_BATCH_MAX], hi[GAP_HUNT_BATCH_MAX];
+    uint32_t dcum[GAP_HUNT_BATCH_MAX];
+    int any_active = 1;
+    while (any_active) {
+        uint32_t total = 0;
+        for (uint32_t i = 0; i < K; i++) {
+            int on = (phase[i] != J2_DONE && chi[i] > clo[i]);
+            lo[i] = on ? clo[i] : 0;
+            hi[i] = on ? chi[i] : 0;
+            dcum[i] = total;
+            if (on)
+                total += chi[i] - clo[i];
+        }
+        if (total > 0) {
+            uint32_t gathered = 0;
+            if (gpu_fermat_gather_run(g->fermat,
+                    gpu_sieve_candidate_buffer(g->sieve, slot),
+                    b->cum, lo, hi, dcum, K, g->fermat_limbs,
+                    &gathered) != 0 || gathered != total) {
+                fprintf(stderr, "[GAP_HUNT] jump2 gather fail: total=%u "
+                        "gathered=%u K=%u\n", total, gathered, K);
+                return 0;
+            }
+            if (gpu_fermat_submit_device(g->fermat, slot,
+                    gpu_fermat_gather_buffer(g->fermat),
+                    (size_t)total) < 0) {
+                fprintf(stderr, "[GAP_HUNT] jump2 submit fail: total=%u\n",
+                        total);
+                return 0;
+            }
+            if (gpu_fermat_collect(g->fermat, slot, flags,
+                                   (size_t)total) < 0) {
+                fprintf(stderr, "[GAP_HUNT] jump2 collect fail: total=%u\n",
+                        total);
+                return 0;
+            }
+        }
+
+        any_active = 0;
+        for (uint32_t i = 0; i < K; i++) {
+            if (phase[i] == J2_DONE)
+                continue;
+            uint32_t n = (chi[i] > clo[i]) ? chi[i] - clo[i] : 0;
+            const uint8_t *fl = flags + dcum[i];
+            uint32_t base = clo[i];
+
+            if (phase[i] == J2_FIND_FIRST) {
+                uint32_t found = UINT32_MAX;
+                for (uint32_t j = 0; j < n; j++)
+                    if (fl[j]) { found = base + j; break; }
+                if (found != UINT32_MAX) {
+                    pidx[i] = found;
+                    qidx[i] = gh_jump2_find_q(b, i, found, thr[i]);
+                    if (qidx[i] == UINT32_MAX) {
+                        phase[i] = J2_DONE;
+                    } else {
+                        phase[i] = J2_JUMP_BACK;
+                        uint32_t cl = qidx[i] > C ? qidx[i] - C : 0;
+                        clo[i] = (cl > found + 1) ? cl : found + 1;
+                        chi[i] = qidx[i];
+                    }
+                } else {
+                    clo[i] = chi[i];
+                    chi[i] = (chi[i] + C < b->count[i])
+                                 ? chi[i] + C : b->count[i];
+                    if (clo[i] >= b->count[i])
+                        phase[i] = J2_DONE;
+                }
+            } else if (phase[i] == J2_JUMP_BACK) {
+                uint32_t found = UINT32_MAX;
+                for (int32_t j = (int32_t)n - 1; j >= 0; j--)
+                    if (fl[j]) { found = base + (uint32_t)j; break; }
+                if (found != UINT32_MAX) {
+                    pidx[i] = found;
+                    qidx[i] = gh_jump2_find_q(b, i, found, thr[i]);
+                    if (qidx[i] == UINT32_MAX) {
+                        phase[i] = J2_DONE;
+                    } else {
+                        uint32_t cl = qidx[i] > C ? qidx[i] - C : 0;
+                        clo[i] = (cl > found + 1) ? cl : found + 1;
+                        chi[i] = qidx[i];
+                    }
+                } else {
+                    if (base == pidx[i] + 1) {
+                        /* (p, q) fully composite: find the true endpoint. */
+                        phase[i] = J2_FIND_END;
+                        clo[i] = qidx[i];
+                        chi[i] = (qidx[i] + C < b->count[i])
+                                     ? qidx[i] + C : b->count[i];
+                        if (chi[i] <= clo[i])
+                            phase[i] = J2_DONE;
+                    } else {
+                        uint32_t old_lo = base;
+                        uint32_t new_lo = (old_lo > pidx[i] + 1 + C)
+                                              ? old_lo - C : pidx[i] + 1;
+                        chi[i] = old_lo;
+                        clo[i] = new_lo;
+                    }
+                }
+            } else { /* J2_FIND_END */
+                uint32_t found = UINT32_MAX;
+                for (uint32_t j = 0; j < n; j++)
+                    if (fl[j]) { found = base + j; break; }
+                if (found != UINT32_MAX) {
+                    if (b->jump_n[i] >= GAP_HUNT_JUMP_CAP)
+                        return 0;   /* fail-closed */
+                    b->jump_s[i][b->jump_n[i]] =
+                        (uint32_t)b->win_off[i][pidx[i]];
+                    b->jump_e[i][b->jump_n[i]] =
+                        (uint32_t)b->win_off[i][found];
+                    b->jump_n[i]++;
+                    pidx[i] = found;
+                    qidx[i] = gh_jump2_find_q(b, i, found, thr[i]);
+                    if (qidx[i] == UINT32_MAX) {
+                        phase[i] = J2_DONE;
+                    } else {
+                        phase[i] = J2_JUMP_BACK;
+                        uint32_t cl = qidx[i] > C ? qidx[i] - C : 0;
+                        clo[i] = (cl > found + 1) ? cl : found + 1;
+                        chi[i] = qidx[i];
+                    }
+                } else {
+                    clo[i] = chi[i];
+                    chi[i] = (chi[i] + C < b->count[i])
+                                 ? chi[i] + C : b->count[i];
+                    if (clo[i] >= b->count[i])
+                        phase[i] = J2_DONE;
+                }
+            }
+            if (phase[i] != J2_DONE)
+                any_active = 1;
+        }
+    }
+    return 1;
+}
+
 static int gh_batch_fill(struct gh_batch *b, int slot, uint64_t k0,
-                         struct gh_ctx *g) {
+                         struct gh_ctx *g, uint8_t *flags) {
     uint32_t cum = 0;
     for (uint32_t i = 0; i < (uint32_t)g_batch; i++) {
         uint64_t k = k0 + i;
@@ -330,6 +522,16 @@ static int gh_batch_fill(struct gh_batch *b, int slot, uint64_t k0,
     b->slot = slot;
     if (cum == 0)
         return 1;               /* nothing to MR-test; process as empty */
+    if (g->jump2) {
+        /* Chunk-parallel backward search: exact Kehrig chain semantics but
+           each step is one batched MR round across all windows. */
+        if (!gh_jump2_scan(b, slot, g, flags)) {
+            fprintf(stderr, "[GAP_HUNT] fill fail: jump2 scan (k0=%llu)\n",
+                    (unsigned long long)k0);
+            return 0;
+        }
+        return 1;
+    }
     if (g->jump) {
         /* Jump mode: per-window serial MR chain on the GPU (Kehrig-style),
            ~1.5 tests per prime instead of all survivors.  Synchronous, so
@@ -414,7 +616,7 @@ static void gh_batch_process(struct gh_batch *b, const uint8_t *flags,
                              uint64_t *gaps, double *best,
                              FILE *out, mpz_t p1, mpz_t p2,
                              mpz_t last_prime, int *have_last) {
-    if (g->jump) {
+    if (g->jump || g->jump2) {
         /* Jump mode: the device walk already certified the chains; only
            BPSW-verify the reported endpoints and emit (the walk tests the
            same MR2 the batch path uses, so the gap set is identical). */
@@ -576,6 +778,15 @@ int gap_hunt_run(const struct gap_hunt_config *cfg) {
         const char *jv = getenv("GAP_HUNT_JUMP");
         if (jv && jv[0] && atoi(jv) > 0)
             g_jump = 1;
+        const char *j2v = getenv("GAP_HUNT_JUMP2");
+        if (j2v && j2v[0] && atoi(j2v) > 0)
+            g_jump2 = 1;
+        const char *j2c = getenv("GAP_HUNT_JUMP2_CHUNK");
+        if (j2c && j2c[0]) {
+            int c = atoi(j2c);
+            if (c >= 8 && c <= 512)
+                g_jump2_chunk = c;
+        }
     }
 
     struct crt_runtime rt;
@@ -693,6 +904,20 @@ int gap_hunt_run(const struct gap_hunt_config *cfg) {
             return 1;
         }
     }
+    if (g_jump2) {
+        if (gpu_fermat_gather_alloc(fermat, (uint32_t)g_batch,
+                                    (uint32_t)g_jump2_chunk,
+                                    gpu_fermat_get_limbs(fermat)) != 0) {
+            fprintf(stderr, "[GAP_HUNT] jump2 gather alloc failed\n");
+            free(base_limbs);
+            gpu_sieve_destroy(gpu_sieve);
+            gpu_adapter_free(gpu);
+            sieve_core_free(&sieve);
+            mpz_clears(target, b0, P, p1, p2, last_prime, NULL);
+            crt_runtime_free(&rt);
+            return 1;
+        }
+    }
     base_limbs = (uint64_t *)calloc((size_t)gpu_limbs, sizeof(uint64_t));
     size_t win_cap = (size_t)sieve.candidate_capacity;
     uint64_t *offsets = (uint64_t *)malloc(
@@ -742,12 +967,13 @@ int gap_hunt_run(const struct gap_hunt_config *cfg) {
 
     fprintf(stderr,
             "[GAP_HUNT] walk: shift=%u n_primes=%u P bits=%.0f window=%llu "
-            "sieve=%u batch=%d quarter=%d jump=%d kmax=%llu min_merit=%.6f "
+            "sieve=%u batch=%d quarter=%d jump=%d jump2=%d jump2_chunk=%d "
+            "kmax=%llu min_merit=%.6f "
             "k0=%llu device=%d\n",
             rt.shift, rt.n_primes,
             (double)mpz_sizeinbase(P, 2),
             (unsigned long long)rt.window, sieve_primes, g_batch, g_quarter,
-            g_jump,
+            g_jump, g_jump2, g_jump2_chunk,
             (unsigned long long)g_kmax, cfg->min_merit,
             (unsigned long long)k, cfg->device);
 
@@ -780,6 +1006,8 @@ int gap_hunt_run(const struct gap_hunt_config *cfg) {
     mpz_set(g.P, P);
     g.quarter = g_quarter;
     g.jump = g_jump;
+    g.jump2 = g_jump2;
+    g.jump2_chunk = g_jump2_chunk;
     g.min_merit = cfg->min_merit;
     g.region_start = g_quarter ? back_limit : 0;
     g.tail_start = back_limit + rt.window;
@@ -826,7 +1054,7 @@ int gap_hunt_run(const struct gap_hunt_config *cfg) {
         /* Refill and resubmit this flight so it is in flight while the other
            is collected next; empty batches (cum==0) process inline. */
         if (!g_stop && !(g_kmax && next_k >= g_kmax)) {
-            if (!gh_batch_fill(fl, turn, next_k, &g)) {
+            if (!gh_batch_fill(fl, turn, next_k, &g, flags)) {
                 fprintf(stderr, "[GAP_HUNT] batch fill failed (k=%llu)\n",
                         (unsigned long long)next_k);
                 break;

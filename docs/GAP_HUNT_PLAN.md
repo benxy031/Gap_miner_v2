@@ -402,3 +402,23 @@ demonstrated win over CGBN integer Montgomery.  LESSON RECORDED: "mixed
 precision" is a conditional transfer, not a generic speedup — it only
 pays when the precision-loss mechanism matches (linearity / bandwidth /
 exact quotient correction).  N5 closed as a pointer with this verdict.
+
+JUMP2 (idea A) IMPLEMENTED + PARITY-EXACT + 3.0x (2026-09-04): the
+chunk-parallel backward search.  The serial jump's Kehrig chain semantics
+are kept exactly (FIND_FIRST -> JUMP_BACK -> FIND_END per window), but each
+step tests a CHUNK of survivors (default 64) batched across all 32 windows
+via a new gather kernel + gpu_fermat_gather_alloc/run/buffer API in
+gpu_fermat.cu (per-window slices packed into a contiguous round staging
+buffer -> one tight gpu_fermat_submit_device).  Env: GAP_HUNT_JUMP2 (off)
++ GAP_HUNT_JUMP2_CHUNK (64, 8..512).  Fail-closed: any CUDA error falls
+back to the batch path.  PARITY: gap sets byte-identical to the full-scan
+batch path on shift507 (KMAX=128, m8) and shift1017 (KMAX=64, m8);
+test_gap_hunt 4/4 exact on the 1017 jump2 output.  THROUGHPUT (dev RTX
+3070, record walker sharing the GPU, shift1017 merit 20): ~486 win/s vs
+~159 full-scan = 3.0x, stable across runs; chunk sweep C=64 optimal
+(32 -> 402, 128 -> 386 win/s).  The remaining gap to the ~9x theoretical
+is the per-window mark+extract (now the co-dominant cost) and per-round
+submit/collect serialization; next levers: overlap the next flight's
+mark+extract with the current flight's rounds.  RECORD-RATE IMPACT: 3x
+windows/s => ~3x gaps/hour => expected next-record wait drops ~2 days to
+~16 h per 3060 at threshold 20.

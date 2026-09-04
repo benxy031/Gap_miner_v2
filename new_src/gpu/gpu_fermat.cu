@@ -1173,6 +1173,16 @@ struct gpu_fermat_ctx {
     uint64_t *d_jump_thresh_in;   /* per-window gap thresholds  */
     uint32_t  jump_windows_cap;
     uint32_t  jump_gap_cap;
+
+    /* Jump2 chunk-parallel gather buffers (host-orchestrated jump) */
+    uint64_t *d_gather_buf;       /* contiguous round staging (AoS) */
+    uint32_t *d_gather_lo;
+    uint32_t *d_gather_hi;
+    uint32_t *d_gather_src_cum;
+    uint32_t *d_gather_dst_cum;
+    uint32_t  gather_windows_cap;
+    uint32_t  gather_chunk_cap;
+    int       gather_limbs;
 };
 
 static __host__ __forceinline__ cudaError_t ensure_device(int device_id)
@@ -1669,6 +1679,130 @@ const char *gpu_fermat_kernel_label(int limbs)
  * ═══════════════════════════════════════════════════════════════════ */
 
 /* Allocate the jump-scan device buffers (once per context). */
+/* ── Jump2 chunk-parallel gather (host-orchestrated backward search) ───────
+   Copies per-window candidate slices [lo,hi) from the packed AoS buffer into
+   a contiguous round staging buffer so each round's MR batch is one tight
+   submit.  One thread block per window, linear element-wise copy. */
+__global__ static void gather_ranges_kernel_t(const uint64_t * __restrict__ src,
+                                              uint64_t * __restrict__ dst,
+                                              const uint32_t * __restrict__ src_cum,
+                                              const uint32_t * __restrict__ lo,
+                                              const uint32_t * __restrict__ hi,
+                                              const uint32_t * __restrict__ dst_cum,
+                                              uint32_t active_limbs)
+{
+    uint32_t w = blockIdx.x;
+    uint32_t n = hi[w] - lo[w];
+    if (n == 0) return;
+    uint64_t sbase = (uint64_t)(src_cum[w] + lo[w]) * (uint64_t)active_limbs;
+    uint64_t dbase = (uint64_t)dst_cum[w] * (uint64_t)active_limbs;
+    uint64_t total = (uint64_t)n * (uint64_t)active_limbs;
+    for (uint64_t t = threadIdx.x; t < total; t += blockDim.x)
+        dst[dbase + t] = src[sbase + t];
+}
+
+int gpu_fermat_gather_alloc(gpu_fermat_ctx *ctx, uint32_t n_windows,
+                            uint32_t chunk_cap, int active_limbs)
+{
+    if (!ctx || n_windows == 0 || chunk_cap == 0 || active_limbs <= 0)
+        return -1;
+    if (ctx->d_gather_buf && ctx->gather_windows_cap >= n_windows &&
+        ctx->gather_chunk_cap >= chunk_cap &&
+        ctx->gather_limbs == active_limbs)
+        return 0;   /* already sized */
+
+    cudaError_t err = ensure_device(ctx->device_id);
+    if (err != cudaSuccess)
+        return -1;
+
+    if (ctx->d_gather_buf)      cudaFree(ctx->d_gather_buf);
+    if (ctx->d_gather_lo)       cudaFree(ctx->d_gather_lo);
+    if (ctx->d_gather_hi)       cudaFree(ctx->d_gather_hi);
+    if (ctx->d_gather_src_cum)  cudaFree(ctx->d_gather_src_cum);
+    if (ctx->d_gather_dst_cum)  cudaFree(ctx->d_gather_dst_cum);
+    ctx->d_gather_buf = NULL;
+    ctx->d_gather_lo = NULL;
+    ctx->d_gather_hi = NULL;
+    ctx->d_gather_src_cum = NULL;
+    ctx->d_gather_dst_cum = NULL;
+    ctx->gather_windows_cap = 0;
+    ctx->gather_chunk_cap = 0;
+    ctx->gather_limbs = 0;
+
+    size_t cap = (size_t)n_windows * chunk_cap * (size_t)active_limbs;
+    if (cudaMalloc(&ctx->d_gather_buf,
+                   cap * sizeof(uint64_t)) != cudaSuccess)
+        return -1;
+    if (cudaMalloc(&ctx->d_gather_lo,
+                   (size_t)n_windows * sizeof(uint32_t)) != cudaSuccess)
+        return -1;
+    if (cudaMalloc(&ctx->d_gather_hi,
+                   (size_t)n_windows * sizeof(uint32_t)) != cudaSuccess)
+        return -1;
+    if (cudaMalloc(&ctx->d_gather_src_cum,
+                   (size_t)n_windows * sizeof(uint32_t)) != cudaSuccess)
+        return -1;
+    if (cudaMalloc(&ctx->d_gather_dst_cum,
+                   (size_t)n_windows * sizeof(uint32_t)) != cudaSuccess)
+        return -1;
+
+    ctx->gather_windows_cap = n_windows;
+    ctx->gather_chunk_cap = chunk_cap;
+    ctx->gather_limbs = active_limbs;
+    return 0;
+}
+
+/* Gather one round's per-window slices into the contiguous staging buffer.
+   h_dst_cum[i] is the host-computed destination prefix (sum of round sizes
+   for windows < i); the round total is returned in *total_out.  Synchronous. */
+int gpu_fermat_gather_run(gpu_fermat_ctx *ctx, const uint64_t *d_src,
+                          const uint32_t *h_src_cum,
+                          const uint32_t *h_lo, const uint32_t *h_hi,
+                          const uint32_t *h_dst_cum,
+                          uint32_t n_windows, int active_limbs,
+                          uint32_t *total_out)
+{
+    if (!ctx || !d_src || !h_src_cum || !h_lo || !h_hi || !h_dst_cum ||
+        !total_out || n_windows == 0)
+        return -1;
+    if (!ctx->d_gather_buf || ctx->gather_windows_cap < n_windows)
+        return -1;
+
+    cudaError_t err = ensure_device(ctx->device_id);
+    if (err != cudaSuccess)
+        return -1;
+
+    size_t bytes = (size_t)n_windows * sizeof(uint32_t);
+    err = cudaMemcpy(ctx->d_gather_lo, h_lo, bytes, cudaMemcpyHostToDevice);
+    if (err != cudaSuccess) return -1;
+    err = cudaMemcpy(ctx->d_gather_hi, h_hi, bytes, cudaMemcpyHostToDevice);
+    if (err != cudaSuccess) return -1;
+    err = cudaMemcpy(ctx->d_gather_src_cum, h_src_cum, bytes,
+                     cudaMemcpyHostToDevice);
+    if (err != cudaSuccess) return -1;
+    err = cudaMemcpy(ctx->d_gather_dst_cum, h_dst_cum, bytes,
+                     cudaMemcpyHostToDevice);
+    if (err != cudaSuccess) return -1;
+
+    gather_ranges_kernel_t<<<(unsigned)n_windows, 256>>>(
+        d_src, ctx->d_gather_buf, ctx->d_gather_src_cum,
+        ctx->d_gather_lo, ctx->d_gather_hi, ctx->d_gather_dst_cum,
+        (uint32_t)active_limbs);
+    err = cudaGetLastError();
+    if (err != cudaSuccess) return -1;
+    err = cudaDeviceSynchronize();
+    if (err != cudaSuccess) return -1;
+
+    *total_out = h_dst_cum[n_windows - 1] +
+                 (h_hi[n_windows - 1] - h_lo[n_windows - 1]);
+    return 0;
+}
+
+uint64_t *gpu_fermat_gather_buffer(gpu_fermat_ctx *ctx)
+{
+    return ctx ? ctx->d_gather_buf : NULL;
+}
+
 int gpu_fermat_jump_alloc(gpu_fermat_ctx *ctx, uint32_t n_windows,
                           uint32_t max_gaps_per_window)
 {
@@ -1868,5 +2002,10 @@ void gpu_fermat_destroy(gpu_fermat_ctx *ctx)
     if (ctx->d_jump_counts_in)  cudaFree(ctx->d_jump_counts_in);
     if (ctx->d_jump_cums_in)    cudaFree(ctx->d_jump_cums_in);
     if (ctx->d_jump_thresh_in)  cudaFree(ctx->d_jump_thresh_in);
+    if (ctx->d_gather_buf)      cudaFree(ctx->d_gather_buf);
+    if (ctx->d_gather_lo)       cudaFree(ctx->d_gather_lo);
+    if (ctx->d_gather_hi)       cudaFree(ctx->d_gather_hi);
+    if (ctx->d_gather_src_cum)  cudaFree(ctx->d_gather_src_cum);
+    if (ctx->d_gather_dst_cum)  cudaFree(ctx->d_gather_dst_cum);
     free(ctx);
 }

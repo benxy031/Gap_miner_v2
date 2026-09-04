@@ -135,6 +135,21 @@ int gpu_fermat_jump_scan(gpu_fermat_ctx *ctx,
                          uint64_t *h_gaps,
                          uint32_t *h_counts_out);
 
+/* Jump2 chunk-parallel gather API (host-orchestrated backward search):
+   allocate the staging buffers once, then per round copy each window's
+   candidate slice [lo,hi) (packed AoS, src_cum = window slot prefix) into
+   the contiguous staging buffer and return the round total for one tight
+   gpu_fermat_submit_device() call. */
+int gpu_fermat_gather_alloc(gpu_fermat_ctx *ctx, uint32_t n_windows,
+                            uint32_t chunk_cap, int active_limbs);
+int gpu_fermat_gather_run(gpu_fermat_ctx *ctx, const uint64_t *d_src,
+                          const uint32_t *h_src_cum,
+                          const uint32_t *h_lo, const uint32_t *h_hi,
+                          const uint32_t *h_dst_cum,
+                          uint32_t n_windows, int active_limbs,
+                          uint32_t *total_out);
+uint64_t *gpu_fermat_gather_buffer(gpu_fermat_ctx *ctx);
+
 /* Set the arithmetic limb count for this context.
    active_limbs = ceil((256 + shift) / 64) for Gapcoin.
    Reduces Montgomery multiplication from O(GPU_NLIMBS²) to O(active²).

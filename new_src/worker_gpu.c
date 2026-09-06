@@ -1566,6 +1566,8 @@ struct fused_flight {
     uint64_t interval;
     uint64_t base_window;       /* global window index of wins[0] (parity) */
     uint32_t total_count;       /* sum of head counts = MR batch size */
+    int row_mode;               /* row-batch mark active for this flight */
+    uint64_t step_limbs[GPU_NLIMBS];  /* row stride P (tail re-mark needs it) */
     struct fused_flight_window wins[FUSED_MR_BATCH_MAX];
 };
 
@@ -1608,6 +1610,7 @@ static void fused_pending_clear(struct fused_pending_state *p) {
    candidates contiguous for ONE accumulated MR submission per K windows. */
 static int crt_fused_append_window(struct gpu_sieve_ctx *gpu_sieve,
                                    int bitmap_buf,
+                                   const uint64_t *row_bitmap,
                                    int cand_buf,
                                    int split,
                                    const uint64_t *base_limbs,
@@ -1647,11 +1650,18 @@ static int crt_fused_append_window(struct gpu_sieve_ctx *gpu_sieve,
     unsigned int count = 0;
     uint64_t class_mask =
         half_class ? halfclass_visible_mask() : UINT64_MAX;
-    if (!gpu_sieve_extract_pack_device_range_ex(
-            gpu_sieve, odd_interval_size, first_odd_offset, lo, hi,
-            bitmap_buf, cand_buf, base_limbs, limbs, &d_cands,
-            head_offsets, &count, base_mod60, class_mask,
-            region_start, slot_base)) {
+    int extract_ok = row_bitmap
+        ? gpu_sieve_extract_pack_device_range_bitmap(
+              gpu_sieve, row_bitmap, odd_interval_size, first_odd_offset,
+              lo, hi, cand_buf, base_limbs, limbs, &d_cands,
+              head_offsets, &count, base_mod60, class_mask,
+              region_start, slot_base)
+        : gpu_sieve_extract_pack_device_range_ex(
+              gpu_sieve, odd_interval_size, first_odd_offset, lo, hi,
+              bitmap_buf, cand_buf, base_limbs, limbs, &d_cands,
+              head_offsets, &count, base_mod60, class_mask,
+              region_start, slot_base);
+    if (!extract_ok) {
         return 0;
     }
     *head_count_out = count;
@@ -1762,13 +1772,27 @@ static int crt_fused_collect_batch(struct gpu_sieve_ctx *gpu_sieve,
                 if (head_hi_odd < odd_interval_size) {
                     /* The window's bitmap was overwritten by later windows;
                        re-mark it on demand (deterministic: same base, same
-                       primes — proven by the pair-batch experiment). */
+                       primes — proven by the pair-batch experiment).  In row
+                       mode the arena rows are shared across nonces, so the
+                       re-mark goes to arena row 0 and the tail extracts from
+                       there (row 0 of the arena is scratch at collect time). */
                     int parity =
                         (int)((fl->base_window + (uint64_t)j) & 1ULL);
-                    if (!gpu_sieve_mark_from_base(
+                    int remark_ok = 0;
+                    uint64_t *row_bmp = NULL;
+                    if (fl->row_mode) {
+                        remark_ok = gpu_sieve_mark_rows_from_base(
+                            gpu_sieve, odd_interval_size, first_odd_offset,
+                            wv->base_limbs, fl->step_limbs, fl->limbs, 1,
+                            primes, inv_p, prime_count);
+                        row_bmp = gpu_sieve_row_bitmap(gpu_sieve, 0);
+                    } else {
+                        remark_ok = gpu_sieve_mark_from_base(
                             gpu_sieve, odd_interval_size, first_odd_offset,
                             wv->base_limbs, fl->limbs, parity,
-                            primes, inv_p, prime_count, NULL, 0)) {
+                            primes, inv_p, prime_count, NULL, 0);
+                    }
+                    if (!remark_ok || (fl->row_mode && !row_bmp)) {
                         free(tail_off);
                         free(tail_ip);
                         free(win_off);
@@ -1782,13 +1806,22 @@ static int crt_fused_collect_batch(struct gpu_sieve_ctx *gpu_sieve,
 
                     unsigned int tc = 0;
                     uint64_t *d_tail = NULL;
-                    if (!gpu_sieve_extract_pack_device_range_ex(
-                            gpu_sieve, odd_interval_size, first_odd_offset,
-                            head_hi_odd, odd_interval_size, parity, fl->buf,
-                            wv->base_limbs, fl->limbs, &d_tail,
-                            tail_off, &tc,
-                            wv->base_mod60, class_mask, fl->back_limit,
-                            total + tail_accum)) {
+                    int tail_extract_ok = row_bmp
+                        ? gpu_sieve_extract_pack_device_range_bitmap(
+                              gpu_sieve, row_bmp, odd_interval_size,
+                              first_odd_offset, head_hi_odd, odd_interval_size,
+                              fl->buf, wv->base_limbs, fl->limbs, &d_tail,
+                              tail_off, &tc,
+                              wv->base_mod60, class_mask, fl->back_limit,
+                              total + tail_accum)
+                        : gpu_sieve_extract_pack_device_range_ex(
+                              gpu_sieve, odd_interval_size, first_odd_offset,
+                              head_hi_odd, odd_interval_size, parity, fl->buf,
+                              wv->base_limbs, fl->limbs, &d_tail,
+                              tail_off, &tc,
+                              wv->base_mod60, class_mask, fl->back_limit,
+                              total + tail_accum);
+                    if (!tail_extract_ok) {
                         free(tail_off);
                         free(tail_ip);
                         free(win_off);
@@ -2332,6 +2365,7 @@ void *worker_thread_run_crt(void *arg) {
     uint32_t worker_id = config->worker_id;
 
     mpz_t base, nadd0, candidate, p1, p2, nadd_full, window_base;
+    mpz_t nadd0_row, rowP, rowLimit, rowCount;
     mpz_init(base);
     mpz_init(nadd0);
     mpz_init(candidate);
@@ -2339,6 +2373,10 @@ void *worker_thread_run_crt(void *arg) {
     mpz_init(p2);
     mpz_init(nadd_full);
     mpz_init(window_base);
+    mpz_init(nadd0_row);
+    mpz_init(rowP);
+    mpz_init(rowLimit);
+    mpz_init(rowCount);
     struct euler_context euler_context;
     euler_context_init(&euler_context);
 
@@ -2390,14 +2428,16 @@ void *worker_thread_run_crt(void *arg) {
     struct sieve_core sieve = {0};
     if (!sieve_core_init_window(&sieve, max_interval, sieve_limit)) {
         fprintf(stderr, "[Worker %u] Failed to initialize CRT sieve\n", worker_id);
-        mpz_clears(base, nadd0, candidate, p1, p2, nadd_full, window_base, NULL);
+        mpz_clears(base, nadd0, candidate, p1, p2, nadd_full, window_base,
+               nadd0_row, rowP, rowLimit, rowCount, NULL);
         euler_context_clear(&euler_context);
         return NULL;
     }
     uint8_t *is_prime = (uint8_t *)malloc(sieve.candidate_capacity * sizeof(*is_prime));
     if (!is_prime) {
         sieve_core_free(&sieve);
-        mpz_clears(base, nadd0, candidate, p1, p2, nadd_full, window_base, NULL);
+        mpz_clears(base, nadd0, candidate, p1, p2, nadd_full, window_base,
+                   nadd0_row, rowP, rowLimit, rowCount, NULL);
         euler_context_clear(&euler_context);
         return NULL;
     }
@@ -2560,6 +2600,34 @@ void *worker_thread_run_crt(void *arg) {
 
     uint32_t nthreads = config->nthreads > 0 ? config->nthreads : 1;
 
+    /* CRT row-walk (Horizon-style): one header nonce yields many aligned
+       bases base + m·P — the CRT template is P-periodic, so the per-window
+       SHA256 + CRT-alignment cost is amortized over a batch of rows.
+       CRT_ROWS_BATCH (default 64, 0 = off) caps rows per nonce; the
+       remaining nonce space bounds them too. */
+    uint64_t crt_rows_batch = 64;
+    {
+        const char *rb = getenv("CRT_ROWS_BATCH");
+        if (rb && *rb) {
+            long v = strtol(rb, NULL, 10);
+            if (v >= 0 && v <= 1024) crt_rows_batch = (uint64_t)v;
+        }
+    }
+    mpz_set(rowP, rt->primorial);
+
+    /* Row stride P exported once: it is fixed for the whole CRT run. */
+    int rowP_limbs_valid = 0;
+    uint64_t rowP_limbs[GPU_NLIMBS];
+    memset(rowP_limbs, 0, sizeof(rowP_limbs));
+    {
+        size_t step_exported = 0;
+        mpz_export(rowP_limbs, &step_exported, -1, sizeof(uint64_t), 0, 0,
+                   rowP);
+        rowP_limbs_valid = (step_exported > 0 && step_exported <= GPU_NLIMBS)
+                               ? 1
+                               : 0;
+    }
+
     while (!g_stop_requested) {
         uint64_t generation;
         uint32_t height;
@@ -2622,9 +2690,27 @@ void *worker_thread_run_crt(void *arg) {
 
                 /* Solve the CRT alignment for this header. */
                 if (crt_runtime_align(nadd0, h256, rt->shift, rt) == 0) {
+                    /* Row-walk: how many translates fit in the nonce space? */
+                    uint64_t rows = 1;
+                    if (crt_rows_batch > 1) {
+                        mpz_set_ui(rowLimit, 1);
+                        mpz_mul_2exp(rowLimit, rowLimit, rt->shift);
+                        mpz_sub(rowLimit, rowLimit, nadd0);
+                        mpz_fdiv_q(rowCount, rowLimit, rowP);
+                        rows = mpz_fits_ulong_p(rowCount)
+                                   ? mpz_get_ui(rowCount)
+                                   : 0;
+                        if (rows > crt_rows_batch) rows = crt_rows_batch;
+                        if (rows < 1) rows = 1;
+                    }
+                    int row_batch_marked = 0;
+                    for (uint64_t row_m = 0; row_m < rows; row_m++) {
+                        mpz_set(nadd0_row, nadd0);
+                        if (row_m)
+                            mpz_addmul_ui(nadd0_row, rowP, row_m);
                     /* base = (h256 << shift) + nadd0 - adj (even-aligned). */
                     worker_set_base(base, h256, rt->shift, 0);
-                    mpz_add(base, base, nadd0);
+                    mpz_add(base, base, nadd0_row);
                     if (rt->adj) mpz_sub_ui(base, base, rt->adj);
 
                     /* Sieve [base - back_limit, base + scan_window) so the
@@ -2717,9 +2803,41 @@ void *worker_thread_run_crt(void *arg) {
                                per-window and unchanged: extract + MR submit
                                for THIS window only, right after its mark. */
                             int mark_ok = 0;
+                            int row_mode = (rows > 1) && rowP_limbs_valid;
                             if (exported <= (size_t)gpu_limbs &&
                                 odd_interval_size > 0) {
-                                if (fused_pending.valid && fused_pair_enabled) {
+                                if (row_mode) {
+                                    /* Row-batch mark: residues for base + P
+                                       once, then mark all rows.  row_m == 0
+                                       runs the batch mark; later rows are
+                                       already marked (bitmaps stay valid
+                                       until the NEXT nonce's batch). */
+                                    fused_pending_clear(&fused_pending);
+                                    if (row_m == 0) {
+                                        mark_ok =
+                                            gpu_sieve_mark_rows_from_base(
+                                                gpu_sieve,
+                                                odd_interval_size,
+                                                first_odd_offset,
+                                                gpu_base_limbs,
+                                                rowP_limbs,
+                                                gpu_limbs,
+                                                (uint32_t)rows,
+                                                sieve.small_primes,
+                                                sieve.inv_p,
+                                                sieve.small_primes_count);
+                                        row_batch_marked = mark_ok;
+                                        if (mark_ok) {
+                                            atomic_fetch_add(
+                                                &g_worker_stats[worker_id].gpu_sieve_calls, 1);
+                                            atomic_fetch_add(
+                                                &g_worker_stats[worker_id].gpu_sieve_windows,
+                                                (uint64_t)rows);
+                                        }
+                                    } else {
+                                        mark_ok = row_batch_marked;
+                                    }
+                                } else if (fused_pending.valid && fused_pair_enabled) {
                                     uint64_t pair_limbs[2][GPU_NLIMBS];
                                     const uint64_t *p0, *p1;
                                     if (fused_pending.parity == 0) {
@@ -2778,11 +2896,19 @@ void *worker_thread_run_crt(void *arg) {
                                     fl->base_window = w_idx;
                                     fl->n_windows = 0;
                                     fl->total_count = 0;
+                                    fl->row_mode = row_mode;
+                                    memcpy(fl->step_limbs, rowP_limbs,
+                                           sizeof(fl->step_limbs));
                                 }
                             }
                             if (mark_ok &&
                                 crt_fused_append_window(
-                                    gpu_sieve, f, slot,
+                                    gpu_sieve, f,
+                                    row_mode
+                                        ? gpu_sieve_row_bitmap(
+                                              gpu_sieve, (uint32_t)row_m)
+                                        : NULL,
+                                    slot,
                                     split_v, gpu_base_limbs, gpu_limbs,
                                     interval, head_end_v,
                                     fused_offsets[slot] + fl->total_count,
@@ -2798,7 +2924,7 @@ void *worker_thread_run_crt(void *arg) {
                                 memcpy(wv->base_limbs, gpu_base_limbs,
                                        (size_t)gpu_limbs * sizeof(uint64_t));
                                 mpz_set(wv->window_base, window_base);
-                                mpz_set(wv->nadd0, nadd0);
+                                mpz_set(wv->nadd0, nadd0_row);
                                 fl->total_count += head_count;
                                 fl->n_windows++;
                                 atomic_fetch_add(
@@ -3045,11 +3171,12 @@ void *worker_thread_run_crt(void *arg) {
                         uint64_t owned_limit = back_limit + needed_gap;
 
                         crt_scan_gaps(worker_id, height, nonce, generation,
-                                      merit_threshold, rt, window_base, nadd0,
+                                      merit_threshold, rt, window_base, nadd0_row,
                                       back_limit, p1, p2, nadd_full,
                                       is_prime, candidate_offsets, tested_count,
                                       owned_limit, half_class, NULL, 0);
                     }
+                    } /* row_m */
                 }
             }
 
@@ -3092,7 +3219,8 @@ void *worker_thread_run_crt(void *arg) {
     }
     if (gpu) gpu_adapter_free(gpu);
 #endif
-    mpz_clears(base, nadd0, candidate, p1, p2, nadd_full, window_base, NULL);
+    mpz_clears(base, nadd0, candidate, p1, p2, nadd_full, window_base,
+               nadd0_row, rowP, rowLimit, rowCount, NULL);
     euler_context_clear(&euler_context);
 
     printf("[Worker %u] CRT stopped (scans=%lu, candidates=%lu, gaps=%lu, gpu_sieve_windows=%lu)\n",

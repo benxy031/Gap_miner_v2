@@ -46,6 +46,12 @@ struct gpu_sieve_ctx {
     uint32_t extract_accum;     /* K: candidate buffers sized K× per window
                                    (MR batch accumulation across windows) */
     int active_limbs_capacity;
+
+    /* Row-batch mark (CRT row-walk): rows × max_bitmap_words bitmaps so one
+       residues pass can mark a whole row batch; d_step_mod_p[i] = P mod p. */
+    uint64_t *d_row_bitmaps;
+    uint32_t row_bitmap_cap;
+    uint64_t *d_step_mod_p;
 };
 
 static uint64_t gpu_sieve_clock_us(void) {
@@ -188,6 +194,15 @@ gpu_sieve_ctx *gpu_sieve_init(int device_id,
                      max_primes * sizeof(*ctx->d_base_mod_p));
     if (err != cudaSuccess) {
         fprintf(stderr, "gpu_sieve: cudaMalloc(base_mod_p): %s\n",
+                cudaGetErrorString(err));
+        gpu_sieve_destroy(ctx);
+        return NULL;
+    }
+
+    err = cudaMalloc(&ctx->d_step_mod_p,
+                     max_primes * sizeof(*ctx->d_step_mod_p));
+    if (err != cudaSuccess) {
+        fprintf(stderr, "gpu_sieve: cudaMalloc(step_mod_p): %s\n",
                 cudaGetErrorString(err));
         gpu_sieve_destroy(ctx);
         return NULL;
@@ -432,6 +447,285 @@ __global__ static void gpu_sieve_residues_kernel(const uint64_t *base_limbs,
         if (r >= p) r -= p;
     }
     base_mod_p[idx] = r;
+}
+
+/* Row-batch fused mark (CRT row-walk): compute base mod p AND step mod p
+   (step = P, the CRT row stride) in ONE sweep, then mark row_count bitmaps.
+   d_base_limbs holds base limbs at [0, base_limb_count) and step limbs at
+   [base_limb_count, 2*base_limb_count). */
+__global__ static void gpu_sieve_rows_residues_kernel(
+    const uint64_t *base_limbs,
+    const uint64_t *step_limbs,
+    int base_limb_count,
+    const uint64_t *primes,
+    const uint64_t *inv_p,
+    uint64_t *base_mod_p,
+    uint64_t *step_mod_p,
+    uint64_t prime_count)
+{
+    uint64_t idx = (uint64_t)blockIdx.x * (uint64_t)blockDim.x +
+                   (uint64_t)threadIdx.x;
+    if (idx >= prime_count) return;
+
+    uint64_t p = primes[idx];
+    uint64_t inv = inv_p[idx];
+    int chunks = base_limb_count * 2;
+
+    const uint32_t *base32 = (const uint32_t *)base_limbs;
+    uint64_t r = 0;
+    for (int i = chunks - 1; i >= 0; i--) {
+        uint64_t v = (r << 32) | base32[i];
+        uint64_t q = (uint64_t)(((unsigned __int128)v * inv) >> 64);
+        r = v - q * p;
+        if (r >= p) r -= p;
+    }
+    base_mod_p[idx] = r;
+
+    const uint32_t *step32 = (const uint32_t *)step_limbs;
+    uint64_t s = 0;
+    for (int i = chunks - 1; i >= 0; i--) {
+        uint64_t v = (s << 32) | step32[i];
+        uint64_t q = (uint64_t)(((unsigned __int128)v * inv) >> 64);
+        s = v - q * p;
+        if (s >= p) s -= p;
+    }
+    step_mod_p[idx] = s;
+}
+
+/* Euclid modulo-event skip (port of Horizon
+   mark_composites_combined_euclid / modulo_search_euclid_u32): returns the
+   smallest k >= 1 such that (k*a mod p) lies in [l, r], for 0 < a < p and
+   1 <= l <= r < p, via Euclidean continued-fraction descent.  All u32. */
+__device__ __forceinline__ static uint32_t
+gpu_sieve_modulo_event_euclid_u32(uint32_t p, uint32_t a,
+                                  uint32_t l, uint32_t r)
+{
+    uint32_t stack_p[64];
+    uint32_t stack_a[64];
+    uint32_t stack_l[64];
+    uint32_t depth = 0u;
+    uint64_t result = 0u;
+
+    while (true) {
+        const uint32_t delta = r - l;
+        if (a > (p >> 1u)) {
+            l += delta;      /* l -> r_old */
+            a = p - a;
+            l = p - l;       /* -> p - r_old (negated interval lower bound) */
+        }
+        const uint32_t l_div = (l - 1u) / a;
+        const uint32_t l_mod = l - l_div * a;
+        const uint32_t r_mod = l_mod + delta;
+        if (r_mod >= a) {
+            result = (uint64_t)l_div + 1u;
+            break;
+        }
+        stack_p[depth] = p;
+        stack_a[depth] = a;
+        stack_l[depth] = l;
+        ++depth;
+        const uint32_t new_a = a - (p % a);
+        p = a;
+        a = new_a;
+        l = l_mod;
+        r = r_mod;
+    }
+
+    while (depth != 0u) {
+        --depth;
+        result = (result * stack_p[depth] + stack_l[depth] - 1u) /
+                     stack_a[depth] +
+                 1u;
+    }
+    return (uint32_t)result;
+}
+
+/* Rows with a FIXED per-row slot decrement: mark every lattice node's row
+   bitmap, skipping whole no-event stretches with one Euclid search each
+   (sparse regime: p > window => at most one mark per row).  a = decrement
+   mod p, 0 < a < p < 2^32; rows are m = k*row_step. */
+__device__ static void gpu_sieve_rows_mark_sparse_lattice(
+    uint64_t *row_bitmaps,
+    uint64_t bitmap_words,
+    uint64_t odd_interval_size,
+    uint64_t p,
+    uint64_t a,
+    uint64_t pos,
+    uint32_t n_rows,
+    uint32_t row_step)
+{
+    const uint32_t p32 = (uint32_t)p;
+    const uint32_t a32 = (uint32_t)a;
+    uint32_t k = 0;
+    uint64_t *wb = row_bitmaps;
+    while (k < n_rows) {
+        if (pos < odd_interval_size) {
+            atomicOr((unsigned long long *)&wb[pos >> 6],
+                     (unsigned long long)(1ULL << (pos & 63U)));
+            pos = (pos >= a) ? pos - a : pos - a + p;
+            k++;
+            wb += (size_t)row_step * bitmap_words;
+            continue;
+        }
+        /* Next event lattice-node: smallest j >= 1 with
+           (j*a mod p) in [pos - odd_interval_size + 1, pos]. */
+        uint32_t j = gpu_sieve_modulo_event_euclid_u32(
+            p32, a32, (uint32_t)(pos - odd_interval_size + 1U),
+            (uint32_t)pos);
+        if (j >= n_rows - k) break;
+        k += j;
+        wb += (size_t)j * (size_t)row_step * bitmap_words;
+        uint64_t ks = ((uint64_t)(j % p32) * a) % p;
+        pos = (pos >= ks) ? pos - ks : pos - ks + p;
+    }
+}
+
+/* Dense rows (>= 1 mark per row) or >32-bit primes: plain row walk with
+   incremental slot decrements.  dec_m[fo] = decrement when LEAVING a row
+   whose current first-odd-offset grid is fo (0/1); row m's grid is
+   fo0 ^ (m & 1). */
+__device__ static void gpu_sieve_rows_mark_dense(
+    uint64_t *row_bitmaps,
+    uint64_t bitmap_words,
+    uint64_t odd_interval_size,
+    uint64_t p,
+    const uint64_t *dec_m,
+    uint64_t fo0,
+    uint64_t pos,
+    uint32_t row_count)
+{
+    uint64_t *wb = row_bitmaps;
+    for (uint32_t m = 0; m < row_count; m++, wb += bitmap_words) {
+        for (uint64_t q = pos; q < odd_interval_size; q += p) {
+            atomicOr((unsigned long long *)&wb[q >> 6],
+                     (unsigned long long)(1ULL << (q & 63U)));
+        }
+        uint64_t d = dec_m[(fo0 ^ (uint64_t)(m & 1U)) & 1U];
+        pos = (pos >= d) ? pos - d : pos - d + p;
+    }
+}
+
+/* Fixed grid: pos0 for even rows, pos1 for odd rows (pos1 == pos0 when the
+   stride is even). */
+__device__ static void gpu_sieve_rows_mark_constant(
+    uint64_t *row_bitmaps,
+    uint64_t bitmap_words,
+    uint64_t odd_interval_size,
+    uint64_t p,
+    uint64_t pos0,
+    uint64_t pos1,
+    int use_alt,
+    uint32_t row_count)
+{
+    uint64_t *wb = row_bitmaps;
+    for (uint32_t m = 0; m < row_count; m++, wb += bitmap_words) {
+        uint64_t pos = (use_alt && (m & 1U)) ? pos1 : pos0;
+        for (uint64_t q = pos; q < odd_interval_size; q += p) {
+            atomicOr((unsigned long long *)&wb[q >> 6],
+                     (unsigned long long)(1ULL << (q & 63U)));
+        }
+    }
+}
+
+/* Mark row_count rows: row m marks bitmap row_bitmaps + m*bitmap_words.
+   residue(row m) = (base_mod_p + m*step_mod_p) mod p.  The per-row first odd
+   offset flips with the row parity ONLY when the row stride P is odd
+   (step_odd = 1); P even keeps the same grid for every row.  Sparse primes
+   (p > window) use a Euclid modulo-event skip across rows instead of walking
+   every row (Horizon mark_composites_combined_euclid).  Marking math matches
+   gpu_sieve_mark_kernel_batch (odd-slot space). */
+__global__ static void gpu_sieve_rows_mark_kernel(
+    uint64_t *row_bitmaps,
+    uint64_t bitmap_words,
+    uint64_t odd_interval_size,
+    uint64_t first_odd_offset,
+    uint32_t step_odd,
+    const uint64_t *primes,
+    const uint64_t *base_mod_p,
+    const uint64_t *step_mod_p,
+    uint64_t prime_count,
+    uint32_t row_count)
+{
+    uint64_t idx = (uint64_t)blockIdx.x * (uint64_t)blockDim.x +
+                   (uint64_t)threadIdx.x;
+    if (idx >= prime_count) return;
+
+    uint64_t p = primes[idx];
+    if (p < 3U) return;
+
+    uint64_t base = base_mod_p[idx];      /* < p */
+    uint64_t step = step_mod_p[idx];      /* < p */
+    const uint64_t inv2 = (p + 1U) >> 1;
+
+    uint64_t rem0 = base + first_odd_offset;
+    if (rem0 >= p) rem0 -= p;
+    uint64_t pos0 = (((p - rem0) % p) * inv2) % p;
+
+    if (!step_odd) {
+        /* P even: one odd grid for all rows; per-row decrement constant:
+           dec = step * inv2 mod p (0 iff p | P). */
+        uint64_t dec = (step >> 1) + ((step & 1U) ? inv2 : 0U);
+        if (dec >= p) dec -= p;
+        if (dec == 0) {
+            /* p | P: every row marks the same slots. */
+            gpu_sieve_rows_mark_constant(row_bitmaps, bitmap_words,
+                                         odd_interval_size, p, pos0, pos0,
+                                         0, row_count);
+            return;
+        }
+        if (p <= odd_interval_size || p >= (1ULL << 32)) {
+            uint64_t dec_m[2] = {dec, dec};
+            gpu_sieve_rows_mark_dense(row_bitmaps, bitmap_words,
+                                      odd_interval_size, p, dec_m, 0,
+                                      pos0, row_count);
+            return;
+        }
+        gpu_sieve_rows_mark_sparse_lattice(row_bitmaps, bitmap_words,
+                                           odd_interval_size, p, dec, pos0,
+                                           row_count, 1);
+        return;
+    }
+
+    /* P odd: fo flips every row.  When p | P (step == 0) the slot value
+       depends only on fo, so rows alternate between pos0 and pos_other.
+       Otherwise the decrement alternates between dec0 = (step+1)*inv2
+       (leaving an fo=0 row) and dec1 = (step-1)*inv2 (leaving an fo=1 row),
+       and two interleaved lattices (even/odd rows) share the PAIR
+       decrement dec0 + dec1 = step mod p. */
+    if (step == 0) {
+        uint64_t pos_other = first_odd_offset
+                                 ? ((pos0 + inv2 >= p) ? pos0 + inv2 - p
+                                                       : pos0 + inv2)
+                                 : ((pos0 >= inv2) ? pos0 - inv2
+                                                   : pos0 - inv2 + p);
+        gpu_sieve_rows_mark_constant(row_bitmaps, bitmap_words,
+                                     odd_interval_size, p, pos0, pos_other,
+                                     1, row_count);
+        return;
+    }
+    uint64_t dec0 = ((step + 1U) >> 1) + (((step + 1U) & 1U) ? inv2 : 0U);
+    if (dec0 >= p) dec0 -= p;
+    uint64_t dec1 = ((step - 1U) >> 1) + (((step - 1U) & 1U) ? inv2 : 0U);
+    if (dec1 >= p) dec1 -= p;
+    uint64_t dec_leave = first_odd_offset ? dec1 : dec0;
+    uint64_t pos1 = (pos0 >= dec_leave) ? pos0 - dec_leave
+                                        : pos0 - dec_leave + p;
+    if (p <= odd_interval_size || p >= (1ULL << 32)) {
+        uint64_t dec_m[2] = {dec0, dec1};
+        gpu_sieve_rows_mark_dense(row_bitmaps, bitmap_words,
+                                  odd_interval_size, p, dec_m,
+                                  first_odd_offset, pos0, row_count);
+        return;
+    }
+    gpu_sieve_rows_mark_sparse_lattice(row_bitmaps, bitmap_words,
+                                       odd_interval_size, p, step, pos0,
+                                       (row_count + 1U) >> 1, 2);
+    if (row_count > 1U) {
+        gpu_sieve_rows_mark_sparse_lattice(row_bitmaps + bitmap_words,
+                                           bitmap_words, odd_interval_size,
+                                           p, step, pos1,
+                                           row_count >> 1, 2);
+    }
 }
 
 /* Pair-batched fused mark: residues + marking in ONE kernel for TWO windows.
@@ -702,6 +996,144 @@ int gpu_sieve_mark_from_base(gpu_sieve_ctx *ctx,
     return 1;
 }
 
+/* Host side of the row-batch fused mark: ONE residues pass for the base
+   AND the row stride P, then mark row_count bitmaps (rows 0..row_count-1 of
+   the row arena).  Amortizes the per-window residue cost over the batch.
+   Returns 1 on success, 0 fail-closed. */
+int gpu_sieve_mark_rows_from_base(gpu_sieve_ctx *ctx,
+                                  uint64_t odd_interval_size,
+                                  uint64_t first_odd_offset,
+                                  const uint64_t *base_limbs,
+                                  const uint64_t *step_limbs,
+                                  int base_limb_count,
+                                  uint32_t row_count,
+                                  const uint64_t *primes,
+                                  const uint64_t *inv_p,
+                                  size_t prime_count)
+{
+    uint64_t start_time = gpu_sieve_clock_us();
+    if (!ctx || !base_limbs || !step_limbs || !primes || !inv_p) return 0;
+    if (odd_interval_size == 0 || prime_count == 0 || row_count == 0) {
+        return 0;
+    }
+    if (first_odd_offset > 1U) return 0;
+    if (base_limb_count < 1 ||
+        (size_t)base_limb_count * 2U > (size_t)ctx->base_limbs_capacity) {
+        return 0;
+    }
+    if (prime_count > ctx->max_primes) return 0;
+
+    size_t required_words = (size_t)((odd_interval_size + 63U) >> 6);
+    if (required_words == 0 || required_words > ctx->max_bitmap_words) {
+        return 0;
+    }
+
+    cudaError_t err = gpu_sieve_ensure_device(ctx->device_id);
+    if (err != cudaSuccess) return 0;
+
+    /* Grow the row bitmap arena (rows × max_bitmap_words). */
+    if (row_count > ctx->row_bitmap_cap) {
+        uint64_t *new_rows = NULL;
+        err = cudaMalloc(&new_rows,
+                         (size_t)row_count * ctx->max_bitmap_words *
+                             sizeof(uint64_t));
+        if (err != cudaSuccess) {
+            fprintf(stderr, "gpu_sieve: row bitmaps alloc: %s\n",
+                    cudaGetErrorString(err));
+            return 0;
+        }
+        if (ctx->d_row_bitmaps) cudaFree(ctx->d_row_bitmaps);
+        ctx->d_row_bitmaps = new_rows;
+        ctx->row_bitmap_cap = row_count;
+    }
+
+    /* The prime table is fixed for the sieve lifetime: upload once. */
+    if (ctx->primes_uploaded_count != prime_count) {
+        err = cudaMemcpyAsync(ctx->d_primes, primes,
+                              prime_count * sizeof(*primes),
+                              cudaMemcpyHostToDevice, ctx->stream);
+        if (err != cudaSuccess) {
+            fprintf(stderr, "gpu_sieve: row H2D primes failed: %s\n",
+                    cudaGetErrorString(err));
+            return 0;
+        }
+        err = cudaMemcpyAsync(ctx->d_inv_p, inv_p,
+                              prime_count * sizeof(*inv_p),
+                              cudaMemcpyHostToDevice, ctx->stream);
+        if (err != cudaSuccess) {
+            fprintf(stderr, "gpu_sieve: row H2D inv_p failed: %s\n",
+                    cudaGetErrorString(err));
+            return 0;
+        }
+        ctx->primes_uploaded_count = prime_count;
+    }
+
+    /* base into d_base_limbs[0..n), step into d_base_limbs[n..2n). */
+    err = cudaMemcpyAsync(ctx->d_base_limbs, base_limbs,
+                          (size_t)base_limb_count * sizeof(uint64_t),
+                          cudaMemcpyHostToDevice, ctx->stream);
+    if (err != cudaSuccess) {
+        fprintf(stderr, "gpu_sieve: row H2D base_limbs failed: %s\n",
+                cudaGetErrorString(err));
+        return 0;
+    }
+    err = cudaMemcpyAsync(ctx->d_base_limbs + base_limb_count, step_limbs,
+                          (size_t)base_limb_count * sizeof(uint64_t),
+                          cudaMemcpyHostToDevice, ctx->stream);
+    if (err != cudaSuccess) {
+        fprintf(stderr, "gpu_sieve: row H2D step_limbs failed: %s\n",
+                cudaGetErrorString(err));
+        return 0;
+    }
+
+    err = cudaMemsetAsync(ctx->d_row_bitmaps, 0,
+                          (size_t)row_count * ctx->max_bitmap_words *
+                              sizeof(uint64_t),
+                          ctx->stream);
+    if (err != cudaSuccess) {
+        fprintf(stderr, "gpu_sieve: row bitmap memset failed: %s\n",
+                cudaGetErrorString(err));
+        return 0;
+    }
+
+    const int tpb = 128;
+    uint64_t prime_count_u64 = (uint64_t)prime_count;
+    uint64_t blocks = (prime_count_u64 + tpb - 1U) / tpb;
+    if (blocks > (uint64_t)UINT_MAX) return 0;
+
+    gpu_sieve_rows_residues_kernel<<<(unsigned int)blocks, tpb, 0,
+                                     ctx->stream>>>(
+        ctx->d_base_limbs, ctx->d_base_limbs + base_limb_count,
+        base_limb_count, ctx->d_primes, ctx->d_inv_p, ctx->d_base_mod_p,
+        ctx->d_step_mod_p, prime_count_u64);
+
+    /* Arena stride: rows are laid out at max_bitmap_words intervals (the
+       extractor reads row r at row_bitmaps + r*max_bitmap_words). */
+    uint32_t step_odd = (uint32_t)(step_limbs[0] & 1ULL);
+    gpu_sieve_rows_mark_kernel<<<(unsigned int)blocks, tpb, 0, ctx->stream>>>(
+        ctx->d_row_bitmaps, (uint64_t)ctx->max_bitmap_words, odd_interval_size,
+        first_odd_offset, step_odd, ctx->d_primes, ctx->d_base_mod_p,
+        ctx->d_step_mod_p, prime_count_u64, row_count);
+
+    err = cudaGetLastError();
+    if (err != cudaSuccess) {
+        fprintf(stderr, "gpu_sieve: row mark kernel launch failed: %s\n",
+                cudaGetErrorString(err));
+        return 0;
+    }
+
+    err = cudaStreamSynchronize(ctx->stream);
+    if (err != cudaSuccess) {
+        fprintf(stderr, "gpu_sieve: row mark stream sync failed: %s\n",
+                cudaGetErrorString(err));
+        return 0;
+    }
+
+    uint64_t end_time = gpu_sieve_clock_us();
+    ctx->last_elapsed_us = end_time >= start_time ? end_time - start_time : 0;
+    return 1;
+}
+
 const char *gpu_sieve_device_name(const gpu_sieve_ctx *ctx) {
     return ctx ? ctx->dev_name : "";
 }
@@ -865,7 +1297,7 @@ static int gpu_sieve_extract_pack_impl(gpu_sieve_ctx *ctx,
                                        uint64_t first_odd_offset,
                                        uint64_t lo_odd,
                                        uint64_t hi_odd,
-                                       int bitmap_buf,
+                                       const uint64_t *bitmap,
                                        int cand_buf,
                                        const uint64_t *base_limbs,
                                        int active_limbs,
@@ -877,7 +1309,9 @@ static int gpu_sieve_extract_pack_impl(gpu_sieve_ctx *ctx,
                                        uint64_t region_start,
                                        uint32_t slot_base)
 {
-    if (!ctx || !base_limbs || !host_offsets || !host_count) return 0;
+    if (!ctx || !bitmap || !base_limbs || !host_offsets || !host_count) {
+        return 0;
+    }
     if (odd_interval_size == 0 || active_limbs < 1) return 0;
     if (first_odd_offset > 1U) return 0;
     if (active_limbs > ctx->base_limbs_capacity) return 0;
@@ -952,7 +1386,7 @@ static int gpu_sieve_extract_pack_impl(gpu_sieve_ctx *ctx,
     /* Single-block ordered compaction: one thread per bitmap word. */
     uint32_t half_filter = (class_mask60 != UINT64_MAX) ? 1U : 0U;
     gpu_sieve_extract_pack_kernel<<<1, 1024, 0, ctx->stream>>>(
-        ctx->d_bitmap[bitmap_buf & 1], (uint64_t)words, odd_interval_size,
+        bitmap, (uint64_t)words, odd_interval_size,
         first_odd_offset, ctx->d_base_limbs, active_limbs,
         ctx->d_cands_aos[cand_buf & 1], ctx->d_offsets, ctx->d_count,
         (uint32_t)(hi_odd - lo_odd + slot_base), lo_odd, hi_odd, half_filter,
@@ -1020,7 +1454,8 @@ int gpu_sieve_extract_pack(gpu_sieve_ctx *ctx,
                            uint64_t region_start)
 {
     return gpu_sieve_extract_pack_impl(ctx, odd_interval_size, first_odd_offset,
-                                       0, odd_interval_size, 0, 0, base_limbs,
+                                       0, odd_interval_size,
+                                       ctx->d_bitmap[0], 0, base_limbs,
                                        active_limbs, host_cands_aos,
                                        host_offsets, host_count,
                                        base_mod60, class_mask60,
@@ -1046,7 +1481,8 @@ int gpu_sieve_extract_pack_device(gpu_sieve_ctx *ctx,
     if (!d_cands_out) return 0;
     *d_cands_out = NULL;
     if (!gpu_sieve_extract_pack_impl(ctx, odd_interval_size, first_odd_offset,
-                                     0, odd_interval_size, 0, 0, base_limbs,
+                                     0, odd_interval_size,
+                                     ctx->d_bitmap[0], 0, base_limbs,
                                      active_limbs, NULL, host_offsets,
                                      host_count, base_mod60, class_mask60,
                                      region_start, 0)) {
@@ -1077,7 +1513,8 @@ int gpu_sieve_extract_pack_device_range(gpu_sieve_ctx *ctx,
     if (!d_cands_out) return 0;
     *d_cands_out = NULL;
     if (!gpu_sieve_extract_pack_impl(ctx, odd_interval_size, first_odd_offset,
-                                     lo_odd, hi_odd, cand_buf, cand_buf,
+                                     lo_odd, hi_odd,
+                                     ctx->d_bitmap[0], cand_buf,
                                      base_limbs,
                                      active_limbs, NULL, host_offsets,
                                      host_count, base_mod60, class_mask60,
@@ -1111,7 +1548,8 @@ int gpu_sieve_extract_pack_device_range_ex(gpu_sieve_ctx *ctx,
     if (!d_cands_out) return 0;
     *d_cands_out = NULL;
     if (!gpu_sieve_extract_pack_impl(ctx, odd_interval_size, first_odd_offset,
-                                     lo_odd, hi_odd, bitmap_buf, cand_buf,
+                                     lo_odd, hi_odd,
+                                     ctx->d_bitmap[bitmap_buf & 1], cand_buf,
                                      base_limbs,
                                      active_limbs, NULL, host_offsets,
                                      host_count, base_mod60, class_mask60,
@@ -1121,6 +1559,50 @@ int gpu_sieve_extract_pack_device_range_ex(gpu_sieve_ctx *ctx,
     *d_cands_out = ctx->d_cands_aos[cand_buf & 1] +
                    (size_t)slot_base * (size_t)active_limbs;
     return 1;
+}
+
+/* Row-bitmap accumulation variant: like gpu_sieve_extract_pack_device_range_ex
+   but reads an explicit device bitmap (a row of the row arena) instead of a
+   ping-pong bitmap.  Used by the CRT row-walk fused path. */
+int gpu_sieve_extract_pack_device_range_bitmap(
+    gpu_sieve_ctx *ctx,
+    const uint64_t *bitmap,
+    uint64_t odd_interval_size,
+    uint64_t first_odd_offset,
+    uint64_t lo_odd,
+    uint64_t hi_odd,
+    int cand_buf,
+    const uint64_t *base_limbs,
+    int active_limbs,
+    uint64_t **d_cands_out,
+    uint64_t *host_offsets,
+    unsigned int *host_count,
+    uint32_t base_mod60,
+    uint64_t class_mask60,
+    uint64_t region_start,
+    uint32_t slot_base)
+{
+    if (!d_cands_out || !bitmap) return 0;
+    *d_cands_out = NULL;
+    if (!gpu_sieve_extract_pack_impl(ctx, odd_interval_size, first_odd_offset,
+                                     lo_odd, hi_odd, bitmap, cand_buf,
+                                     base_limbs,
+                                     active_limbs, NULL, host_offsets,
+                                     host_count, base_mod60, class_mask60,
+                                     region_start, slot_base)) {
+        return 0;
+    }
+    *d_cands_out = ctx->d_cands_aos[cand_buf & 1] +
+                   (size_t)slot_base * (size_t)active_limbs;
+    return 1;
+}
+
+/* Device pointer of row r in the row bitmap arena (NULL when unavailable). */
+uint64_t *gpu_sieve_row_bitmap(gpu_sieve_ctx *ctx, uint32_t row) {
+    if (!ctx || !ctx->d_row_bitmaps || row >= ctx->row_bitmap_cap) {
+        return NULL;
+    }
+    return ctx->d_row_bitmaps + (size_t)row * ctx->max_bitmap_words;
 }
 
 /* Size the extract candidate buffers for K-window MR batch accumulation.
@@ -1155,6 +1637,8 @@ void gpu_sieve_destroy(gpu_sieve_ctx *ctx) {
     if (ctx->d_cands_aos[1]) cudaFree(ctx->d_cands_aos[1]);
     if (ctx->d_offsets) cudaFree(ctx->d_offsets);
     if (ctx->d_count) cudaFree(ctx->d_count);
+    if (ctx->d_row_bitmaps) cudaFree(ctx->d_row_bitmaps);
+    if (ctx->d_step_mod_p) cudaFree(ctx->d_step_mod_p);
     if (ctx->stream) cudaStreamDestroy(ctx->stream);
 
     free(ctx);

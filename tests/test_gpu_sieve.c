@@ -257,11 +257,125 @@ fail:
     return 0;
 }
 
+/* Row-batch parity: gpu_sieve_mark_rows_from_base marks rows
+   base + m*step for m in [0, row_count); compare each row's survivors
+   against the CPU reference for that row's own base.  Exercises the
+   iterated-residue mark kernel AND the row-arena stride of the extractor. */
+static int run_one_row_batch(gpu_sieve_ctx *ctx, const mpz_t base,
+                             const mpz_t step, int limbs,
+                             uint64_t interval_size, uint32_t row_count,
+                             const uint64_t *primes, size_t prime_count,
+                             const uint64_t *inv_p, const char *label) {
+    uint64_t first_odd_offset = mpz_tstbit(base, 0) ? 0U : 1U;
+    uint64_t odd_count = (interval_size - first_odd_offset + 1U) >> 1;
+    uint64_t bitmap_words = (odd_count + 63U) >> 6;
+
+    uint64_t base_limbs[32];
+    uint64_t step_limbs[32];
+    mpz_to_limbs(base, base_limbs, 32);
+    mpz_to_limbs(step, step_limbs, 32);
+
+    uint64_t *base_mod_p = (uint64_t *)malloc(prime_count * sizeof(uint64_t));
+    uint64_t *cpu_bitmap =
+        (uint64_t *)calloc(bitmap_words ? bitmap_words : 1, sizeof(uint64_t));
+    uint64_t *cpu_offsets = (uint64_t *)malloc(odd_count * sizeof(uint64_t));
+    uint64_t *gpu_offsets = (uint64_t *)malloc(odd_count * sizeof(uint64_t));
+    if (!base_mod_p || !cpu_bitmap || !cpu_offsets || !gpu_offsets) {
+        fprintf(stderr, "  FAIL: out of memory (%s, rows)\n", label);
+        free(base_mod_p); free(cpu_bitmap);
+        free(cpu_offsets); free(gpu_offsets);
+        return 0;
+    }
+
+    int ok = gpu_sieve_mark_rows_from_base(ctx, odd_count, first_odd_offset,
+                                           base_limbs, step_limbs, limbs,
+                                           row_count, primes, inv_p,
+                                           prime_count);
+    if (!ok) {
+        fprintf(stderr, "  FAIL: gpu_sieve_mark_rows_from_base returned 0 (%s)\n",
+                label);
+        free(base_mod_p); free(cpu_bitmap);
+        free(cpu_offsets); free(gpu_offsets);
+        return 0;
+    }
+
+    mpz_t base_m;
+    mpz_init(base_m);
+    int pass = 1;
+    for (uint32_t m = 0; m < row_count && pass; m++) {
+        mpz_set(base_m, base);
+        if (m) mpz_addmul_ui(base_m, step, m);
+        uint64_t fo_m = mpz_tstbit(base_m, 0) ? 0U : 1U;
+        uint64_t odd_count_m = (interval_size - fo_m + 1U) >> 1;
+        uint64_t words_m = (odd_count_m + 63U) >> 6;
+
+        for (size_t i = 0; i < prime_count; i++) {
+            base_mod_p[i] = mpz_fdiv_ui(base_m, primes[i]);
+        }
+        memset(cpu_bitmap, 0,
+               (size_t)bitmap_words * sizeof(*cpu_bitmap));
+        cpu_mark_odd(primes, prime_count, base_mod_p, odd_count_m, fo_m,
+                     cpu_bitmap);
+        size_t cpu_count = cpu_extract(cpu_bitmap, words_m, odd_count_m, fo_m,
+                                       cpu_offsets);
+
+        uint64_t base_limbs_m[32];
+        mpz_to_limbs(base_m, base_limbs_m, 32);
+
+        unsigned int gpu_count = 0;
+        uint64_t *d_cands = NULL;
+        uint64_t *row_bmp = gpu_sieve_row_bitmap(ctx, m);
+        if (!row_bmp) {
+            fprintf(stderr, "  FAIL: row bitmap %u unavailable (%s)\n", m,
+                    label);
+            pass = 0;
+            break;
+        }
+        ok = gpu_sieve_extract_pack_device_range_bitmap(
+            ctx, row_bmp, odd_count_m, fo_m, 0, odd_count_m, 0,
+            base_limbs_m, limbs, &d_cands, gpu_offsets, &gpu_count, 0,
+            UINT64_MAX, 0, 0);
+        if (!ok) {
+            fprintf(stderr,
+                    "  FAIL: row %u extract_pack_device_range_bitmap (%s)\n",
+                    m, label);
+            pass = 0;
+            break;
+        }
+        if (gpu_count != (unsigned int)cpu_count) {
+            fprintf(stderr,
+                    "  FAIL: row %u survivor count mismatch (%s): gpu=%u cpu=%zu\n",
+                    m, label, gpu_count, cpu_count);
+            pass = 0;
+            break;
+        }
+        qsort(cpu_offsets, cpu_count, sizeof(uint64_t), cmp_u64);
+        qsort(gpu_offsets, gpu_count, sizeof(uint64_t), cmp_u64);
+        if (memcmp(cpu_offsets, gpu_offsets,
+                   cpu_count * sizeof(uint64_t)) != 0) {
+            fprintf(stderr,
+                    "  FAIL: row %u survivor offset mismatch (%s)\n", m,
+                    label);
+            pass = 0;
+            break;
+        }
+    }
+
+    if (pass) {
+        printf("  OK  %s: %u rows, survivors match per row\n", label,
+               row_count);
+    }
+    mpz_clear(base_m);
+    free(base_mod_p); free(cpu_bitmap);
+    free(cpu_offsets); free(gpu_offsets);
+    return pass;
+}
+
 static int run_gpu_sieve_parity_test(void) {
     printf("[TEST] GPU sieve extract+pack parity vs CPU reference...\n");
 
     int device_id = 0;
-    gpu_sieve_ctx *ctx = gpu_sieve_init(device_id, 4096, 1U << 16);
+    gpu_sieve_ctx *ctx = gpu_sieve_init(device_id, 12000, 1U << 16);
     if (!ctx) {
         fprintf(stderr, "  SKIP: no CUDA device available or init failed\n");
         return 1;
@@ -322,6 +436,112 @@ static int run_gpu_sieve_parity_test(void) {
             }
         }
         if (!pass) break;
+    }
+
+    /* Row-batch mark parity (CRT row-walk): rows base + m*step with an odd
+       step (the row stride P), per-row survivors must match the CPU ref. */
+    {
+        mpz_t step;
+        mpz_init(step);
+        for (int parity = 0; parity < 2 && pass; parity++) {
+            /* Random odd step ~ 2^(64*limbs - 40): rows far apart, parity flips. */
+            mpz_urandomb(step, rng, 64UL * 6UL - 40UL);
+            mpz_setbit(step, 0);
+            mpz_urandomb(base, rng, 64UL * 6UL - 32UL);
+            if (parity) mpz_setbit(base, 0); else mpz_clrbit(base, 0);
+            snprintf(label, sizeof(label), "rows parity=%s",
+                     parity ? "odd" : "even");
+            if (!run_one_row_batch(ctx, base, step, 6, 16384U, 4,
+                                   primes, prime_count, inv_p, label)) {
+                pass = 0;
+            }
+        }
+        mpz_clear(step);
+    }
+
+    /* Production-like geometry: 20-limb base (CRT window ~2^762), step like
+       the real row stride P (~506 bits), full rows walk of 4.  Both step
+       parities are covered: some CRT covers have an EVEN primorial P (a
+       cover prime divides 2), which keeps ONE odd grid for all rows. */
+    {
+        mpz_t step;
+        mpz_init(step);
+        for (int step_parity = 0; step_parity < 2 && pass; step_parity++) {
+            for (int parity = 0; parity < 2 && pass; parity++) {
+                mpz_urandomb(step, rng, 506UL);
+                if (step_parity) mpz_setbit(step, 0);
+                else mpz_clrbit(step, 0);
+                mpz_urandomb(base, rng, 64UL * 20UL - 32UL);
+                if (parity) mpz_setbit(base, 0); else mpz_clrbit(base, 0);
+                snprintf(label, sizeof(label),
+                         "prod-rows parity=%s step=%s",
+                         parity ? "odd" : "even",
+                         step_parity ? "odd" : "even");
+                if (!run_one_row_batch(ctx, base, step, 20, 32768U, 4,
+                                       primes, prime_count, inv_p, label)) {
+                    pass = 0;
+                }
+            }
+        }
+        mpz_clear(step);
+    }
+
+    /* Euclid skip regime: sparse-heavy prime table (up to 100k) against a
+       16k window — ~5/6 of primes have at most one mark per row, so the
+       modulo-event skip must match the CPU reference.  Covers both stride
+       parities and strides divisible by small cover primes (p | P => fixed
+       grid rows, step=0 branch). */
+    {
+        const uint64_t prime_limit2 = 100000U;
+        const size_t prime_cap2 = 12000;
+        uint64_t *primes2 = (uint64_t *)malloc(prime_cap2 * sizeof(uint64_t));
+        uint64_t *inv_p2 = (uint64_t *)malloc(prime_cap2 * sizeof(uint64_t));
+        if (!primes2 || !inv_p2) {
+            fprintf(stderr, "  FAIL: out of memory (euclid table)\n");
+            free(primes2); free(inv_p2);
+            pass = 0;
+        } else {
+            size_t prime_count2 = gen_primes(prime_limit2, primes2, prime_cap2);
+            for (size_t i = 0; i < prime_count2; i++) {
+                inv_p2[i] = (primes2[i] >= 3U) ? (UINT64_MAX / primes2[i]) : 0U;
+            }
+            mpz_t step;
+            mpz_init(step);
+            for (int step_parity = 0; step_parity < 2 && pass; step_parity++) {
+                mpz_urandomb(step, rng, 506UL);
+                if (step_parity) mpz_setbit(step, 0);
+                else mpz_clrbit(step, 0);
+                mpz_urandomb(base, rng, 64UL * 20UL - 32UL);
+                if (step_parity) mpz_setbit(base, 0); else mpz_clrbit(base, 0);
+                snprintf(label, sizeof(label),
+                         "euclid-rows step=%s window=16384 rows=16",
+                         step_parity ? "odd" : "even");
+                if (!run_one_row_batch(ctx, base, step, 20, 16384U, 16,
+                                       primes2, prime_count2, inv_p2, label)) {
+                    pass = 0;
+                }
+            }
+            /* Fixed-grid cases: stride divisible by small cover primes. */
+            mpz_set_ui(step, 30030U);   /* even: 2*3*5*7*11*13 */
+            mpz_urandomb(base, rng, 64UL * 20UL - 32UL);
+            mpz_clrbit(base, 0);
+            if (!run_one_row_batch(ctx, base, step, 20, 16384U, 16,
+                                   primes2, prime_count2, inv_p2,
+                                   "euclid-rows step=30030 even")) {
+                pass = 0;
+            }
+            mpz_set_ui(step, 255255U);  /* odd: 3*5*7*11*13*17 */
+            mpz_urandomb(base, rng, 64UL * 20UL - 32UL);
+            mpz_setbit(base, 0);
+            if (!run_one_row_batch(ctx, base, step, 20, 16384U, 16,
+                                   primes2, prime_count2, inv_p2,
+                                   "euclid-rows step=255255 odd")) {
+                pass = 0;
+            }
+            mpz_clear(step);
+            free(primes2);
+            free(inv_p2);
+        }
     }
 
     mpz_clear(base);

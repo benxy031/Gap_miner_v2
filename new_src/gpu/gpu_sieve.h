@@ -77,6 +77,25 @@ int gpu_sieve_mark_batch_from_bases(gpu_sieve_ctx *ctx,
                                     const uint64_t *inv_p,
                                     size_t prime_count);
 
+/* Row-batch fused mark (CRT row-walk): computes base mod p AND step mod p
+   (step_limbs = P, the row stride) in ONE residue sweep, then marks
+   row_count bitmaps in the row arena (rows 0..row_count-1).  Row m covers
+   base + m*P; the per-row first odd offset flips with the row parity only
+   when P is odd (P even keeps one grid for all rows).  Amortizes the
+   per-window residue cost over the batch.
+   base_limbs/step_limbs: little-endian limbs, base_limb_count each.
+   Returns 1 on success, 0 on any CUDA or validation error (fail-closed). */
+int gpu_sieve_mark_rows_from_base(gpu_sieve_ctx *ctx,
+                                  uint64_t odd_interval_size,
+                                  uint64_t first_odd_offset,
+                                  const uint64_t *base_limbs,
+                                  const uint64_t *step_limbs,
+                                  int base_limb_count,
+                                  uint32_t row_count,
+                                  const uint64_t *primes,
+                                  const uint64_t *inv_p,
+                                  size_t prime_count);
+
 /* HALF_CLASS extraction filter: offsets with value (base + offset) mod 60
    whose bit is set in class_mask60 are extracted.  Offsets BELOW
    region_start are never filtered (the CRT back-lookahead must be scanned
@@ -161,6 +180,30 @@ int gpu_sieve_extract_pack_device_range_ex(gpu_sieve_ctx *ctx,
                                            uint64_t class_mask60,
                                            uint64_t region_start,
                                            uint32_t slot_base);
+
+/* Row-bitmap accumulation variant: identical to the _ex accumulation
+   extractor but reads an explicit device bitmap (a row of the row arena
+   written by gpu_sieve_mark_rows_from_base) instead of a ping-pong bitmap. */
+int gpu_sieve_extract_pack_device_range_bitmap(
+    gpu_sieve_ctx *ctx,
+    const uint64_t *bitmap,
+    uint64_t odd_interval_size,
+    uint64_t first_odd_offset,
+    uint64_t lo_odd,
+    uint64_t hi_odd,
+    int cand_buf,
+    const uint64_t *base_limbs,
+    int active_limbs,
+    uint64_t **d_cands_out,
+    uint64_t *host_offsets,
+    unsigned int *host_count,
+    uint32_t base_mod60,
+    uint64_t class_mask60,
+    uint64_t region_start,
+    uint32_t slot_base);
+
+/* Device pointer of row r in the row bitmap arena (NULL when unavailable). */
+uint64_t *gpu_sieve_row_bitmap(gpu_sieve_ctx *ctx, uint32_t row);
 
 /* Size the extract candidate buffers for K-window MR batch accumulation. */
 void gpu_sieve_set_extract_accum(gpu_sieve_ctx *ctx, uint32_t k);

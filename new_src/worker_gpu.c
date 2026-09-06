@@ -17,6 +17,7 @@
 #include "worker_gpu.h"
 #include "sieve_core.h"
 #include "gap_detection.h"
+#include "gap_dist.h"
 #include "halfclass.h"
 #include "primality_euler.h"
 #include "primality_bpsw.h"
@@ -1539,6 +1540,16 @@ static int crt_gpu_batch_test(struct gpu_adapter *gpu, int limbs,
    gpu_fermat_submit_device call. */
 #define FUSED_MR_BATCH_MAX 8
 
+/* MINING_JUMP2 -- no-test chain (Horizon M19-style certificates) on the
+   fused mining path: per-window backward-search chain driven host-side in
+   chunked MR rounds shared across the flight's windows (~1.5 MR tests per
+   confirmed prime instead of every survivor).  Requires --threads 1 (the
+   gather staging buffers are per-ctx) and the full-class fused path.
+   Fail-closed: any chain error falls back to a full scan of the same
+   flight, and any further error disables the fused path. */
+#define MINING_JUMP2_BATCH_MAX 128
+#define MINING_JUMP2_CHUNK_DEFAULT 64
+
 struct fused_flight_window {
     uint32_t nonce;
     uint32_t count;             /* head candidates MR-tested in the batch */
@@ -1568,7 +1579,7 @@ struct fused_flight {
     uint32_t total_count;       /* sum of head counts = MR batch size */
     int row_mode;               /* row-batch mark active for this flight */
     uint64_t step_limbs[GPU_NLIMBS];  /* row stride P (tail re-mark needs it) */
-    struct fused_flight_window wins[FUSED_MR_BATCH_MAX];
+    struct fused_flight_window wins[MINING_JUMP2_BATCH_MAX];
 };
 
 /* Forward declaration: defined after this WITH_CUDA section (it is
@@ -1889,6 +1900,423 @@ static int crt_fused_collect_batch(struct gpu_sieve_ctx *gpu_sieve,
     free(win_off);
     free(win_ip);
     return 1;
+}
+
+/* ── MINING_JUMP2: no-test chain (Horizon M19-style certificates) ─────────
+   Host-orchestrated per-window backward-search chain, one chunked MR round
+   shared across all flight windows (same semantics as GAP_HUNT_JUMP2).
+   Confirmed anchors are written into is_prime (sparse view); crt_scan_gaps
+   then sees exactly the consecutive probable-prime pairs a full scan would
+   find.  Soundness: a real prime always passes the MR, so it can never hide
+   in an untested interior; and any gap inside a certified interval is
+   shorter than thr = ceil(merit_threshold * ln(window_base)), so it can
+   never pass the merit gate.  Returns 1 on success, 0 on any CUDA error
+   (the caller falls back to a full scan of the same flight). */
+enum { MJ2_FIND_FIRST = 0, MJ2_JUMP_BACK = 1, MJ2_FIND_END = 2, MJ2_DONE = 3 };
+
+struct mining_chain_state {
+    uint32_t lo[MINING_JUMP2_BATCH_MAX];
+    uint32_t hi[MINING_JUMP2_BATCH_MAX];
+    uint32_t dcum[MINING_JUMP2_BATCH_MAX];
+    uint32_t pidx[MINING_JUMP2_BATCH_MAX];
+    uint32_t qidx[MINING_JUMP2_BATCH_MAX];
+    uint32_t clo[MINING_JUMP2_BATCH_MAX];
+    uint32_t chi[MINING_JUMP2_BATCH_MAX];
+    uint8_t  phase[MINING_JUMP2_BATCH_MAX];
+    uint64_t thr[MINING_JUMP2_BATCH_MAX];
+    uint32_t cum[MINING_JUMP2_BATCH_MAX + 1];
+    uint32_t wtests[MINING_JUMP2_BATCH_MAX];
+    uint32_t anchors[MINING_JUMP2_BATCH_MAX];
+    uint8_t *flags;             /* per-round MR collect results */
+    size_t flags_cap;
+};
+
+/* ln(n) via mantissa + exponent: mpz_get_d overflows (>2^1024) to +inf,
+   which silently zeroes merit math at high shifts. */
+static double worker_log_mpz(const mpz_t n) {
+    if (mpz_sgn(n) <= 0)
+        return 0.0;
+    signed long int e = 0;
+    double m = mpz_get_d_2exp(&e, n);
+    return log(m) + (double)e * 0.69314718055994530942;
+}
+
+/* First index > p whose offset gap from p reaches thr (offsets ascending). */
+static uint32_t mj2_find_q(const uint64_t *offs, uint32_t count, uint32_t p,
+                           uint64_t thr) {
+    uint32_t lo = p + 1, hi = count;
+    uint64_t target = offs[p] + thr;
+    while (lo < hi) {
+        uint32_t mid = lo + (hi - lo) / 2;
+        if (offs[mid] >= target)
+            hi = mid;
+        else
+            lo = mid + 1;
+    }
+    return lo < count ? lo : UINT32_MAX;
+}
+
+/* Full-scan of an already-extracted flight (ground truth and the fallback
+   when the chain fails): one MR submit over all candidates, then the
+   regular per-window stats + gap scan.  Returns 1 on success. */
+static int crt_fused_fullscan_flight(struct gpu_sieve_ctx *gpu_sieve,
+                                     struct gpu_fermat_ctx *fermat,
+                                     uint32_t worker_id,
+                                     const struct crt_runtime *rt,
+                                     struct fused_flight *fl,
+                                     uint64_t *offsets,
+                                     uint8_t *is_prime,
+                                     mpz_t p1, mpz_t p2, mpz_t nadd_full)
+{
+    uint32_t total = fl->total_count;
+    if (total == 0)
+        return 1;
+    uint64_t *d_batch = gpu_sieve_candidate_buffer(gpu_sieve, fl->buf);
+    if (!d_batch)
+        return 0;
+    if (gpu_fermat_submit_device(fermat, fl->slot, d_batch, total) < 0)
+        return 0;
+    if (gpu_fermat_collect(fermat, fl->slot, is_prime, total) < 0)
+        return 0;
+
+    uint32_t cum = 0;
+    uint64_t owned_limit = fl->back_limit + fl->needed_gap;
+    for (int i = 0; i < fl->n_windows; i++) {
+        uint32_t cnt = fl->wins[i].count;
+        uint32_t passes = 0;
+        for (uint32_t j = 0; j < cnt; j++)
+            passes += is_prime[cum + j];
+        atomic_fetch_add(&g_worker_stats[worker_id].candidates_generated,
+                         cnt);
+        atomic_fetch_add(&g_worker_stats[worker_id].candidates_tested, cnt);
+        atomic_fetch_add(&g_worker_stats[worker_id].euler_passes, passes);
+        crt_scan_gaps(worker_id, fl->height, fl->wins[i].nonce,
+                      fl->generation, fl->merit_threshold, rt,
+                      fl->wins[i].window_base, fl->wins[i].nadd0,
+                      fl->back_limit, p1, p2, nadd_full,
+                      is_prime + cum, offsets + cum, cnt, owned_limit,
+                      fl->half_class, fermat, fl->slot);
+        cum += cnt;
+    }
+    atomic_store(&g_worker_stats[worker_id].gpu_accounted_us,
+                 gpu_fermat_accounted_us(fermat));
+    return 1;
+}
+
+/* No-test chain over a completed flight.  See the block comment above. */
+static int crt_fused_chain_flight(struct gpu_sieve_ctx *gpu_sieve,
+                                  struct gpu_fermat_ctx *fermat,
+                                  uint32_t worker_id,
+                                  const struct crt_runtime *rt,
+                                  struct fused_flight *fl,
+                                  uint64_t *offsets,
+                                  uint8_t *is_prime,
+                                  struct mining_chain_state *cs,
+                                  int chunk,
+                                  mpz_t p1, mpz_t p2, mpz_t nadd_full)
+{
+    const uint32_t K = (uint32_t)fl->n_windows;
+    const uint32_t C = (uint32_t)chunk;
+    const uint32_t total = fl->total_count;
+    if (K == 0)
+        return 1;
+    if (K > MINING_JUMP2_BATCH_MAX)
+        return 0;
+    if ((size_t)total > cs->flags_cap)
+        return 0;
+
+    uint32_t cum = 0;
+    for (uint32_t i = 0; i < K; i++) {
+        cs->cum[i] = cum;
+        cum += fl->wins[i].count;
+        cs->wtests[i] = 0;
+        cs->anchors[i] = 0;
+        cs->pidx[i] = UINT32_MAX;
+        cs->qidx[i] = UINT32_MAX;
+        cs->phase[i] = MJ2_FIND_FIRST;
+        cs->clo[i] = 0;
+        cs->chi[i] = fl->wins[i].count < C ? fl->wins[i].count : C;
+        double t = fl->merit_threshold *
+                   worker_log_mpz(fl->wins[i].window_base);
+        cs->thr[i] = (uint64_t)ceil(t);
+        if (cs->thr[i] < 1)
+            cs->thr[i] = 1;
+    }
+    cs->cum[K] = cum;
+    if (cum != total)
+        return 0;               /* bookkeeping invariant */
+    memset(is_prime, 0, (size_t)total);
+
+    if (getenv("MJ2_DEBUG")) {
+        fprintf(stderr,
+                "[MJ2DBG] flight K=%u total=%u merit=%.4f thr0=%llu cnt0=%u\n",
+                K, total, fl->merit_threshold,
+                (unsigned long long)cs->thr[0],
+                K > 0 ? fl->wins[0].count : 0);
+    }
+
+    uint64_t *d_batch = gpu_sieve_candidate_buffer(gpu_sieve, fl->buf);
+    if (!d_batch)
+        return 0;
+
+    uint32_t rounds = 0;
+    uint32_t max_rounds = 2 * total + 4 * K + 16;
+    int any_active = 1;
+    while (any_active && rounds < max_rounds) {
+        uint32_t rtotal = 0;
+        for (uint32_t i = 0; i < K; i++) {
+            int on = (cs->phase[i] != MJ2_DONE && cs->chi[i] > cs->clo[i]);
+            cs->lo[i] = on ? cs->clo[i] : 0;
+            cs->hi[i] = on ? cs->chi[i] : 0;
+            cs->dcum[i] = rtotal;
+            if (on)
+                rtotal += cs->chi[i] - cs->clo[i];
+        }
+        if (rtotal > 0) {
+            uint32_t gathered = 0;
+            if (gpu_fermat_gather_run(fermat, d_batch, cs->cum, cs->lo,
+                                      cs->hi, cs->dcum, K, fl->limbs,
+                                      &gathered) != 0 ||
+                gathered != rtotal)
+                return 0;
+            if (gpu_fermat_submit_device(
+                    fermat, fl->slot, gpu_fermat_gather_buffer(fermat),
+                    (size_t)rtotal) < 0 ||
+                gpu_fermat_collect(fermat, fl->slot, cs->flags,
+                                   (size_t)rtotal) < 0)
+                return 0;
+        }
+        rounds++;
+        any_active = 0;
+        for (uint32_t i = 0; i < K; i++) {
+            if (cs->phase[i] == MJ2_DONE)
+                continue;
+            uint32_t n = (cs->chi[i] > cs->clo[i])
+                             ? cs->chi[i] - cs->clo[i]
+                             : 0;
+            const uint8_t *fla = cs->flags + cs->dcum[i];
+            uint32_t base = cs->clo[i];
+            const uint64_t *off_i = offsets + cs->cum[i];
+            uint32_t cnt_i = fl->wins[i].count;
+            cs->wtests[i] += n;
+
+            if (cs->phase[i] == MJ2_FIND_FIRST) {
+                uint32_t found = UINT32_MAX;
+                for (uint32_t j = 0; j < n; j++)
+                    if (fla[j]) { found = base + j; break; }
+                if (found != UINT32_MAX) {
+                    is_prime[cs->cum[i] + found] = 1;
+                    cs->anchors[i]++;
+                    cs->pidx[i] = found;
+                    cs->qidx[i] = mj2_find_q(off_i, cnt_i, found,
+                                             cs->thr[i]);
+                    if (cs->qidx[i] == UINT32_MAX) {
+                        cs->phase[i] = MJ2_DONE;
+                    } else {
+                        cs->phase[i] = MJ2_JUMP_BACK;
+                        uint32_t cl = cs->qidx[i] > C ? cs->qidx[i] - C : 0;
+                        cs->clo[i] = (cl > found + 1) ? cl : found + 1;
+                        cs->chi[i] = cs->qidx[i];
+                    }
+                } else {
+                    cs->clo[i] = cs->chi[i];
+                    cs->chi[i] = (cs->chi[i] + C < cnt_i)
+                                     ? cs->chi[i] + C : cnt_i;
+                    if (cs->clo[i] >= cnt_i)
+                        cs->phase[i] = MJ2_DONE;
+                }
+            } else if (cs->phase[i] == MJ2_JUMP_BACK) {
+                uint32_t found = UINT32_MAX;
+                for (int32_t j = (int32_t)n - 1; j >= 0; j--)
+                    if (fla[j]) { found = base + (uint32_t)j; break; }
+                if (found != UINT32_MAX) {
+                    is_prime[cs->cum[i] + found] = 1;
+                    cs->anchors[i]++;
+                    cs->pidx[i] = found;
+                    cs->qidx[i] = mj2_find_q(off_i, cnt_i, found,
+                                             cs->thr[i]);
+                    if (cs->qidx[i] == UINT32_MAX) {
+                        cs->phase[i] = MJ2_DONE;
+                    } else {
+                        uint32_t cl = cs->qidx[i] > C ? cs->qidx[i] - C : 0;
+                        cs->clo[i] = (cl > found + 1) ? cl : found + 1;
+                        cs->chi[i] = cs->qidx[i];
+                    }
+                } else {
+                    if (base == cs->pidx[i] + 1) {
+                        /* (p, q) fully composite: find the true endpoint. */
+                        cs->phase[i] = MJ2_FIND_END;
+                        cs->clo[i] = cs->qidx[i];
+                        cs->chi[i] = (cs->qidx[i] + C < cnt_i)
+                                         ? cs->qidx[i] + C : cnt_i;
+                        if (cs->chi[i] <= cs->clo[i])
+                            cs->phase[i] = MJ2_DONE;
+                    } else {
+                        uint32_t old_lo = base;
+                        uint32_t new_lo =
+                            (old_lo > cs->pidx[i] + 1 + C)
+                                ? old_lo - C : cs->pidx[i] + 1;
+                        cs->chi[i] = old_lo;
+                        cs->clo[i] = new_lo;
+                    }
+                }
+            } else { /* MJ2_FIND_END */
+                uint32_t found = UINT32_MAX;
+                for (uint32_t j = 0; j < n; j++)
+                    if (fla[j]) { found = base + j; break; }
+                if (found != UINT32_MAX) {
+                    is_prime[cs->cum[i] + found] = 1;
+                    cs->anchors[i]++;
+                    cs->pidx[i] = found;
+                    cs->qidx[i] = mj2_find_q(off_i, cnt_i, found,
+                                             cs->thr[i]);
+                    if (cs->qidx[i] == UINT32_MAX) {
+                        cs->phase[i] = MJ2_DONE;
+                    } else {
+                        cs->phase[i] = MJ2_JUMP_BACK;
+                        uint32_t cl = cs->qidx[i] > C ? cs->qidx[i] - C : 0;
+                        cs->clo[i] = (cl > found + 1) ? cl : found + 1;
+                        cs->chi[i] = cs->qidx[i];
+                    }
+                } else {
+                    cs->clo[i] = cs->chi[i];
+                    cs->chi[i] = (cs->chi[i] + C < cnt_i)
+                                     ? cs->chi[i] + C : cnt_i;
+                    if (cs->clo[i] >= cnt_i)
+                        cs->phase[i] = MJ2_DONE;
+                }
+            }
+            if (getenv("MJ2_DEBUG") && i == 0) {
+                fprintf(stderr,
+                        "[MJ2DBG] r%u w0 phase=%u n=%u clo=%u chi=%u p=%u "
+                        "q=%u anchors=%u wtests=%u\n",
+                        rounds, cs->phase[i], n, cs->clo[i], cs->chi[i],
+                        cs->pidx[i], cs->qidx[i], cs->anchors[i],
+                        cs->wtests[i]);
+            }
+            if (cs->phase[i] != MJ2_DONE)
+                any_active = 1;
+        }
+    }
+    if (rounds >= max_rounds)
+        return 0;               /* fail-closed: chain did not terminate */
+
+    uint64_t owned_limit = fl->back_limit + fl->needed_gap;
+    for (uint32_t i = 0; i < K; i++) {
+        uint32_t cnt = fl->wins[i].count;
+        atomic_fetch_add(&g_worker_stats[worker_id].candidates_generated,
+                         cnt);
+        atomic_fetch_add(&g_worker_stats[worker_id].candidates_tested,
+                         cs->wtests[i]);
+        atomic_fetch_add(&g_worker_stats[worker_id].euler_passes,
+                         cs->anchors[i]);
+        crt_scan_gaps(worker_id, fl->height, fl->wins[i].nonce,
+                      fl->generation, fl->merit_threshold, rt,
+                      fl->wins[i].window_base, fl->wins[i].nadd0,
+                      fl->back_limit, p1, p2, nadd_full,
+                      is_prime + cs->cum[i], offsets + cs->cum[i], cnt,
+                      owned_limit, fl->half_class, fermat, fl->slot);
+    }
+    atomic_store(&g_worker_stats[worker_id].gpu_accounted_us,
+                 gpu_fermat_accounted_us(fermat));
+    return 1;
+}
+
+/* Drain a partial flight at header change/shutdown: chain mode processes it
+   synchronously (with full-scan fallback), batch mode submits it for the
+   next collect.  Returns 1 when processed (or nothing to do). */
+static int crt_fused_drain_partial(struct gpu_sieve_ctx *gpu_sieve,
+                                   struct gpu_fermat_ctx *fermat,
+                                   uint32_t worker_id,
+                                   const struct crt_runtime *rt,
+                                   struct fused_flight *fl, int chain_on,
+                                   struct mining_chain_state *chain_cs,
+                                   int chain_chunk,
+                                   uint64_t *offsets, uint8_t *is_prime,
+                                   mpz_t p1, mpz_t p2, mpz_t nadd_full)
+{
+    if (chain_on) {
+        if (fl->n_windows <= 0)
+            return 1;
+        if (!crt_fused_chain_flight(gpu_sieve, fermat, worker_id, rt, fl,
+                                    offsets, is_prime, chain_cs, chain_chunk,
+                                    p1, p2, nadd_full) &&
+            !crt_fused_fullscan_flight(gpu_sieve, fermat, worker_id, rt, fl,
+                                       offsets, is_prime, p1, p2, nadd_full))
+            return 0;
+        fl->n_windows = 0;
+        fl->total_count = 0;
+        return 1;
+    }
+    fused_flush_partial(gpu_sieve, fermat, fl, fl->slot);
+    return 1;
+}
+
+/* Dev-only parity check: full-scan the same flight and compare the
+   QUALIFYING gap sets per window (MINING_JUMP2_VERIFY=1).  The chain stops
+   at the merit frontier by design, so raw prime sets differ; the exact
+   mining invariant is the emitted merit-candidate set, which must be
+   identical.  tmp may clobber the other slot's result buffer (its contents
+   are dead in chain mode). */
+static void crt_fused_chain_verify(struct gpu_sieve_ctx *gpu_sieve,
+                                   struct gpu_fermat_ctx *fermat,
+                                   uint32_t worker_id,
+                                   const struct crt_runtime *rt,
+                                   struct fused_flight *fl,
+                                   uint64_t *offsets,
+                                   uint8_t *is_prime, uint8_t *tmp)
+{
+    uint32_t total = fl->total_count;
+    uint64_t *d_batch = gpu_sieve_candidate_buffer(gpu_sieve, fl->buf);
+    if (total == 0 || !d_batch)
+        return;
+    if (gpu_fermat_submit_device(fermat, fl->slot, d_batch, total) < 0 ||
+        gpu_fermat_collect(fermat, fl->slot, tmp, total) < 0) {
+        fprintf(stderr,
+                "[Worker %u] MINING_JUMP2 VERIFY: full-scan failed\n",
+                worker_id);
+        return;
+    }
+    uint32_t cum = 0, bad_windows = 0, bad_pairs = 0;
+    uint64_t owned_limit = fl->back_limit + fl->needed_gap;
+    for (int i = 0; i < fl->n_windows; i++) {
+        uint32_t cnt = fl->wins[i].count;
+        /* Mirror crt_scan_gaps: the reported pairs are gap_detection_find's
+           output on the VISIBLE slice (offsets >= back_limit).  In class
+           modes the back region is a prefix chain + terminal resolution,
+           not gap_detection input, and the chain walks it only up to the
+           first prime by design. */
+        uint32_t k = 0;
+        while (k < cnt && offsets[cum + k] < fl->back_limit)
+            k++;
+        struct gap_result *g1 = NULL, *g2 = NULL;
+        uint32_t n1 = 0, n2 = 0;
+        struct gap_scan_stats s1, s2;
+        gap_detection_find(is_prime + cum + k, offsets + cum + k, cnt - k,
+                           rt->shift, fl->wins[i].window_base,
+                           fl->merit_threshold, owned_limit, &s1, &g1, &n1);
+        gap_detection_find(tmp + cum + k, offsets + cum + k, cnt - k,
+                           rt->shift, fl->wins[i].window_base,
+                           fl->merit_threshold, owned_limit, &s2, &g2, &n2);
+        if (n1 != n2) {
+            bad_pairs += (n1 > n2) ? n1 - n2 : n2 - n1;
+        } else {
+            for (uint32_t j = 0; j < n1; j++) {
+                if (g1[j].offset_p1 != g2[j].offset_p1 ||
+                    g1[j].offset_p2 != g2[j].offset_p2)
+                    bad_pairs++;
+            }
+        }
+        if (bad_pairs)
+            bad_windows++;
+        gap_detection_free_results(g1);
+        gap_detection_free_results(g2);
+        cum += cnt;
+    }
+    fprintf(stderr,
+            "[Worker %u] MINING_JUMP2 VERIFY: windows=%d bad_windows=%u "
+            "bad_pairs=%u\n",
+            worker_id, fl->n_windows, bad_windows, bad_pairs);
 }
 #endif /* WITH_CUDA */
 
@@ -2540,7 +2968,7 @@ void *worker_thread_run_crt(void *arg) {
     uint64_t *fused_offsets[2] = { NULL, NULL };
     memset(fused_fl, 0, sizeof(fused_fl));
     for (int f = 0; f < 2; f++) {
-        for (int w = 0; w < FUSED_MR_BATCH_MAX; w++) {
+        for (int w = 0; w < MINING_JUMP2_BATCH_MAX; w++) {
             mpz_init(fused_fl[f].wins[w].window_base);
             mpz_init(fused_fl[f].wins[w].nadd0);
         }
@@ -2557,11 +2985,90 @@ void *worker_thread_run_crt(void *arg) {
             if (v >= 1 && v <= FUSED_MR_BATCH_MAX) fused_mr_batch = (int)v;
         }
     }
+    /* MINING_JUMP2: no-test chain (Horizon M19-style certificates).  Each
+       worker owns its gpu_adapter + gpu_fermat context (no singleton), so
+       the jump2 gather staging buffers are per-worker and N workers can
+       chain concurrently; with the round-robin device assignment
+       (farm->workers[i].gpu_device = i % gpu_count) N workers map to N
+       GPUs.  Class modes (HALF_CLASS/QUARTER_CLASS) are supported: the
+       chain walks the class-filtered survivor list and the reported visible
+       pairs are identical to the full scan's (every skipped interior pair
+       has span < thr and can never qualify; a qualifying consecutive pair
+       is found by the FIND_END phase). */
+    int mining_jump2 = worker_env_enabled(getenv("MINING_JUMP2"));
+    int mining_jump2_batch = 64;
+    {
+        const char *mb = getenv("MINING_JUMP2_BATCH");
+        if (mb && *mb) {
+            long v = strtol(mb, NULL, 10);
+            if (v >= 1 && v <= MINING_JUMP2_BATCH_MAX)
+                mining_jump2_batch = (int)v;
+        }
+    }
+    int mining_jump2_chunk = MINING_JUMP2_CHUNK_DEFAULT;
+    {
+        const char *mc = getenv("MINING_JUMP2_CHUNK");
+        if (mc && *mc) {
+            long v = strtol(mc, NULL, 10);
+            if (v >= 8 && v <= 512) mining_jump2_chunk = (int)v;
+        }
+    }
+    int mining_jump2_verify = worker_env_enabled(getenv("MINING_JUMP2_VERIFY"));
+    int chain_on = 0;
+    int chain_fail_reported = 0;
+    int flight_batch = fused_mr_batch;
+    struct mining_chain_state *chain_cs = NULL;
     if (gpu && gpu_sieve && worker_env_enabled(fused_env)) {
         fused_fermat = gpu_adapter_get_fermat_ctx(gpu);
         if (fused_fermat) {
+            if (mining_jump2 &&
+                gpu_fermat_gather_alloc(
+                    fused_fermat, (uint32_t)mining_jump2_batch,
+                    (uint32_t)mining_jump2_chunk, gpu_limbs) != 0) {
+                fprintf(stderr,
+                        "[Worker %u] MINING_JUMP2 disabled (gather alloc "
+                        "failed)\n",
+                        worker_id);
+            } else if (mining_jump2) {
+                chain_cs = (struct mining_chain_state *)
+                    calloc(1, sizeof(struct mining_chain_state));
+                if (!chain_cs) {
+                    fprintf(stderr,
+                            "[Worker %u] MINING_JUMP2 disabled (chain state "
+                            "alloc failed)\n",
+                            worker_id);
+                } else {
+                    chain_cs->flags_cap =
+                        (size_t)sieve.candidate_capacity *
+                        (size_t)mining_jump2_batch;
+                    chain_cs->flags =
+                        (uint8_t *)malloc(chain_cs->flags_cap);
+                    if (!chain_cs->flags) {
+                        free(chain_cs);
+                        chain_cs = NULL;
+                        fprintf(stderr,
+                                "[Worker %u] MINING_JUMP2 disabled (flags "
+                                "alloc failed)\n",
+                                worker_id);
+                    } else {
+                        chain_on = 1;
+                        flight_batch = mining_jump2_batch;
+                        fused_pair_enabled = 0;
+                        /* The chain stops at the merit frontier by design
+                           (only the prefix needed to certify every
+                           qualifying gap is walked), so the pair set is not
+                           the full consecutive-prime set.  Disable the
+                           gap-dist health histogram like HALF_CLASS does:
+                           it compares small-gap frequencies, which the
+                           frontier cut would distort into a false alarm.
+                           Single worker here, so the global switch is
+                           race-free. */
+                        gap_dist_set_enabled(0);
+                    }
+                }
+            }
             size_t cap = (size_t)sieve.candidate_capacity *
-                         (size_t)fused_mr_batch;
+                         (size_t)flight_batch;
             fused_slot_offsets = (uint64_t *)malloc(cap * sizeof(uint64_t));
             fused_sorted_offsets = (uint64_t *)malloc(cap * sizeof(uint64_t));
             fused_is_prime[0] = (uint8_t *)malloc(cap * sizeof(uint8_t));
@@ -2572,15 +3079,26 @@ void *worker_thread_run_crt(void *arg) {
                 fused_offsets[1] = fused_sorted_offsets;
                 fused_enabled = 1;
                 gpu_sieve_set_extract_accum(gpu_sieve,
-                                            (uint32_t)fused_mr_batch);
+                                            (uint32_t)flight_batch);
                 fprintf(stderr,
                         "[Worker %u] Fused GPU pipeline enabled (FUSED_GPU=1): "
-                        "async double-buffered, ordered extraction%s%s\n",
+                        "async double-buffered, ordered extraction%s%s%s\n",
                         worker_id,
-                        fused_mr_batch > 1 ? " (GPU_MR_BATCH: K-window MR accumulation)" : "",
+                        flight_batch > 1 ? " (GPU_MR_BATCH: K-window MR accumulation)" : "",
                         fused_pair_enabled
                             ? " (GPU_SIEVE_PAIR=1: 2-window pair-batched mark)"
+                            : "",
+                        chain_on
+                            ? " (MINING_JUMP2: no-test chain)"
                             : "");
+                if (chain_on) {
+                    fprintf(stderr,
+                            "[Worker %u] MINING_JUMP2 no-test chain: "
+                            "K=%d windows, chunk=%d, verify=%s\n",
+                            worker_id, mining_jump2_batch,
+                            mining_jump2_chunk,
+                            mining_jump2_verify ? "on" : "off");
+                }
             } else {
                 free(fused_slot_offsets);
                 free(fused_sorted_offsets);
@@ -2652,10 +3170,22 @@ void *worker_thread_run_crt(void *arg) {
 #ifdef WITH_CUDA
                 fused_pending_clear(&fused_pending);
                 if (fused_enabled && fused_fermat && gpu_sieve) {
-                    uint64_t b0 = fused_seq / (uint64_t)fused_mr_batch;
-                    fused_flush_partial(gpu_sieve, fused_fermat,
-                                        &fused_fl[b0 & 1ULL],
-                                        (int)(b0 & 1ULL));
+                    uint64_t b0 = fused_seq / (uint64_t)flight_batch;
+                    if (!crt_fused_drain_partial(
+                            gpu_sieve, fused_fermat, worker_id, rt,
+                            &fused_fl[b0 & 1ULL], chain_on, chain_cs,
+                            mining_jump2_chunk,
+                            fused_offsets[b0 & 1ULL],
+                            fused_is_prime[b0 & 1ULL], p1, p2, nadd_full) &&
+                        !gpu_sieve_failure_reported) {
+                        gpu_sieve_failure_reported = 1;
+                        gpu_sieve_enabled = 0;
+                        fused_enabled = 0;
+                        chain_on = 0;
+                        fprintf(stderr,
+                                "[Worker %u] CRT fused GPU pipeline failed; falling back to CPU sieve\n",
+                                worker_id);
+                    }
                 }
 #endif
                 break;
@@ -2665,15 +3195,27 @@ void *worker_thread_run_crt(void *arg) {
 #ifdef WITH_CUDA
                 fused_pending_clear(&fused_pending);
                 if (fused_enabled && fused_fermat && gpu_sieve) {
-                    uint64_t b0 = fused_seq / (uint64_t)fused_mr_batch;
-                    fused_flush_partial(gpu_sieve, fused_fermat,
-                                        &fused_fl[b0 & 1ULL],
-                                        (int)(b0 & 1ULL));
+                    uint64_t b0 = fused_seq / (uint64_t)flight_batch;
+                    if (!crt_fused_drain_partial(
+                            gpu_sieve, fused_fermat, worker_id, rt,
+                            &fused_fl[b0 & 1ULL], chain_on, chain_cs,
+                            mining_jump2_chunk,
+                            fused_offsets[b0 & 1ULL],
+                            fused_is_prime[b0 & 1ULL], p1, p2, nadd_full) &&
+                        !gpu_sieve_failure_reported) {
+                        gpu_sieve_failure_reported = 1;
+                        gpu_sieve_enabled = 0;
+                        fused_enabled = 0;
+                        chain_on = 0;
+                        fprintf(stderr,
+                                "[Worker %u] CRT fused GPU pipeline failed; falling back to CPU sieve\n",
+                                worker_id);
+                    }
                     /* Align to the next batch boundary so the new header's
                        first window starts a fresh flight. */
-                    fused_seq = ((fused_seq + (uint64_t)fused_mr_batch - 1U) /
-                                 (uint64_t)fused_mr_batch) *
-                                (uint64_t)fused_mr_batch;
+                    fused_seq = ((fused_seq + (uint64_t)flight_batch - 1U) /
+                                 (uint64_t)flight_batch) *
+                                (uint64_t)flight_batch;
                 }
 #endif
                 break;   /* new block: re-snapshot */
@@ -2737,8 +3279,8 @@ void *worker_thread_run_crt(void *arg) {
                            into the batch's accumulation buffer; submit ONE
                            MR per K windows. */
                         uint64_t w_idx = fused_seq;
-                        uint64_t batch = w_idx / (uint64_t)fused_mr_batch;
-                        int w_in = (int)(w_idx % (uint64_t)fused_mr_batch);
+                        uint64_t batch = w_idx / (uint64_t)flight_batch;
+                        int w_in = (int)(w_idx % (uint64_t)flight_batch);
                         int slot = (int)(batch & 1ULL);
                         struct fused_flight *fl = &fused_fl[slot];
                         int f = (int)(w_idx & 1ULL);   /* bitmap parity */
@@ -2781,7 +3323,7 @@ void *worker_thread_run_crt(void *arg) {
                             }
                             uint64_t need_off_v =
                                 back_limit + needed_gap;
-                            int split_v =
+                            int split_v = chain_on ? 0 :
                                 (need_off_v < head_end_v) &&
                                 (head_end_v - need_off_v >=
                                  (uint64_t)(2.0 * logbase));
@@ -2933,9 +3475,51 @@ void *worker_thread_run_crt(void *arg) {
                                 fused_async = 1;
                                 fused_seq++;
 
-                                /* Submit ONE accumulated MR batch per K
-                                   windows. */
-                                if (w_in == fused_mr_batch - 1) {
+                                if (chain_on) {
+                                    /* No-test chain over the completed
+                                       flight; a full scan of the same flight
+                                       is the exact fallback. */
+                                    if (w_in == flight_batch - 1) {
+                                        if (!crt_fused_chain_flight(
+                                                gpu_sieve, fused_fermat,
+                                                worker_id, rt, fl,
+                                                fused_offsets[slot],
+                                                fused_is_prime[slot],
+                                                chain_cs, mining_jump2_chunk,
+                                                p1, p2, nadd_full)) {
+                                            if (!crt_fused_fullscan_flight(
+                                                    gpu_sieve, fused_fermat,
+                                                    worker_id, rt, fl,
+                                                    fused_offsets[slot],
+                                                    fused_is_prime[slot],
+                                                    p1, p2, nadd_full)) {
+                                                if (!gpu_sieve_failure_reported) {
+                                                    gpu_sieve_failure_reported = 1;
+                                                    gpu_sieve_enabled = 0;
+                                                    fused_enabled = 0;
+                                                    chain_on = 0;
+                                                    fprintf(stderr,
+                                                            "[Worker %u] CRT fused GPU pipeline failed; falling back to CPU sieve\n",
+                                                            worker_id);
+                                                }
+                                            } else if (!chain_fail_reported) {
+                                                chain_fail_reported = 1;
+                                                fprintf(stderr,
+                                                        "[Worker %u] MINING_JUMP2 chain failed once; full-scan fallback for this flight\n",
+                                                        worker_id);
+                                            }
+                                        } else if (mining_jump2_verify) {
+                                            crt_fused_chain_verify(
+                                                gpu_sieve, fused_fermat,
+                                                worker_id, rt, fl,
+                                                fused_offsets[slot],
+                                                fused_is_prime[slot],
+                                                fused_is_prime[slot ^ 1]);
+                                        }
+                                        fl->n_windows = 0;
+                                        fl->total_count = 0;
+                                    }
+                                } else if (w_in == flight_batch - 1) {
                                     uint64_t *d_batch =
                                         gpu_sieve_candidate_buffer(gpu_sieve,
                                                                    slot);
@@ -3190,6 +3774,12 @@ void *worker_thread_run_crt(void *arg) {
        whose MR was still in flight). */
 #ifdef WITH_CUDA
     for (int f = 0; f < 2; f++) {
+        if (chain_on && fused_fl[f].n_windows > 0) {
+            crt_fused_drain_partial(gpu_sieve, fused_fermat, worker_id, rt,
+                                    &fused_fl[f], chain_on, chain_cs,
+                                    mining_jump2_chunk, fused_offsets[f],
+                                    fused_is_prime[f], p1, p2, nadd_full);
+        }
         if (!fused_fl[f].active) continue;
         crt_fused_collect_batch(gpu_sieve, fused_fermat, worker_id, rt,
                                 &fused_fl[f], fused_offsets[f],
@@ -3211,8 +3801,12 @@ void *worker_thread_run_crt(void *arg) {
     free(fused_sorted_offsets);
     free(fused_is_prime[0]);
     free(fused_is_prime[1]);
+    if (chain_cs) {
+        free(chain_cs->flags);
+        free(chain_cs);
+    }
     for (int f = 0; f < 2; f++) {
-        for (int w = 0; w < FUSED_MR_BATCH_MAX; w++) {
+        for (int w = 0; w < MINING_JUMP2_BATCH_MAX; w++) {
             mpz_clear(fused_fl[f].wins[w].window_base);
             mpz_clear(fused_fl[f].wins[w].nadd0);
         }

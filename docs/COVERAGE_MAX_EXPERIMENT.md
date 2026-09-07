@@ -87,6 +87,18 @@ data/crt/m23/shift720_p98_covermax_m23.txt` → ALL TESTS PASSED,
 window survivors 2295 vs 2328 for the original (full aligned window
 31120 = 2×gap_target).
 
+### p67 config (`shift450_p67_m30.txt`)
+
+| run | restarts | best survivors | coverage |
+|---|---|---|---|
+| file | — | 1108 | 92.4523% |
+| 300 s search | 1385 | **1101** | **92.5000%** |
+
+Improvement: −7 survivors (−0.6%), +0.048 pp coverage — near-optimal;
+longest run 65 vs 69, mean fwd run 12.3 vs 12.2 (near-neutral tradeoff).
+**DEPLOYED** (2026-09-07) as `data/crt/m23/shift450_p67_covermax_m30.txt`;
+`test_crt_runtime` ALL TESTS PASSED.
+
 ## Conclusion
 
 - **p74 config: certified done.** 1355 restarts of a stronger optimizer

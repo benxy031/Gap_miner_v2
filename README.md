@@ -273,7 +273,8 @@ CRT covering quality is certified in `docs/COVERAGE_CERT.md` (search tool:
 `bin/cover_max`, report: `docs/COVERAGE_MAX_EXPERIMENT.md`). The p74
 production cover is at its search optimum (1141 survivors, 92.81% coverage);
 the p98 cover was improved from 987 to 952 survivors (93.66% → 93.88%) and
-is deployed in `gap_hunt_fleet.conf`.
+the p67 cover from 1108 to 1101 survivors (92.45% → 92.50%); both improved
+covers are deployed in `gap_hunt_fleet.conf`.
 
 ## CLI reference
 

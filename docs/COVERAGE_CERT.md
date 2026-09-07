@@ -36,6 +36,21 @@ Status: ISSUED 2026-09-07. Companion to `docs/COVERAGE_MAX_EXPERIMENT.md`
   repo evaluator before writing.
 - Layer: *exact fact* (the two survivor counts and test outcomes above).
 
+## Certificate C — p67 config improvement + deployment (issued 2026-09-07)
+
+- Old file: `data/crt/m23/shift450_p67_m30.txt`
+  → 1108 survivors = 92.4523% coverage.
+- **Deployed file: `data/crt/m23/shift450_p67_covermax_m30.txt`
+  → 1101 survivors = 92.5000% coverage** (−7 survivors, +0.048 pp).
+- Evidence: 300 s / 1385 restarts; best found at elapsed 1 s, stable for the
+  remaining restarts. Constellation: longest run 65 vs 69 (slightly shorter),
+  mean forward run 12.3 vs 12.2 (slightly better) — near-neutral; the win is
+  the candidate reduction (−0.6% GPU tests).
+- Validation: `bin/test_crt_runtime data/crt/m23/shift450_p67_covermax_m30.txt`
+  → **ALL TESTS PASSED** (window 29362 survivors: 2524 vs 2541 for the old
+  file).
+- Layer: *exact fact* (the two survivor counts and test outcomes above).
+
 ## Deployment record
 
 | Change | File |
@@ -44,6 +59,9 @@ Status: ISSUED 2026-09-07. Companion to `docs/COVERAGE_MAX_EXPERIMENT.md`
 | Deployment-ready walker commented (activate on a free GPU) | `gap_hunt_fleet_dual3060.conf` |
 | Certificate + experiment report | `docs/COVERAGE_CERT.md`, `docs/COVERAGE_MAX_EXPERIMENT.md` |
 | Search tool + Makefile target | `tools/cover_max.c`, `Makefile` (`bin/cover_max`) |
+
+Deployed covers: p98 `shift720_p98_covermax_m23.txt` (952 survivors) and p67
+`shift450_p67_covermax_m30.txt` (1101 survivors).
 
 Commit at deployment: `8cc2a6f` (working tree also carries unrelated
 README/merits changes).

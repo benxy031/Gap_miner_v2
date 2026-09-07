@@ -102,12 +102,13 @@ TEST_CRT_RUNTIME = $(BIN_DIR)/test_crt_runtime
 TEST_CRT_SUBMISSION = $(BIN_DIR)/test_crt_submission
 TEST_GAP_HUNT = $(BIN_DIR)/test_gap_hunt
 BENCH_FERMAT = $(BIN_DIR)/bench_fermat
+COVER_MAX = $(BIN_DIR)/cover_max
 
 # Phony targets
 .PHONY: all clean test help update-merits
 
 # Default target
-all: $(BIN_DIR) $(BUILD_DIR) $(OBJECTS) $(MAIN_BINARY) $(TEST_GAP_DETECTION) $(TEST_PRIMALITY) $(TEST_WORKER_THREADS) $(TEST_GAPCOIN_RPC) $(TEST_BLOCK_SUBMISSION) $(TEST_SIEVE_CORE) $(TEST_GPU_FERMAT) $(TEST_GPU_SIEVE) $(TEST_GPU_RESOLVE) $(TEST_GAP_DIST) $(TEST_HALFCLASS) $(TEST_GAP_PRIORITY) $(TEST_CRT_SET) $(TEST_GAP_TARGET) $(TEST_COVERING) $(TEST_CRT_RUNTIME) $(TEST_CRT_SUBMISSION) $(TEST_GAP_HUNT) $(CRT_GEN) $(GEN_CRT)
+all: $(BIN_DIR) $(BUILD_DIR) $(OBJECTS) $(MAIN_BINARY) $(TEST_GAP_DETECTION) $(TEST_PRIMALITY) $(TEST_WORKER_THREADS) $(TEST_GAPCOIN_RPC) $(TEST_BLOCK_SUBMISSION) $(TEST_SIEVE_CORE) $(TEST_GPU_FERMAT) $(TEST_GPU_SIEVE) $(TEST_GPU_RESOLVE) $(TEST_GAP_DIST) $(TEST_HALFCLASS) $(TEST_GAP_PRIORITY) $(TEST_CRT_SET) $(TEST_GAP_TARGET) $(TEST_COVERING) $(TEST_CRT_RUNTIME) $(TEST_CRT_SUBMISSION) $(TEST_GAP_HUNT) $(CRT_GEN) $(GEN_CRT) $(COVER_MAX)
 
 # Create directories
 $(BIN_DIR):
@@ -210,6 +211,11 @@ $(GEN_CRT): $(BUILD_DIR)/$(SRC_DIR)/covering.o $(BUILD_DIR)/$(SRC_DIR)/gen_crt_m
 	$(CC) $(CFLAGS) $^ -lm -o $@
 	@echo "✓ Built: $@"
 
+# Covering-coverage search experiment tool (GPA-style; CPU-only dev tool)
+$(COVER_MAX): $(BUILD_DIR)/$(SRC_DIR)/covering.o $(BUILD_DIR)/tools/cover_max.o | $(BIN_DIR)
+	$(CC) $(CFLAGS) $^ -lm -o $@
+	@echo "✓ Built: $@"
+
 $(TEST_CRT_RUNTIME): $(BUILD_DIR)/$(SRC_DIR)/covering.o $(BUILD_DIR)/$(SRC_DIR)/crt_runtime.o $(BUILD_DIR)/$(TEST_DIR)/test_crt_runtime.o | $(BIN_DIR)
 	$(CC) $(CFLAGS) $^ -lm -lgmp -o $@
 	@echo "✓ Built: $@"
@@ -241,7 +247,7 @@ $(BUILD_DIR)/$(TEST_DIR)/%.o: $(TEST_DIR)/%.c
 # Compile dev tools
 $(BUILD_DIR)/tools/%.o: tools/%.c
 	@mkdir -p $(BUILD_DIR)/tools
-	$(CC) $(CFLAGS) -c $< -o $@
+	$(CC) $(CFLAGS) -I$(SRC_DIR) -c $< -o $@
 
 # Compile CUDA GPU sources (only reached when WITH_CUDA=1 selects a .o under gpu/)
 $(BUILD_DIR)/$(SRC_DIR)/gpu/%.o: $(SRC_DIR)/gpu/%.cu | $(BUILD_DIR)

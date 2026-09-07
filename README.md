@@ -264,7 +264,16 @@ lotteries.  Example config:
 # crt-file                                device  min-merit
 data/crt/m23/shift507_p74_lex_m30.txt     0       18
 data/crt/m23/shift998_p128_m23.txt        1       18
+# coverage-certified p98 walker (952 survivors / 93.88%; cert:
+# docs/COVERAGE_CERT.md):
+# data/crt/m23/shift720_p98_covermax_m23.txt  0  8
 ```
+
+CRT covering quality is certified in `docs/COVERAGE_CERT.md` (search tool:
+`bin/cover_max`, report: `docs/COVERAGE_MAX_EXPERIMENT.md`). The p74
+production cover is at its search optimum (1141 survivors, 92.81% coverage);
+the p98 cover was improved from 987 to 952 survivors (93.66% → 93.88%) and
+is deployed in `gap_hunt_fleet.conf`.
 
 ## CLI reference
 
@@ -354,6 +363,8 @@ summed `acc` equals the GPU's total busy time. Interpreting the ratio:
 
 The metric is only meaningful with GPU MR active and stays `0.000` in pure-CPU
 runs or when the GPU path is disabled.
+
+In `MINING_JUMP2` mode the `Max Euler pair` line reports the largest **chain certificate span** (≈ active difficulty by construction: the frontier jump pair's gap is `ceil(difficulty·logbase) − ε`, always just below the threshold), not a true consecutive-prime pair — the true per-window max pair (full-scan) is the cross-cover gap ≈ 9-10k (merit ~17-19). `Merit candidates`/BPSW/submission are unaffected (parity-verified, 0 mismatches).
 
 In `HALF_CLASS` mode the `Max Euler pair` and `Merit candidates` lines reflect
 **true** consecutive-prime gaps (resolved by the on-demand hidden-class

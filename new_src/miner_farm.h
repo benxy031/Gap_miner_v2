@@ -52,6 +52,7 @@ void miner_farm_join(struct miner_farm *farm);
 struct farm_stats {
     uint64_t total_nonces;
     uint64_t total_candidates;
+    uint64_t total_candidates_tested;   /* candidates actually sent to the GPU MR kernel */
     uint64_t total_euler_passes;
     uint64_t total_euler_pairs;
     uint64_t total_merit_candidates;
@@ -66,6 +67,17 @@ struct farm_stats {
     uint64_t total_gpu_sieve_windows;
     uint64_t total_smart_tail_skipped;
     uint64_t total_gpu_accounted_us;
+    /* Fused stage split (FUSED_STAGE_TIMING=1 only; 0 otherwise). */
+    uint64_t total_us_mark;
+    uint64_t total_us_extract;
+    uint64_t total_us_collect;
+    uint64_t total_us_chain;
+    uint64_t total_us_chain_gather;
+    uint64_t total_us_chain_mr;
+    uint64_t total_chain_rounds;
+    /* Sieve kernel accounting (GPU_SIEVE_TIMING=1 only). */
+    uint64_t total_sieve_mark_us;
+    uint64_t total_sieve_extract_us;
 };
 
 void miner_farm_get_stats(struct miner_farm *farm, struct farm_stats *stats);

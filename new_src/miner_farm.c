@@ -114,6 +114,7 @@ void miner_farm_get_stats(struct miner_farm *farm, struct farm_stats *stats) {
         worker_get_stats(i, &wstats);
         stats->total_nonces += wstats.nonces_processed;
         stats->total_candidates += wstats.candidates_generated;
+        stats->total_candidates_tested += wstats.candidates_tested;
         stats->total_euler_passes += wstats.euler_passes;
         stats->total_euler_pairs += wstats.euler_pairs;
         stats->total_merit_candidates += wstats.merit_candidates;
@@ -125,6 +126,15 @@ void miner_farm_get_stats(struct miner_farm *farm, struct farm_stats *stats) {
         stats->total_gpu_sieve_windows += wstats.gpu_sieve_windows;
         stats->total_smart_tail_skipped += wstats.smart_tail_skipped;
         stats->total_gpu_accounted_us += wstats.gpu_accounted_us;
+        stats->total_us_mark += wstats.us_mark;
+        stats->total_us_extract += wstats.us_extract;
+        stats->total_us_collect += wstats.us_collect;
+        stats->total_us_chain += wstats.us_chain;
+        stats->total_us_chain_gather += wstats.us_chain_gather;
+        stats->total_us_chain_mr += wstats.us_chain_mr;
+        stats->total_chain_rounds += wstats.chain_rounds;
+        stats->total_sieve_mark_us += wstats.sieve_mark_us;
+        stats->total_sieve_extract_us += wstats.sieve_extract_us;
         if (wstats.max_gap_length > stats->max_gap_length) {
             stats->max_gap_length = wstats.max_gap_length;
         }

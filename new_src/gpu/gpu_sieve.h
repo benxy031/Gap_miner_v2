@@ -205,6 +205,11 @@ int gpu_sieve_extract_pack_device_range_bitmap(
 /* Device pointer of row r in the row bitmap arena (NULL when unavailable). */
 uint64_t *gpu_sieve_row_bitmap(gpu_sieve_ctx *ctx, uint32_t row);
 
+/* Device ping-pong bitmap (buf 0/1) written by gpu_sieve_mark_from_base and
+   gpu_sieve_mark_batch_from_bases; used by tests to compare the GPU bitmap
+   against a CPU reference. */
+uint64_t *gpu_sieve_pingpong_bitmap(gpu_sieve_ctx *ctx, int buf);
+
 /* Size the extract candidate buffers for K-window MR batch accumulation. */
 void gpu_sieve_set_extract_accum(gpu_sieve_ctx *ctx, uint32_t k);
 
@@ -237,7 +242,11 @@ int gpu_sieve_mark_high_primes_batch(gpu_sieve_ctx *ctx,
 
 /* Wall time of the last completed batch, including CUDA transfers and sync. */
 uint64_t gpu_sieve_last_elapsed_us(const gpu_sieve_ctx *ctx);
-
+/* Cumulative pure-kernel time of the mark and extract launches, measured with
+   CUDA events and drained after the stream syncs those paths already perform.
+   Non-zero only when GPU_SIEVE_TIMING=1 was set before gpu_sieve_init(). */
+uint64_t gpu_sieve_accounted_mark_us(gpu_sieve_ctx *ctx);
+uint64_t gpu_sieve_accounted_extract_us(gpu_sieve_ctx *ctx);
 /* Device name for logging, empty string when unavailable. */
 const char *gpu_sieve_device_name(const gpu_sieve_ctx *ctx);
 

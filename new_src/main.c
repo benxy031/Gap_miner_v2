@@ -165,7 +165,7 @@ void print_usage(const char *prog_name) {
     printf("  --sieve-primes <n>    Sieve prime limit (default: 50000; in non-CRT\n");
     printf("                        mode with --enable-gpu-fermat an adaptive\n");
     printf("                        bit-scaled default (cover..20M); 100k in\n");
-    printf("                        CRT+GPU mode; 5M in CRT+GPU+FUSED_GPU mode;\n");
+    printf("                        CRT+GPU mode; 2M in CRT+GPU+FUSED_GPU mode;\n");
     printf("                        10M in CRT CPU mode)\n");
     printf("  --merit <value>       Merit threshold override (default: node difficulty)\n");
     printf("                         Validated candidates are logged; submission is disabled\n");
@@ -181,7 +181,16 @@ void print_usage(const char *prog_name) {
     printf("                        Optional GPU bitmap sieve is off by default; enable with\n");
     printf("                        GPU_SIEVE=1 (multi-GPU only).\n");
     printf("                        GPU_SIEVE batch size is configurable via\n");
-    printf("                        GPU_SIEVE_BATCH=<windows> (default: 8).\n");
+    printf("                        GPU_SIEVE_BATCH=<windows> (default: 1024,\n");
+    printf("                        max 4096).\n");
+    printf("                        Dense GPU marking (p <= window) uses chunked\n");
+    printf("                        work items; GPU_MARK_SPLIT=0 restores the\n");
+    printf("                        per-prime walk and GPU_MARK_SPLIT_SLOTS=<n>\n");
+    printf("                        sets the chunk size in odd slots\n");
+    printf("                        (default: 160, clamped 32..4096).\n");
+    printf("                        On the fused path the no-test chain is ON by\n");
+    printf("                        default (MINING_JUMP2=0 restores the full scan;\n");
+    printf("                        inert without FUSED_GPU=1).\n");
     printf("  --record-log <path>   Log every BPSW-verified candidate with full parameters\n");
     printf("                        (default: gapminer_records.log)\n");
     printf("  --merit-records <path>\n");
@@ -308,7 +317,17 @@ int main(int argc, char *argv[]) {
         gh.min_merit = gap_hunt_min_merit;
         gh.state_path = gap_hunt_state;
         gh.out_path = gap_hunt_out;
-        gh.sieve_primes = sieve_primes_overridden ? sieve_primes : 10000000U;
+        /* GAP_HUNT sieve depth: 2M (was 10M).  Re-measured 2026-09-15 AFTER the
+           chunked mark split made marking ~9x cheaper and with the chain
+           (GAP_HUNT_JUMP2) on: the curve is now FLAT then falling -- shift507:
+           0.5M=1893, 1M=1908, 2M=1897, 5M=1819, 10M=1736, 20M=1558 win/s;
+           shift1017: 2M=599, 5M=596, 10M=593, 20M=538 win/s.  The old "deeper
+           is better" advice held when the mark kernel dominated; now the
+           per-prime per-window residue/mark cost outweighs the shrinking
+           survivor set.  2M is equal-best at both shifts with 5x less prime
+           table (16 MB vs 80 MB) and faster startup.  Record parity verified
+           at 2M vs 10M (identical gap/merit/start over the same k range). */
+        gh.sieve_primes = sieve_primes_overridden ? sieve_primes : 2000000U;
         gh.device = gap_hunt_device;
         return gap_hunt_run(&gh);
     }
@@ -899,6 +918,59 @@ int main(int argc, char *argv[]) {
                   printf("  Euler passes: %lu | Euler pairs: %lu | Merit candidates: %lu\n",
                       stats.total_euler_passes, stats.total_euler_pairs,
                       stats.total_merit_candidates);
+                  {
+                      /* Expensive-test density: how many candidates each
+                         window actually sends to the GPU MR kernel (the
+                         full-scan path tests every sieve survivor; the
+                         MINING_JUMP2 chain tests only the frontier) plus the
+                         same ratio per 1000 survivors, which is independent
+                         of the window geometry. */
+                      double mr_per_window = stats.total_nonces ?
+                          (double)stats.total_candidates_tested /
+                          (double)stats.total_nonces : 0.0;
+                      double mr_per_1000_surv = stats.total_candidates ?
+                          1000.0 * (double)stats.total_candidates_tested /
+                          (double)stats.total_candidates : 0.0;
+                      printf("  GPU MR tests: %lu (%.1f/window, %.1f per 1000 survivors)\n",
+                          stats.total_candidates_tested, mr_per_window,
+                          mr_per_1000_surv);
+                  }
+                  if (stats.total_us_mark || stats.total_us_extract ||
+                      stats.total_us_collect || stats.total_us_chain) {
+                      /* FUSED_STAGE_TIMING=1 stage split, as a percentage of
+                         total uptime.  "mark"/"extract"/"collect" are the
+                         host-side stage calls of the fused pipeline; the
+                         chain block is the whole MINING_JUMP2 flight with its
+                         own gather/MR round trips. */
+                      double up_s = (double)(uptime > 0 ? uptime : 1);
+                      double pct = 100.0 / (up_s * 1e6);
+                      printf("  Fused stage split: mark=%.1f%% extract=%.1f%% "
+                             "collect=%.1f%% chain=%.1f%% (rounds=%lu, "
+                             "gather=%.1f%%, mr=%.1f%%)\n",
+                          (double)stats.total_us_mark * pct,
+                          (double)stats.total_us_extract * pct,
+                          (double)stats.total_us_collect * pct,
+                          (double)stats.total_us_chain * pct,
+                          (unsigned long)stats.total_chain_rounds,
+                          (double)stats.total_us_chain_gather * pct,
+                          (double)stats.total_us_chain_mr * pct);
+                  }
+                  if (stats.total_sieve_mark_us || stats.total_sieve_extract_us) {
+                      /* GPU_SIEVE_TIMING=1: pure kernel time (CUDA events) of
+                         the sieve stages, as a share of uptime.  Together
+                         with GPU MR acc/wall this closes the GPU-busy
+                         budget: MR + mark + extract + idle = wall. */
+                      double up_s = (double)(uptime > 0 ? uptime : 1);
+                      double pct = 100.0 / (up_s * 1e6);
+                      printf("  GPU kernel split: MR=%.1f%% mark=%.1f%% "
+                             "extract=%.1f%% of wall (mark=%.2f s, "
+                             "extract=%.2f s)\n",
+                          (double)stats.total_gpu_accounted_us * pct,
+                          (double)stats.total_sieve_mark_us * pct,
+                          (double)stats.total_sieve_extract_us * pct,
+                          (double)stats.total_sieve_mark_us / 1e6,
+                          (double)stats.total_sieve_extract_us / 1e6);
+                  }
                   if (stats.total_gpu_euler_skipped > 0) {
                       printf("  GPU Fermat: %lu Euler calls skipped (composite pre-filter)\n",
                           stats.total_gpu_euler_skipped);

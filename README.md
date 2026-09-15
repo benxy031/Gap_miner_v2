@@ -64,6 +64,57 @@ script):
   --enable-submission --coinbase-script-hex 76a914<20-byte-hash160>88ac
 ```
 
+## Recommended commands
+
+All GPU commands assume a `WITH_CUDA=1` build
+(`make clean && make WITH_CUDA=1 WITH_CGBN_FERMAT=1 -j4`). `MINING_JUMP2` and
+`GPU_MARK_SPLIT` are already on by default; only `FUSED_GPU=1` (which implies
+`GPU_SIEVE=1`) has to be asked for. Use **one worker thread per GPU**
+(`--threads` = number of GPUs) — the device is assigned round-robin, and each
+worker owns its own GPU contexts, so one chain runs per card.
+
+```bash
+# ── Mining: fused GPU pipeline + no-test chain (fastest CRT mining mode) ─────
+# 1 thread per GPU; needs a CRT cover file; submits only with --enable-submission.
+FUSED_GPU=1 ./bin/gapminer --host 127.0.0.1 --port 31397 --user benxy031 --pass xx \
+  --crt-file data/crt/m23/shift507_p74_lex_m30.txt --threads 1 --enable-gpu-fermat \
+  --enable-submission --coinbase-script-hex 76a914<20-byte-hash160>88ac
+
+# Two GPUs: two workers, one chain each (device 0 and 1).
+FUSED_GPU=1 ./bin/gapminer --host 127.0.0.1 --port 31397 --user benxy031 --pass xx \
+  --crt-file data/crt/m23/shift1017_p130_lex_m30.txt --threads 2 --enable-gpu-fermat
+
+# ── Mining: non-CRT (no cover file), high shift + GPU Fermat ────────────────
+FUSED_GPU=1 ./bin/gapminer --host 127.0.0.1 --port 31397 --user benxy031 --pass xx \
+  --shift 96 --threads 8 --enable-gpu-fermat --sieve-primes 7000000
+
+# ── Record hunting (GAP_HUNT): single walker ────────────────────────────────
+./bin/gapminer --gap-hunt --crt-file data/crt/m23/shift507_p74_lex_m30.txt \
+  --gap-hunt-device 0 --gap-hunt-min-merit 19 \
+  --gap-hunt-state data/gap_hunt_state_f1.txt \
+  --gap-hunt-out data/gap_hunt_records_f1.txt
+
+# ── Record hunting: fleet (one walker per conf line) ────────────────────────
+./scripts/gap_hunt_fleet.sh                              # uses gap_hunt_fleet.conf
+CONF=gap_hunt_fleet_dual3060.conf ./scripts/gap_hunt_fleet.sh   # dual-3060 config
+# conf line format:  <crt-file> <gpu-device> <min-merit>
+
+# ── Diagnostics / validation (slower; do not leave on in production) ────────
+GPU_SIEVE_TIMING=1 FUSED_STAGE_TIMING=1 FUSED_GPU=1 ./bin/gapminer \
+  --crt-file data/crt/m23/shift507_p74_lex_m30.txt --threads 1 --enable-gpu-fermat   # stage + kernel split lines
+MINING_JUMP2_VERIFY=1 FUSED_GPU=1 ./bin/gapminer \
+  --crt-file data/crt/m23/shift507_p74_lex_m30.txt --threads 1 --enable-gpu-fermat   # chain vs full-scan parity
+MINING_JUMP2=0 FUSED_GPU=1 ./bin/gapminer \
+  --crt-file data/crt/m23/shift507_p74_lex_m30.txt --threads 1 --enable-gpu-fermat   # restore the full scan
+GPU_MARK_SPLIT=0 FUSED_GPU=1 ./bin/gapminer \
+  --crt-file data/crt/m23/shift507_p74_lex_m30.txt --threads 1 --enable-gpu-fermat   # restore the per-prime mark walk
+
+# ── Benchmarks / analysis tools ─────────────────────────────────────────────
+make bin/bench_mark WITH_CUDA=1      # GPU mark-kernel cost model (see docs/MARK_SPLIT_RESULT.md)
+./bin/bench_mark --primes 2000000 --rows 8 --window 10175
+scripts/ab_shift_compare.sh          # accepted blocks / qualifying gaps per hour, two shifts
+```
+
 ## GPU acceleration (CUDA)
 
 Optional. Build with the fast [CGBN](https://github.com/NVlabs/CGBN) kernel
@@ -198,8 +249,10 @@ alternates to cancel difficulty drift. Results land in
 difficulty, no submissions.  The CRT cover of a design file is periodic with
 period `P` (product of the cover primes), so every translate
 `b_k = b0 + k·P` of an aligned base carries the identical cover template and
-the same σ-conditioned gap distribution the miner exploits.  The walk uses
-the fused GPU pipeline (device sieve + CGBN MR, full-class) and reports every
+the same σ-conditioned gap distribution the miner exploits.  The walk runs the
+**chunk-parallel backward chain** by default (`GAP_HUNT_JUMP2=1` since
+2026-09-15; `GAP_HUNT_JUMP2=0` restores the full-scan batch walk, ~2.9–4×
+slower) on the fused GPU pipeline (device sieve + CGBN MR) and reports every
 gap whose both endpoints are BPSW-verified and whose merit is at least
 `--gap-hunt-min-merit`.  Merit is the **true record merit** `gap / ln(start)`
 (the prime-gap community convention, matching external verifiers) — NOT the
@@ -207,11 +260,17 @@ miner's nominal `gap / ln(2^(256+shift))` protocol merit.
 
 Windows are `P` apart (not contiguous), so gaps are chained only within a
 window; the first prime of each window is skipped for gap measurement
-(unknown predecessor).  Windows accumulate into **K=32 async MR batches**
-(tunable via `GAP_HUNT_BATCH`, 1..32) with two alternating flights: the host
-processes one collected batch while the GPU runs the next flight's MR kernel
-(measured on the dev host while mining runs: **893 win/s at K=32 vs 706 at
-K=16**; the M1 synchronous baseline was 480).  The walk is single-threaded by
+(unknown predecessor).  Windows accumulate into **K=64 async MR batches**
+(tunable via `GAP_HUNT_BATCH`, 1..64) with two alternating flights: the host
+processes one collected batch while the GPU runs the next flight's MR kernel.
+The batch is large because a chain round pays a **~4 ms per-LAUNCH floor** of the
+CGBN MR kernel (measured with `GAP_HUNT_TIMING=1`), which every window sharing
+the round amortizes; going 32 → 64 windows per round measured **+27% at shift507
+(1876 → 2386 win/s) and +21% at shift1017 (559 → 677 win/s)**. Cost is staging
+memory: the MR staging buffers are sized by `GPU_ADAPTER_MAX_BATCH` (320000
+candidates ≈ 200 MB per adapter at 20 limbs), and the walk auto-reduces the
+batch with a warning if a cover's windows hold so many survivors that a round
+would not fit.  The walk is single-threaded by
 design — `--threads` and the other miner flags are ignored in this mode; GPU
 concurrency comes from the K flights.  State is written to
 `--gap-hunt-state` every 1024 windows and on `SIGINT`/`SIGTERM`; `k` resumes
@@ -223,6 +282,9 @@ carries `win_s_avg`).
 
 ```bash
 # Requires WITH_CUDA=1 build (the same binary as the miner)
+# The chunk-parallel chain walk is the default (GAP_HUNT_JUMP2=1 since
+# 2026-09-15); it is 2.9-4x faster than the full-scan batch walk and finds the
+# same records.  Add GAP_HUNT_JUMP2=0 to fall back to the full scan.
 ./bin/gapminer --gap-hunt \
     --crt-file data/crt/m23/shift507_p74_lex_m30.txt \
     --gap-hunt-min-merit 15 \
@@ -287,7 +349,7 @@ covers are deployed in `gap_hunt_fleet.conf`.
 | `--threads <n>` | `1` | Worker threads |
 | `--shift <v>` | `26` | Non-CRT shift (`20..1024`); candidate = `256+shift` bits |
 | `--crt-file <path>` | none | Enable CRT covering mode; the file's shift overrides `--shift` |
-| `--sieve-primes <n>` | `50000` | Small-prime sieve limit. Non-CRT + `--enable-gpu-fermat`: adaptive bit-scaled default (`log2(depth)` interpolated between 282-bit → window+halo cover and 311-bit → 20M, clamped to `[cover, 20M]`; measured +14% win/s at shift 55, deeper than 20M makes the CPU sieve the bottleneck). With `HALF_CLASS` the 311-bit anchor drops to 5M (measured peak at shift 55: 5M = 609 win/s vs 20M = 391). CRT mode: `10000000` on CPU, `100000` on GPU, `2000000` on the fused GPU path (`FUSED_GPU=1`; measured on the production host at shift475 live merit: 500K=3183, 1M=3197, 2M=3324, 5M=3205 win/s — 2M is the optimum; older dev-host runs: shift258 3106 win/s at 1M vs 2814 at 5M, shift509 1971 vs 1905). GAP_HUNT: default **`10000000`** — the walk is CGBN-MR-bound, so deeper sieving trims survivors directly (shift1017: 2M=91, 10M=154, 20M=161 win/s; shift507: 667 vs 711; parity identical 411/411) |
+| `--sieve-primes <n>` | `50000` | Small-prime sieve limit. Non-CRT + `--enable-gpu-fermat`: adaptive bit-scaled default (`log2(depth)` interpolated between 282-bit → window+halo cover and 311-bit → 20M, clamped to `[cover, 20M]`; measured +14% win/s at shift 55, deeper than 20M makes the CPU sieve the bottleneck). With `HALF_CLASS` the 311-bit anchor drops to 5M (measured peak at shift 55: 5M = 609 win/s vs 20M = 391). CRT mode: `10000000` on CPU, `100000` on GPU, `2000000` on the fused GPU path (`FUSED_GPU=1`; measured on the production host at shift475 live merit: 500K=3183, 1M=3197, 2M=3324, 5M=3205 win/s — 2M is the optimum; older dev-host runs: shift258 3106 win/s at 1M vs 2814 at 5M, shift509 1971 vs 1905). GAP_HUNT: default **`2000000`** (lowered from 10M on 2026-09-15; re-measured with the chunked mark split and the jump2 chain on, where the curve is flat-then-falling: shift507 0.5M=1893, 1M=1908, 2M=1897, 5M=1819, 10M=1736, 20M=1558 win/s; shift1017 2M=599, 5M=596, 10M=593, 20M=538 — 2M is equal-best at both shifts with 5× less prime table and faster startup; record parity at 2M vs 10M verified: identical gap/merit/start over the same k range. The older "deeper sieving trims survivors directly" advice (2M=91, 10M=154, 20M=161 win/s at shift1017) was measured in the full-scan path *before* the mark split, when the host sieve dominated; it no longer holds in chain mode) |
 | `--merit <v>` | node difficulty | Merit threshold override (lower = more BPSW work) |
 | `--enable-submission` | off | Submit BPSW-verified gaps via `submitblock` |
 | `--coinbase-script-hex <hex>` | none (`OP_TRUE`) | Payout scriptPubKey for submitted blocks |
@@ -307,14 +369,19 @@ Environment variables:
 | Variable | Default | Description |
 |---|---|---|
 | `GPU_SIEVE` | off | Experimental GPU bitmap sieve (`1` enables; multi-GPU only) |
+| `GPU_SIEVE_TIMING` | off | CUDA-event accounting for the GPU sieve kernels: adds a `GPU kernel split` line to `ROLLING STATS` with the pure kernel time of the MR, mark and extract launches as a share of uptime (`gpu_sieve_accounted_mark_us` / `_extract_us`). In `--gap-hunt` it additionally prints a `stage us/window` line on the periodic tick (`mark=`/`extract=`/`mr=` per window and as a share of the window). Events are recorded around the launches and read after the stream sync those paths already perform, so no extra synchronization is added. Measured (RTX 3070, shift512 `p75_lex_m30`, difficulty ≈ 23.9, 1 thread, fused chain, chunk 32): **MR 45.6% + mark 31.2% + extract 5.6% = 82.4% of wall is GPU kernel execution** (nvidia-smi utilization 93%, the difference being gather/memset kernels and copies) — that was BEFORE the `GPU_MARK_SPLIT` rewrite; after it the mark share drops to 3.5% and the MR kernel becomes the wall (see `GPU_MARK_SPLIT`). Hunt (jump2, 2M hunt default, per window): shift1017 1683 µs total — mark 59 µs (3.5%) + extract 60 µs (3.6%) + **MR 1421 µs (84.5%)**; shift507 576 µs total — mark 46 µs (8.0%) + extract 30 µs (5.1%) + **MR 387 µs (67%)**, the rest host/gather overhead |
 | `GPU_SIEVE_BATCH` | `1024` | Windows per GPU bitmap-sieve batch (`1..4096`, autotuned) |
 | `FUSED_GPU` | off | Full GPU-resident CRT pipeline (sieve+extract+MR on-device; implies `GPU_SIEVE`, defaults to a 2M deep sieve) |
+| `FUSED_STAGE_TIMING` | off | Adds a `Fused stage split` line to `ROLLING STATS` with the host wall time of each fused stage (mark / extract / chain, plus the chain's own gather and MR round trips) as a percentage of uptime, and the chain round count. Costs four `clock_gettime` calls per window plus four per chain round — diagnostics only. Measured (RTX 3070, shift512 `p75_lex_m30`, live difficulty ≈ 23.9, 1 thread, fused chain): at chunk 32 **mark 20.8% + extract 36.2% (host side 57%) vs chain 42.0%** (gather 14.7%, MR round trip 27.0%) with ~16.6k chain rounds per 120 s ≈ 3 ms per round — i.e. after the chunk fix the host sieve side is the bottleneck, not the MR kernel. In the clean chunk-sweep runs the split was mark 35.3% / extract 11.1% / chain 51.8% (rounds 35479) at the default chunk 32 and 36.1% / 11.1% / 51.0% (rounds 23106) at chunk 64; with `GPU MR acc/wall = 0.492` and external `nvidia-smi` utilization **93% (50/50 samples ≥ 90%)** the fused path is GPU-saturated, so the non-MR ~50% of wall is the mark/extract kernels, **not idle time** — hiding the chain round trip (second in-flight context) buys nothing |
 | `GPU_MR_BATCH` | `8` | Windows per accumulated MR batch on the fused path (`1..8`; `1` = per-window, the old behavior). One `gpu_fermat_submit_device` per K windows instead of K small-batch launches. Measured on the dev host (RTX 3070, 8 workers, 20s runs, 0 failures): shift258 K=1 3047 → K=8 **5715 (+88%)**; shift509 K=1 1971 → K=8 **3211 (+63%)**. K=8 vs K=4 (all wins, no regressions): +6.5% (258), +2.7% (450), +4.5% (509), +1.4% (657), +0.7% (720), +1.9% (1008). Candidate counts per window are identical across K (verified per shift). Memory note: K=8 sizes the device candidate buffers at 8 windows; on ≤4 GB cards with 8 workers at shifts ≥ 1008 this may OOM and fail-closed to the CPU path |
 | `GPU_SIEVE_PAIR` | off | Experimental 2-window pair-batched fused mark (one kernel writes both ping-pong bitmaps). Measured **-58%** win/s on the dev host (8 workers / 1 GPU, shift258: 1262 vs 3022); the monolithic kernel starves extract/MR kernels at the GPU scheduler. Benchmark-gated — do not enable in production |
-| `CRT_ROWS_BATCH` | `64` | CRT row-walk (Horizon-style): one header nonce yields several aligned bases `base + m·P` (P = the cover primorial), amortizing the per-window SHA256 + CRT alignment over a batch of rows (`0` disables, `1..1024`; the remaining nonce space `(2^shift − nadd0)/P` also bounds the rows). On the fused GPU path (`FUSED_GPU=1`) rows > 1 additionally switch to the **row-batch mark**: one residue sweep computes `base mod p` AND `P mod p` on-device, then one kernel marks all row bitmaps (row r of the arena = `base + r·P`). The per-row first-odd-offset flips with the row parity only when P is odd (some covers have an even primorial P — the even-P grid bug was caught by a false-gap flood and fixed; `test_gpu_sieve` covers both step parities). Measured at shift507 live difficulty (4 threads, fused path): **2319 win/s (rows=64) vs 2348 (rows=1)** — statistically neutral; the per-window residue cost was not the bottleneck at this configuration. Correctness: parity-verified per row vs the CPU sieve. Example: `FUSED_GPU=1 CRT_ROWS_BATCH=64 ./bin/gapminer --crt-file data/crt/m23/shift507_p74_lex_m30.txt --threads 4 --enable-gpu-fermat` |
-| `MINING_JUMP2` | off | **No-test chain** (Horizon M19-style certificates) on the fused CRT mining path: per-window backward-search chain in chunked MR rounds shared across K flight windows (~3× fewer MR tests per window; stops at the merit frontier — every skipped interior gap is provably below threshold). Works with `HALF_CLASS`/`QUARTER_CLASS` (the chain walks the class-filtered survivor list; reported visible pairs are identical to the full scan's and hidden interiors are resolved by the existing on-demand machinery). Each worker owns its GPU contexts (gather staging is per-worker), so the chain runs on every worker independently; with the round-robin device assignment (`gpu_device = i % gpu_count`) set `--threads` to the number of GPUs for one chain per card. Fail-closed: any chain error falls back to a full scan of the same flight, then to the CPU path. Disables the gap-dist health histogram (the frontier cut distorts small-gap frequencies, same policy as `HALF_CLASS`). Parity-verified via `MINING_JUMP2_VERIFY` vs the full scan: **0 mismatched merit-candidate sets** at shift507 (2370 flights) and shift998. Measured on the dev host (RTX 3070, shift507 live merit, 1 thread): **2953 win/s at K=64 vs 1961 full-scan (+51%)** (K=32: 2514; K=128: 3115); 2 chain workers on the same 3070: **3639 win/s**; single-thread chain also beats the 4-thread full-scan (2319 win/s). Class modes (parity-verified, 0 mismatches): `HALF_CLASS` 1973 → **2630 (+33%)**, `QUARTER_CLASS` 928 → **1018 (+9.7%)** (quarter stays host-bound at 1 thread). Example: `MINING_JUMP2=1 FUSED_GPU=1 GPU_SIEVE=1 ./bin/gapminer --crt-file data/crt/m23/shift507_p74_lex_m30.txt --threads 1 --enable-gpu-fermat` |
+| `CRT_ROWS_BATCH` | `64` | CRT row-walk (Horizon-style): one header nonce yields several aligned bases `base + m·P` (P = the cover primorial), amortizing the per-window SHA256 + CRT alignment over a batch of rows (`0` disables, `1..1024`; the remaining nonce space `(2^shift − nadd0)/P` also bounds the rows — ~64 rows at shift507 with the p74 cover (log2 P = 500.5), only ~8 at shift512 with the p75 cover (log2 P = 509.0)). On the fused GPU path (`FUSED_GPU=1`) rows > 1 additionally switch to the **row-batch mark**: one residue sweep computes `base mod p` AND `P mod p` on-device, then one kernel marks all row bitmaps (rank-major: thread = prime, rows in the inner loop). The per-row first-odd-offset flips with the row parity only when P is odd (some covers have an even primorial P — the even-P grid bug was caught by a false-gap flood and fixed; `test_gpu_sieve` covers both step parities). Measured at shift507 with kernel accounting (`GPU_SIEVE_TIMING=1`, fused chain, chunk 32, 1 thread, 120 s): **rows=64 → 2861 win/s vs 2428 with the row walk off (+17.8%)**; mark cost only drops 0.138 → 0.121 ms/window while the per-window SHA256/alignment/launch bucket drops 0.077 → 0.032 ms/window (this supersedes the older "statistically neutral at 4 threads" note). Correctness: parity-verified per row vs the CPU sieve. With `GPU_MARK_SPLIT` (default on) the dense part (`p ≤ window`) of that marking is chunked over (prime, row, chunk) work items instead of one thread per prime — see `GPU_MARK_SPLIT` below (that is where the row batch's mark cost went: 32% → 3.5% of wall). Example: `FUSED_GPU=1 CRT_ROWS_BATCH=64 ./bin/gapminer --crt-file data/crt/m23/shift507_p74_lex_m30.txt --threads 4 --enable-gpu-fermat` |
+| `GPU_MARK_SPLIT` | on | Dense marking for primes `p ≤ window` is done by **chunked work items** — one per (prime, row, odd-slot chunk) — instead of the per-prime walk (rows in the inner loop), on **all three** fused marking shapes: the CRT row batch, the single-window mark (`rows == 1`, e.g. `CRT_ROWS_BATCH=0`) and the 2-window pair batch (`GPU_SIEVE_PAIR=1`). Same slots marked (bit-exact: `test_gpu_sieve` `split-rows` + `pair rows1` cases cover both stride parities, the split+sparse mixed table, forced chunk sizes and both ping-pong windows) at **~9–14× less mark kernel time**: **+47–55%** windows/s on the row batch (shift512 and shift507), **+43%** single-window (`CRT_ROWS_BATCH=0`: 2399 → 3439 win/s, mark 33.7% → 5.3% of wall), **+40%** pair batch (2400 → 3354, mark 33.7% → 5.2%), and **+16%** on the standalone `--gap-hunt` walk used by the fleet (shift507, min-merit 19, default 10M hunt depth: 724/726 → 839/845 win/s, order swapped — smaller because the walk is CGBN-MR-bound). Cost model behind it (`tools/bench_mark.cu`, `make bin/bench_mark WITH_CUDA=1`): the old walk's time is set by the warp with the longest trip count (the `p = 3..131` warp walks `W/3` slots per row) and 73% of it is the marking loop, **not** the atomic store — which is why cutting atomics by 4.5× was a −15% regression and why the 100k→2M sieve-depth sweep was flat. `0` disables (falls back to the per-prime walks, byte-for-byte the old behavior); it also fails closed to them if the prime table is not ascending (the split domain is the `p ≤ window` prefix of the table). Expensive MR tests per window unchanged in all A/Bs and `MINING_JUMP2_VERIFY` parity clean (1173 flights at rows=64, 1138 at rows=1). Example: `GPU_MARK_SPLIT=0 FUSED_GPU=1 ./bin/gapminer --crt-file data/crt/m23/shift512_p75_lex_m30.txt --threads 1 --enable-gpu-fermat` |
+| `GAP_HUNT_TIMING` | off | Hunt diagnostics: adds three lines to the periodic tick — **GPU kernel split** (mark/extract/MR per window and as a share of the window; arms the same CUDA-event accounting as `GPU_SIEVE_TIMING`, which it enables automatically), **host stage split** (setup / mark / extract / submit / detect per window) and **chain bookkeeping** (MR candidates tested per window and chain rounds per 1000 windows). Diagnostics only — leave it off in production. Measured at shift1017 `p130_lex_m30`, jump2, chunk 64, 2M depth (RTX 3070): window 1748 µs — **MR 1538 µs (88%)**, extract 68 µs (4%), mark 32 µs (2%), with ~65 µs (3.5%) of host-side call time outside the kernels → the walk is MR-throughput bound and the host sieve side is no longer a lever. At shift507 the same split is MR 387 µs (67%) of a 576 µs window (mark 8%, extract 5%) |
+| `GPU_MARK_SPLIT_SLOTS` | `160` | Odd slots per marking chunk when `GPU_MARK_SPLIT` is active (clamped to `32..4096`; chunks per row = `ceil(window / slots)`, capped at 1024). The optimum is broad: 32–128 chunks per row all land within noise at shift512 (isolated bench: 21 µs at 64 chunks vs 42 µs at 8 chunks vs 757 µs for the per-prime row walk). Example: `GPU_MARK_SPLIT_SLOTS=64 FUSED_GPU=1 ./bin/gapminer --crt-file data/crt/m23/shift512_p75_lex_m30.txt --threads 1 --enable-gpu-fermat` |
+| `MINING_JUMP2` | **on** | **No-test chain** (Horizon M19-style certificates) on the fused CRT mining path: per-window backward-search chain in chunked MR rounds shared across K flight windows (~3× fewer MR tests per window; stops at the merit frontier — every skipped interior gap is provably below threshold). **Default on since 2026-09-15** (measured +70–76% windows/s, see below); `MINING_JUMP2=0` restores the full scan. **Inert without `FUSED_GPU=1`** (the chain lives on the fused pipeline; without that gate `chain_on` stays 0 and the run is a plain full scan). Works with `HALF_CLASS`/`QUARTER_CLASS` (the chain walks the class-filtered survivor list; reported visible pairs are identical to the full scan's and hidden interiors are resolved by the existing on-demand machinery). Each worker owns its GPU contexts (gather staging is per-worker), so the chain runs on every worker independently; with the round-robin device assignment (`gpu_device = i % gpu_count`) set `--threads` to the number of GPUs for one chain per card. Fail-closed: any chain error falls back to a full scan of the same flight, then to the CPU path. Disables the gap-dist health histogram (the frontier cut distorts small-gap frequencies, same policy as `HALF_CLASS`). Parity-verified via `MINING_JUMP2_VERIFY` vs the full scan: **0 mismatched merit-candidate sets** (2370 flights at shift507, 1173 at shift512 rows=64, 1138 at `CRT_ROWS_BATCH=0`). A/B on the dev host (RTX 3070, fused chain, 1 thread, default chunk 32, `GPU_MARK_SPLIT` on, 90 s per point, order swapped): shift512 `p75_lex_m30` **2353 / 2300 win/s full-scan → 4002 / 3994 with the chain (+70%)**, shift507 `p74_lex_m30` **2416 / 2423 → 4275 / 4250 (+76%)**, with expensive MR tests per window **620.7 / 622.0 → 120.1 / 120.5 (5.2× fewer)** at the same settings. (An earlier 300 s A/B measured +41%/+51% — the gain is larger now because the mark kernel no longer dominates the window.) Class modes (parity-verified, 0 mismatches): `HALF_CLASS` 1973 → **2630 (+33%)**, `QUARTER_CLASS` 928 → **1018 (+9.7%)** (quarter stays host-bound at 1 thread). 2 chain workers on one 3070: `3639 win/s` vs `2953` for one. Example: `MINING_JUMP2=0 FUSED_GPU=1 ./bin/gapminer --crt-file data/crt/m23/shift507_p74_lex_m30.txt --threads 1 --enable-gpu-fermat` |
 | `MINING_JUMP2_BATCH` | `64` | Windows per chain flight (`1..128`); the per-round gather/submit/collect latency is amortized over K windows (measured: +17% K=32→64, +5.5% K=64→128) |
-| `MINING_JUMP2_CHUNK` | `64` | Survivor chunk size for one backward-search step (`8..512`) |
+| `MINING_JUMP2_CHUNK` | `32` | Survivor chunk size for one backward-search step (`8..512`). Measured (RTX 3070, shift512 `p75_lex_m30`, live difficulty ≈ 23.9, 1 thread, fused path): chunk 32 and 64 give the same throughput (2736 vs 2751 win/s, within noise) but 32 needs **1.66× fewer expensive MR tests per window** (120.5 vs 200.2) — same speed with real MR headroom. Chunk 16 is latency-bound (2069 win/s, 87.4 tests/window); chunk 128 wastes tests (384.5/window) and is slower (2163 win/s) |
 | `MINING_JUMP2_VERIFY` | off | Dev-only parity check: full-scans every flight and compares the emitted merit-candidate sets with the chain (doubles MR work — benchmark/validation only) |
 | `HALF_CLASS` | off | Two-pass scan: sieve/test only residues `{1,7,11,13,17,19,23,29} mod 60`, verify the hidden classes on demand (~2× fewer MR candidates; non-CRT +87% at shift 55, CRT fused +14.6% at shift509); disables the gap-dist health histogram. In CRT mode the covering template pre-filters the verification and the back-lookahead stays unfiltered |
 | `QUARTER_CLASS` | off | Generalizes `HALF_CLASS` to 4 visible / 12 hidden coprime classes (`{1,7,11,13} mod 60` visible). The containment lemma (every true qualifying gap is contained in a visible qualifying gap) guarantees no blocks are lost while the GPU MR load halves. Hidden resolution runs on the GPU MR pipeline (base-2+3 batch + BPSW only on MR survivors; falls back to the CPU path without CUDA), and the fused head is extended ~12·logbase in this mode to keep tail re-marks rare. Measured on the dev host (RTX 3070, fused path, live difficulty): **3515 win/s vs 3176 for `HALF_CLASS` (+10.7%)**, tails skipped 99.4%, GPU-bound (acc/wall 2.8). Parity-exactness unit tests green; production A/B on the dual-3060 box pending |
@@ -322,11 +389,11 @@ Environment variables:
 | `GAPMINER_CPU_WINDOW_OVERRIDE` | `4` | Force the CPU limb path's exponentiation window width (`3`, `4` or `5`; `4` is the specialized default) |
 | `GAPMINER_CPU_WINDOW_LOG` | off | Log the selected window width once per limb count (diagnostic) |
 | `GAPDEBUG` | off | CRT gap diagnostics (HALF_CLASS and full-class modes): for every emitted gap, log to stderr the window class, gap class endpoints, and the interior candidates with their MR flags; in HALF_CLASS mode also logs `[HIDDBG]` hidden-class resolution counters (candidates tested / primes found per resolved interval). Used to trace false-gap regressions; verbose — development only |
-| `GAP_HUNT_BATCH` | `32` | GAP_HUNT windows per accumulated MR batch (`1..32`). Measured on the dev host (RTX 3070, mining running): **893 win/s at 32 vs 706 at 16 vs 808 at K=8**; batches are guarded against silent truncation at the 160000-candidate MR limit (fail-closed) |
+| `GAP_HUNT_BATCH` | `64` | GAP_HUNT windows per accumulated MR batch (`1..64`; default raised from 32 on 2026-09-15). A chain round has a ~4 ms per-launch floor in the CGBN MR kernel, so more windows per round = cheaper rounds: measured shift507 **1876 → 2386 win/s (+27%)** and shift1017 **559 → 677 win/s (+21%)** going 32 → 64 at the same tested-candidates-per-window. Batches are guarded against silent truncation at the `GPU_ADAPTER_MAX_BATCH` (320000) staging limit and the walk auto-reduces the batch with a warning if a round would not fit (fail-closed) |
 | `GAP_HUNT_QUARTER` | off | **FALSIFIED experiment** — 4-visible-class scan + on-demand hidden resolution (containment lemma, exact — parity-tested identical to full-class). At record thresholds (merit ≥ 15) the visible-gap trigger fires ~1.3×/window (visible gaps inherit the σ-tail with mean merit ≈ 8) and CPU resolution costs ~40 ms each → 46 win/s vs 893 full-class. Kept off; exact but not profitable |
 | `GAP_HUNT_KMAX` | none | Stop the walk at this k (tests/benchmarks) |
 | `GAP_HUNT_JUMP` | off | **FALSIFIED experiment** — Kehrig-style per-window serial CGBN walk (jump-by-threshold + backward search, ~1.5 MR tests per prime instead of all survivors). Exact: parity-identical gap sets on shift507 (299/299) and shift1017 (411/411). But 6.3× slower at shift1017 (23.5 vs 147 win/s) — CGBN cooperative-test latency (~10 ms/test under load) cannot be hidden by 32-way window parallelism. Follow-up diagnosis: the 1017 batch path is **MR-bound** (147 win/s × 2,675 survivors = 393k tests/s ≈ CGBN AL=20 capacity scaled from the 907k/s AL=12 measurement); `GPU_FERMAT_TPI` 16/32 are slower than 8 at AL=20 (66 vs 44 vs 24 win/s). Kept off; reopen trigger: per-thread low-latency MR or a quiet dedicated GPU |
-| `GAP_HUNT_JUMP2` | off | **Chunk-parallel backward search (Kehrig-exact, latency-free)** — the same jump-by-threshold chain semantics as `GAP_HUNT_JUMP`, but each step tests a CHUNK of survivors batched across all 32 windows in one tight MR submit (gather kernel → `gpu_fermat_submit_device`), so the cooperative-test latency that killed the serial jump is hidden. Parity-verified: gap sets byte-identical to the full-scan batch path on shift507 (KMAX=128), shift1017 (KMAX=64), and the full 188k-window production range on shift998 (k 12819456..13007648, `test_gap_hunt` bad=0). A production false-gap bug (stale per-flight `jump_s/jump_e` pairs re-emitted against later windows) was fixed by resetting the per-fill record slots; `verify_gap_candidate.py` confirms the strict interior scan. Measured on the dev host (RTX 3070, record walker sharing the GPU, shift1017 merit 20): **~486 win/s vs ~159 full-scan = 3.0×** (stable across runs). Fail-closed: any CUDA error falls back to the batch path. `GAP_HUNT_JUMP2_CHUNK` (default 64, 8..512) sets the per-window chunk size; 64 measured optimal (32 → 402 win/s, 128 → 386 win/s) |
+| `GAP_HUNT_JUMP2` | **on** | **Chunk-parallel backward search (Kehrig-exact, latency-free)** — the same jump-by-threshold chain semantics as `GAP_HUNT_JUMP`, but each step tests a CHUNK of survivors batched across all K windows (default 64) in one tight MR submit (gather kernel → `gpu_fermat_submit_device`), so the cooperative-test latency that killed the serial jump is hidden. Parity-verified: gap sets byte-identical to the full-scan batch path on shift507 (KMAX=128), shift1017 (KMAX=64), and the full 188k-window production range on shift998 (k 12819456..13007648, `test_gap_hunt` bad=0). A production false-gap bug (stale per-flight `jump_s/jump_e` pairs re-emitted against later windows) was fixed by resetting the per-fill record slots; `verify_gap_candidate.py` confirms the strict interior scan. Measured on the dev host (RTX 3070, record walker sharing the GPU, shift1017 merit 20): **~486 win/s vs ~159 full-scan = 3.0×** (stable across runs). Fail-closed: any CUDA error falls back to the batch path. `GAP_HUNT_JUMP2_CHUNK` (default **32** since 2026-09-15, 8..512) sets the per-window chunk size; it is coupled to `GAP_HUNT_BATCH`: with a 64-window batch the optimum is the smaller chunk (shift1017: chunk 32 → 679 win/s at 268 tests/window vs chunk 64 → 664 win/s at 390 tests/window; shift507: 2406 win/s at 222 tests vs 2283 at 369), while at K=32 the old default of 64 was better (425 vs 559 win/s) — a chain round pays a fixed per-launch floor, so the two knobs must be tuned together. **Re-measured 2026-09-15 with the current defaults** (`GPU_MARK_SPLIT` on, 2M hunt depth, fixed k ranges of 16384 windows, no competing GPU work): shift507 **888 win/s full-scan → 1799 win/s with jump2 (+103%)**, shift1017 **170 → 579 win/s (3.4×)** at the then-default K=32/chunk 64; with the 2026-09-15 defaults (K=64, chunk 32) the same fixed k ranges measure **2386 win/s (shift507, +27% vs K=32) and 677 win/s (shift1017, +21%)**. Chunk re-swept at K=64 (shift1017): 8=262, 16=456, 24=577, **32=679**, 64=664 win/s — with the bigger batch the optimum moves to the smaller chunk. With the mark split in place the walk is now **MR-throughput bound**: `GPU_SIEVE_TIMING=1` reports mark 3.5% + extract 3.6% + **MR 84.5%** of the window at shift1017 (shift507: 8.0% + 5.1% + 67%), so the remaining levers are the MR tier itself (per-test cost/rejected-candidate count), not the host sieve side. Chain trade-off measured with `GAP_HUNT_TIMING=1` at shift1017 (tests the chain submits vs the rounds it needs): chunk 16 → **216 tests/window, 879 rounds/1k-windows, 283 win/s**; chunk 32 → 266 tests, 490 rounds, **455 win/s**; chunk 64 → **386 tests, 300 rounds, 563 win/s**; chunk 128 → 673 tests, 222 rounds, 437 win/s. Smaller chunks really do test fewer candidates (44% fewer at chunk 16), but every round costs a gather+submit+collect+sync, so the optimum sits where that fixed cost balances the candidate count — and it MOVES with the batch (K=32 → chunk 64; K=64 → chunk 32), because the fixed cost is per LAUNCH, not per candidate. Host-side batching was evaluated and rejected: the host contributes only ~3.5% of the window, so batching the per-window D2H/state work has no measurable headroom |
 
 ## Testing
 
@@ -364,6 +431,19 @@ summed `acc` equals the GPU's total busy time. Interpreting the ratio:
 
 The metric is only meaningful with GPU MR active and stays `0.000` in pure-CPU
 runs or when the GPU path is disabled.
+
+The same block reports the expensive-test density on a `GPU MR tests` line:
+
+```
+GPU MR tests: 47185920 (90.0/window, 78.8 per 1000 survivors)
+```
+
+`GPU MR tests` is the number of candidates actually submitted to the GPU MR
+kernel (not the number of sieve survivors). In full-scan mode it tracks the
+survivor count; in `MINING_JUMP2` chain mode it drops to the frontier candidates
+only. Both ratios are geometry-independent and are the metric to compare against
+other miners' per-row test counts (e.g. a 74-prime/S512 cover with 761
+candidates/row and ~19 expensive tests/row).
 
 In `MINING_JUMP2` mode the `Max Euler pair` line reports the largest **chain certificate span** (≈ active difficulty by construction: the frontier jump pair's gap is `ceil(difficulty·logbase) − ε`, always just below the threshold), not a true consecutive-prime pair — the true per-window max pair (full-scan) is the cross-cover gap ≈ 9-10k (merit ~17-19). `Merit candidates`/BPSW/submission are unaffected (parity-verified, 0 mismatches).
 

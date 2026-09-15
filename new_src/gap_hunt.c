@@ -143,15 +143,57 @@ static int load_state(const char *path, uint64_t *k, mpz_t last_prime,
    submission.  Two flights alternate: while the host processes the
    collected flight, the GPU runs the other flight's MR kernel. */
 
-#define GAP_HUNT_BATCH_MAX 32
-static int g_batch = 32;       /* GAP_HUNT_BATCH env, clamped 1..MAX */
+/* Windows per MR batch.  Raised 32 -> 64 (2026-09-15): the chain's rounds are
+   dominated by a ~4 ms per-LAUNCH floor of the CGBN MR kernel (measured with
+   GAP_HUNT_TIMING=1: 512 candidates/round -> 4.1 ms, 2048 -> 5.3 ms, i.e.
+   ~3.6 ms fixed + 0.76 us/test), so every window in a round pays that floor
+   divided by the number of windows sharing it.  More windows per round =
+   cheaper rounds; the device cost is only the gather/candidate buffers
+   (K x chunk x limbs), well within the 160000-candidate adapter cap. */
+#define GAP_HUNT_BATCH_MAX 64
+/* Default 64 (was 32).  A chain round has a ~4 ms per-LAUNCH floor, so the
+   windows sharing a round split it: doubling the batch is worth +21% (shift1017
+   559 -> 679 win/s) and +28% (shift507 1876 -> 2406 win/s) with the same tested
+   candidates per window. */
+static int g_batch = 64;       /* GAP_HUNT_BATCH env, clamped 1..MAX */
 static int g_quarter = 0;      /* GAP_HUNT_QUARTER env: 4-visible-class scan */
 static uint64_t g_kmax = 0;    /* GAP_HUNT_KMAX env: stop hook (tests/bench) */
 #define GAP_HUNT_JUMP_CAP 16   /* per-window gap capacity in jump mode */
 static int g_jump = 0;         /* GAP_HUNT_JUMP env: Kehrig-style walk */
-#define GAP_HUNT_JUMP2_CHUNK_DEFAULT 64
-static int g_jump2 = 0;        /* GAP_HUNT_JUMP2 env: chunk-parallel walk */
+/* Per-window chunk cap for the chain.  Default 32 (was 64): with a 64-window
+   batch the round floor is amortized, so the optimum moves to the smaller
+   chunk that tests fewer candidates per window (measured shift1017: K=64
+   chunk 32 -> 679 win/s with 268 tests/window vs K=64 chunk 64 -> 664 win/s
+   with 390 tests/window; shift507: 2406 win/s @222 tests vs 2283 @369).  It is
+   coupled to GAP_HUNT_BATCH: at K=32, chunk 32 is worse than 64. */
+#define GAP_HUNT_JUMP2_CHUNK_DEFAULT 32
+static int g_jump2 = 1;        /* GAP_HUNT_JUMP2=0 restores the full scan */
 static int g_jump2_chunk = GAP_HUNT_JUMP2_CHUNK_DEFAULT;
+
+/* Optional HOST-stage accounting (GAP_HUNT_TIMING=1, diagnostics only).  The
+   walk's windows/s is only meaningful if the host side is not the wall, so the
+   per-window host cost is split into the four things the host actually does:
+   window setup (mpz base/wb + limb export), the mark call, the extract call,
+   the MR submit (jump2 chunk scan or batched submit) and the collect+detect
+   gap processing.  Printed on the periodic tick next to the GPU kernel line. */
+static int g_host_timing = 0;
+static uint64_t g_ht_setup, g_ht_mark, g_ht_extract, g_ht_submit, g_ht_process;
+
+/* Chain bookkeeping for the same diagnostic line: how many MR candidates the
+   jump2 chain actually submitted and in how many rounds (the two numbers that
+   decide whether the walk is MR-throughput bound or round-latency bound). */
+static uint64_t g_j2_tests, g_j2_rounds;
+
+/* Round-internal split for the same diagnostic line: a chain round is
+   gather -> submit -> collect, and at small chunks the FIXED part of a round
+   (not the MR work) decides whether small chunks are viable. */
+static uint64_t g_rt_gather_us, g_rt_submit_us, g_rt_collect_us;
+
+static uint64_t gh_now_us(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * 1000000ULL + (uint64_t)(ts.tv_nsec / 1000);
+}
 
 struct gh_batch {
     int active;                 /* submitted, not yet collected */
@@ -296,6 +338,7 @@ static int gh_jump2_scan(struct gh_batch *b, int slot, struct gh_ctx *g,
         }
         if (total > 0) {
             uint32_t gathered = 0;
+            uint64_t rt0 = g_host_timing ? gh_now_us() : 0;
             if (gpu_fermat_gather_run(g->fermat,
                     gpu_sieve_candidate_buffer(g->sieve, slot),
                     b->cum, lo, hi, dcum, K, g->fermat_limbs,
@@ -304,6 +347,7 @@ static int gh_jump2_scan(struct gh_batch *b, int slot, struct gh_ctx *g,
                         "gathered=%u K=%u\n", total, gathered, K);
                 return 0;
             }
+            uint64_t rt1 = g_host_timing ? gh_now_us() : 0;
             if (gpu_fermat_submit_device(g->fermat, slot,
                     gpu_fermat_gather_buffer(g->fermat),
                     (size_t)total) < 0) {
@@ -311,11 +355,20 @@ static int gh_jump2_scan(struct gh_batch *b, int slot, struct gh_ctx *g,
                         total);
                 return 0;
             }
+            uint64_t rt2 = g_host_timing ? gh_now_us() : 0;
+            g_j2_tests += total;
+            g_j2_rounds++;
             if (gpu_fermat_collect(g->fermat, slot, flags,
                                    (size_t)total) < 0) {
                 fprintf(stderr, "[GAP_HUNT] jump2 collect fail: total=%u\n",
                         total);
                 return 0;
+            }
+            if (g_host_timing) {
+                uint64_t rt3 = gh_now_us();
+                g_rt_gather_us += rt1 - rt0;
+                g_rt_submit_us += rt2 - rt1;
+                g_rt_collect_us += rt3 - rt2;
             }
         }
 
@@ -421,6 +474,7 @@ static int gh_batch_fill(struct gh_batch *b, int slot, uint64_t k0,
                          struct gh_ctx *g, uint8_t *flags) {
     uint32_t cum = 0;
     for (uint32_t i = 0; i < (uint32_t)g_batch; i++) {
+        uint64_t ht0 = g_host_timing ? gh_now_us() : 0;
         uint64_t k = k0 + i;
         b->base_k[i] = k;
         mpz_set(g->bk, g->b0);
@@ -450,6 +504,11 @@ static int gh_batch_fill(struct gh_batch *b, int slot, uint64_t k0,
             odd_size = (g->interval - first_odd_offset + 1ULL) >> 1;
 
         int buf = (int)(i & 1);
+        if (g_host_timing) {
+            uint64_t ht1 = gh_now_us();
+            g_ht_setup += ht1 - ht0;
+            ht0 = ht1;
+        }
         if (!gpu_sieve_mark_from_base(g->sieve, odd_size, first_odd_offset,
                                       g->base_limbs, g->gpu_limbs, buf,
                                       g->primes, g->inv_p, g->prime_count,
@@ -462,6 +521,11 @@ static int gh_batch_fill(struct gh_batch *b, int slot, uint64_t k0,
             return 0;
         }
 
+        if (g_host_timing) {
+            uint64_t ht1 = gh_now_us();
+            g_ht_mark += ht1 - ht0;
+            ht0 = ht1;
+        }
         uint64_t class_mask =
             g->quarter ? halfclass_visible_mask() : UINT64_MAX;
         /* The extract filter classes VALUES by (base + offset) mod 60 —
@@ -522,11 +586,17 @@ static int gh_batch_fill(struct gh_batch *b, int slot, uint64_t k0,
             b->count[i] = nc + nc2;
             cum += nc2;
         }
+        if (g_host_timing) {
+            uint64_t ht1 = gh_now_us();
+            g_ht_extract += ht1 - ht0;
+            ht0 = ht1;
+        }
     }
     b->cum[g_batch] = cum;
     b->n_windows = (uint32_t)g_batch;
     b->total = cum;
     b->slot = slot;
+    uint64_t ht_s = g_host_timing ? gh_now_us() : 0;
     if (cum == 0)
         return 1;               /* nothing to MR-test; process as empty */
     if (g->jump2) {
@@ -537,6 +607,7 @@ static int gh_batch_fill(struct gh_batch *b, int slot, uint64_t k0,
                     (unsigned long long)k0);
             return 0;
         }
+        if (g_host_timing) g_ht_submit += gh_now_us() - ht_s;
         return 1;
     }
     if (g->jump) {
@@ -575,6 +646,7 @@ static int gh_batch_fill(struct gh_batch *b, int slot, uint64_t k0,
                 b->jump_e[i][jj] = (uint32_t)pair;
             }
         }
+        if (g_host_timing) g_ht_submit += gh_now_us() - ht_s;
         return 1;
     }
     uint64_t *d_batch = gpu_sieve_candidate_buffer(g->sieve, slot);
@@ -585,6 +657,7 @@ static int gh_batch_fill(struct gh_batch *b, int slot, uint64_t k0,
         return 0;
     }
     b->active = 1;
+    if (g_host_timing) g_ht_submit += gh_now_us() - ht_s;
     return 1;
 }
 
@@ -785,8 +858,15 @@ int gap_hunt_run(const struct gap_hunt_config *cfg) {
         const char *jv = getenv("GAP_HUNT_JUMP");
         if (jv && jv[0] && atoi(jv) > 0)
             g_jump = 1;
+        /* GAP_HUNT_JUMP2 (chunk-parallel Kehrig chain) is ON by default since
+           2026-09-15: measured +169% at shift507 (888 -> 2386 win/s) and +300%
+           at shift1017 (170 -> 677 win/s) vs the full-scan batch walk, with
+           byte-identical gap sets (parity verified at 507/998/1017 and by
+           test_gap_hunt).  GAP_HUNT_JUMP2=0 restores the full-scan walk. */
         const char *j2v = getenv("GAP_HUNT_JUMP2");
-        if (j2v && j2v[0] && atoi(j2v) > 0)
+        if (j2v && j2v[0] && atoi(j2v) <= 0)
+            g_jump2 = 0;
+        else
             g_jump2 = 1;
         const char *j2c = getenv("GAP_HUNT_JUMP2_CHUNK");
         if (j2c && j2c[0]) {
@@ -852,8 +932,19 @@ int gap_hunt_run(const struct gap_hunt_config *cfg) {
         return 1;
     }
 
+    /* GAP_HUNT_TIMING=1 must also turn on the gpu_sieve CUDA-event accounting,
+       which is armed at gpu_sieve_init() below, so it has to be exported
+       BEFORE that init (otherwise the kernel line reports zeros while the
+       host line reports real numbers). */
+    {
+        const char *ht = getenv("GAP_HUNT_TIMING");
+        if (ht && ht[0] && ht[0] != '0') {
+            setenv("GPU_SIEVE_TIMING", "1", 1);
+        }
+    }
+
     /* Deep-sieve prime table (same engine the miner uses). */
-    uint32_t sieve_primes = cfg->sieve_primes ? cfg->sieve_primes : 10000000U;
+    uint32_t sieve_primes = cfg->sieve_primes ? cfg->sieve_primes : 2000000U;
     struct sieve_core sieve;
     memset(&sieve, 0, sizeof(sieve));
     if (!sieve_core_init_window(&sieve, interval, sieve_primes)) {
@@ -927,6 +1018,30 @@ int gap_hunt_run(const struct gap_hunt_config *cfg) {
     }
     base_limbs = (uint64_t *)calloc((size_t)gpu_limbs, sizeof(uint64_t));
     size_t win_cap = (size_t)sieve.candidate_capacity;
+    /* Batch/round guard: one chain round submits up to g_batch x survivors
+       candidates, and the MR staging buffers (GPU_ADAPTER_MAX_BATCH) must hold
+       them -- the fill fails closed otherwise.  NOTE: win_cap is the per-window
+       CAPACITY (an upper bound), not the survivor count; clamping with it would
+       shrink the batch to a handful of windows (measured: batch 6 at shift507,
+       3 at shift1017 -> 420 and 67 win/s).  Use the observed survivor density
+       instead: a CRT cover leaves ~1/8 of the odd slots as survivors, so
+       odd_interval_size/8 is a realistic estimate with margin, and the hard
+       `cum + nc > cap` check in the fill remains the final guard. */
+    {
+        uint64_t est = (uint64_t)(odd_interval_size / 8U);
+        if (est < 1) est = 1;
+        if ((uint64_t)g_batch * est > GPU_ADAPTER_MAX_BATCH) {
+            int nb = (int)(GPU_ADAPTER_MAX_BATCH / est);
+            if (nb < 1) nb = 1;
+            if (nb != g_batch) {
+                fprintf(stderr, "[GAP_HUNT] batch reduced %d -> %d "
+                                "(est survivors/window=%llu, cap %u)\n",
+                        g_batch, nb, (unsigned long long)est,
+                        GPU_ADAPTER_MAX_BATCH);
+                g_batch = nb;
+            }
+        }
+    }
     uint64_t *offsets = (uint64_t *)malloc(
         2U * (size_t)g_batch * win_cap * sizeof(uint64_t));
     uint8_t *flags = (uint8_t *)malloc(
@@ -995,6 +1110,29 @@ int gap_hunt_run(const struct gap_hunt_config *cfg) {
     t_last = t0;
     uint64_t win_last = 0;
 
+    /* Optional per-stage GPU accounting on the periodic line
+       (GPU_SIEVE_TIMING=1).  Mark/extract come from the gpu_sieve CUDA events,
+       MR from the fermat context events; all three are cumulative counters, so
+       the tick prints the DELTA divided by the windows in the tick -> us/window
+       and the share of the tick's wall time.  Diagnostics only: off by default
+       so production walk rates are not perturbed. */
+    const char *stage_timing_env = getenv("GPU_SIEVE_TIMING");
+    int stage_timing = (stage_timing_env && stage_timing_env[0] &&
+                        stage_timing_env[0] != '0') ? 1 : 0;
+    /* GAP_HUNT_TIMING=1 turns on BOTH the GPU kernel line and the host stage
+       line (host stages alone cannot explain a walk rate without them). */
+    const char *host_timing_env = getenv("GAP_HUNT_TIMING");
+    if (host_timing_env && host_timing_env[0] && host_timing_env[0] != '0') {
+        g_host_timing = 1;
+        stage_timing = 1;
+    }
+    uint64_t acc_mark_prev = 0, acc_ext_prev = 0, acc_mr_prev = 0;
+    if (stage_timing) {
+        acc_mark_prev = gpu_sieve_accounted_mark_us(gpu_sieve);
+        acc_ext_prev = gpu_sieve_accounted_extract_us(gpu_sieve);
+        acc_mr_prev = gpu_fermat_accounted_us(fermat);
+    }
+
     /* Two alternating flights (fermat slots 0/1). */
     struct gh_batch A, B;
     gh_batch_init(&A);
@@ -1058,9 +1196,11 @@ int gap_hunt_run(const struct gap_hunt_config *cfg) {
                 fprintf(stderr, "[GAP_HUNT] GPU collect failed\n");
                 break;
             }
+            uint64_t ht_p = g_host_timing ? gh_now_us() : 0;
             gh_batch_process(fl, flags, cfg, &g, &windows,
                              &gaps_reported, &best_merit, out,
                              p1, p2, last_prime, &have_last);
+            if (g_host_timing) g_ht_process += gh_now_us() - ht_p;
             fl->active = 0;
             fl->n_windows = 0;
             fl->total = 0;
@@ -1096,6 +1236,7 @@ int gap_hunt_run(const struct gap_hunt_config *cfg) {
                 dt_now > 0.0 ? (double)(windows - win_last) / dt_now : 0.0;
             double win_s_avg =
                 dt_avg > 0.0 ? (double)windows / dt_avg : 0.0;
+            uint64_t dw_tick = windows - win_last;   /* windows in THIS tick */
             t_last = tn;
             win_last = windows;
             save_state(cfg->state_path, next_k, last_prime, have_last);
@@ -1107,6 +1248,72 @@ int gap_hunt_run(const struct gap_hunt_config *cfg) {
                     (unsigned long long)windows,
                     (unsigned long long)gaps_reported, best_merit,
                     win_s_now, win_s_avg);
+            if (stage_timing) {
+                uint64_t dw = dw_tick;
+                uint64_t mark_now = gpu_sieve_accounted_mark_us(gpu_sieve);
+                uint64_t ext_now = gpu_sieve_accounted_extract_us(gpu_sieve);
+                uint64_t mr_now = gpu_fermat_accounted_us(fermat);
+                double per_win = 1e6 / (win_s_now > 0.0 ? win_s_now : 1.0);
+                double m_us = dw ? (double)(mark_now - acc_mark_prev) / (double)dw : 0.0;
+                double e_us = dw ? (double)(ext_now - acc_ext_prev) / (double)dw : 0.0;
+                double r_us = dw ? (double)(mr_now - acc_mr_prev) / (double)dw : 0.0;
+                fprintf(stderr,
+                        "[GAP_HUNT] stage us/window: total=%.0f mark=%.2f "
+                        "extract=%.2f mr=%.2f (mark=%.0f%% extract=%.0f%% "
+                        "mr=%.0f%%; totals mark=%llu extract=%llu mr=%llu us)\n",
+                        per_win, m_us, e_us, r_us,
+                        per_win > 0 ? 100.0 * m_us / per_win : 0.0,
+                        per_win > 0 ? 100.0 * e_us / per_win : 0.0,
+                        per_win > 0 ? 100.0 * r_us / per_win : 0.0,
+                        (unsigned long long)mark_now,
+                        (unsigned long long)ext_now,
+                        (unsigned long long)mr_now);
+                acc_mark_prev = mark_now;
+                acc_ext_prev = ext_now;
+                acc_mr_prev = mr_now;
+            }
+            if (g_host_timing) {
+                uint64_t dw = dw_tick;
+                double setup = dw ? (double)g_ht_setup / (double)dw : 0.0;
+                double mk = dw ? (double)g_ht_mark / (double)dw : 0.0;
+                double ex = dw ? (double)g_ht_extract / (double)dw : 0.0;
+                double sb = dw ? (double)g_ht_submit / (double)dw : 0.0;
+                double pr = dw ? (double)g_ht_process / (double)dw : 0.0;
+                double per_win = 1e6 / (win_s_now > 0.0 ? win_s_now : 1.0);
+                fprintf(stderr,
+                        "[GAP_HUNT] host us/window: total=%.0f setup=%.1f "
+                        "mark=%.1f extract=%.1f submit=%.1f detect=%.1f "
+                        "(%.0f%% host; GAP_HUNT_TIMING)\n",
+                        per_win, setup, mk, ex, sb, pr,
+                        per_win > 0
+                            ? 100.0 * (setup + mk + ex + sb + pr) / per_win
+                            : 0.0);
+                g_ht_setup = g_ht_mark = g_ht_extract = g_ht_submit =
+                    g_ht_process = 0;
+            }
+            if (stage_timing) {
+                uint64_t dw = dw_tick;
+                uint64_t rounds_tick = g_j2_rounds;
+                fprintf(stderr,
+                        "[GAP_HUNT] chain: tests/window=%.1f "
+                        "rounds/1k-win=%.1f (jump2 only)\n",
+                        dw ? (double)g_j2_tests / (double)dw : 0.0,
+                        dw ? 1000.0 * (double)rounds_tick / (double)dw : 0.0);
+                if (g_host_timing && rounds_tick > 0) {
+                    fprintf(stderr,
+                            "[GAP_HUNT] round us (mean of %llu): "
+                            "gather=%.1f submit=%.1f collect=%.1f total=%.1f\n",
+                            (unsigned long long)rounds_tick,
+                            (double)g_rt_gather_us / (double)rounds_tick,
+                            (double)g_rt_submit_us / (double)rounds_tick,
+                            (double)g_rt_collect_us / (double)rounds_tick,
+                            (double)(g_rt_gather_us + g_rt_submit_us +
+                                     g_rt_collect_us) / (double)rounds_tick);
+                }
+                g_j2_tests = 0;
+                g_j2_rounds = 0;
+                g_rt_gather_us = g_rt_submit_us = g_rt_collect_us = 0;
+            }
         }
 
         turn ^= 1;

@@ -86,6 +86,17 @@ struct worker_stats {
     uint64_t gpu_sieve_windows; /* Windows processed through batched GPU sieve */
     uint64_t smart_tail_skipped; /* CRT windows whose uncovered tail was skipped */
     uint64_t gpu_accounted_us;  /* GPU-accounted MR kernel time (CUDA events) */
+    /* Fused stage split (only accumulated when FUSED_STAGE_TIMING=1). */
+    uint64_t us_mark;           /* launching the GPU sieve mark */
+    uint64_t us_extract;        /* launching extract/pack */
+    uint64_t us_collect;        /* waiting for the async MR batch */
+    uint64_t us_chain;          /* whole MINING_JUMP2 chain flight */
+    uint64_t us_chain_gather;   /* chain gather kernel calls */
+    uint64_t us_chain_mr;       /* chain MR submit+collect round trips */
+    uint64_t chain_rounds;      /* chain MR round trips */
+    /* Sieve kernel accounting (only non-zero with GPU_SIEVE_TIMING=1). */
+    uint64_t sieve_mark_us;     /* pure mark kernel time (CUDA events) */
+    uint64_t sieve_extract_us;  /* pure extract/pack kernel time (CUDA events) */
 };
 
 void worker_get_stats(uint32_t worker_id, struct worker_stats *stats);

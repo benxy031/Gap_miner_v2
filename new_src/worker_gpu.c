@@ -160,9 +160,70 @@ struct worker_counter_state {
     _Atomic uint64_t gpu_sieve_windows;
     _Atomic uint64_t smart_tail_skipped;
     _Atomic uint64_t gpu_accounted_us;
+    /* Stage split (FUSED_STAGE_TIMING=1).  Host wall time per fused stage,
+       accumulated in microseconds.  The defaults cost one atomic load per
+       call site and nothing else; with the env unset every value stays 0. */
+    _Atomic uint64_t us_mark;          /* launching the GPU sieve mark */
+    _Atomic uint64_t us_extract;       /* launching extract/pack */
+    _Atomic uint64_t us_collect;       /* waiting for the async MR batch */
+    _Atomic uint64_t us_chain;         /* whole chain flight */
+    _Atomic uint64_t us_chain_gather;  /* chain gather kernel calls */
+    _Atomic uint64_t us_chain_mr;      /* chain MR submit+collect round trips */
+    _Atomic uint64_t chain_rounds;     /* number of chain MR round trips */
+    /* Sieve kernel accounting (GPU_SIEVE_TIMING=1). */
+    _Atomic uint64_t sieve_mark_us;
+    _Atomic uint64_t sieve_extract_us;
 } __attribute__((aligned(64)));
 
 static struct worker_counter_state g_worker_stats[8] = {0};  /* Max 8 GPUs */
+
+/* FUSED_STAGE_TIMING=1 enables the per-stage wall-clock accumulators above. */
+static int worker_stage_timing(void) {
+    static int cached = -1;
+    if (cached < 0) {
+        const char *v = getenv("FUSED_STAGE_TIMING");
+        /* Unset, empty or "0*" means off; anything else enables the split. */
+        cached = (v && *v && v[0] != '0') ? 1 : 0;
+    }
+    return cached;
+}
+
+/* Reset the optional stage-timing accumulators (no-op cost when unused). */
+static void worker_stage_reset(uint32_t worker_id) {
+    if (worker_id >= 8) return;
+    atomic_store(&g_worker_stats[worker_id].us_mark, 0);
+    atomic_store(&g_worker_stats[worker_id].us_extract, 0);
+    atomic_store(&g_worker_stats[worker_id].us_collect, 0);
+    atomic_store(&g_worker_stats[worker_id].us_chain, 0);
+    atomic_store(&g_worker_stats[worker_id].us_chain_gather, 0);
+    atomic_store(&g_worker_stats[worker_id].us_chain_mr, 0);
+    atomic_store(&g_worker_stats[worker_id].chain_rounds, 0);
+    atomic_store(&g_worker_stats[worker_id].sieve_mark_us, 0);
+    atomic_store(&g_worker_stats[worker_id].sieve_extract_us, 0);
+}
+
+static inline uint64_t worker_stage_now_us(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * 1000000ull + (uint64_t)(ts.tv_nsec / 1000);
+}
+
+/* RAII-free stage bracket: STAGE_T0(name) ... STAGE_ADD(name, worker_id). */
+#define STAGE_T0(name) \
+    uint64_t name##_t0 = worker_stage_timing() ? worker_stage_now_us() : 0
+#define STAGE_ADD(name, wid) \
+    do { \
+        if (name##_t0) { \
+            atomic_fetch_add(&g_worker_stats[wid].us_##name, \
+                             worker_stage_now_us() - name##_t0); \
+        } \
+    } while (0)
+#define STAGE_COUNT(field, wid, n) \
+    do { \
+        if (worker_stage_timing()) \
+            atomic_fetch_add(&g_worker_stats[wid].field, (uint64_t)(n)); \
+    } while (0)
+
 
 #define MERIT_STAT_SCALE 1000000.0
 
@@ -1138,6 +1199,7 @@ void *worker_thread_run(void *arg) {
     atomic_store(&g_worker_stats[worker_id].gpu_sieve_calls, 0);
     atomic_store(&g_worker_stats[worker_id].gpu_sieve_windows, 0);
     atomic_store(&g_worker_stats[worker_id].gpu_accounted_us, 0);
+    worker_stage_reset(worker_id);
     uint64_t cached_generation = UINT64_MAX;
     uint64_t chunk_generation = UINT64_MAX;
     uint32_t chunk_next = 0;
@@ -1548,7 +1610,13 @@ static int crt_gpu_batch_test(struct gpu_adapter *gpu, int limbs,
    Fail-closed: any chain error falls back to a full scan of the same
    flight, and any further error disables the fused path. */
 #define MINING_JUMP2_BATCH_MAX 128
-#define MINING_JUMP2_CHUNK_DEFAULT 64
+/* Per-window chain chunk.  Measured (RTX 3070, shift512 p75, live difficulty
+   ~23.9, 1 thread, fused path, 120-300 s): chunk 32 and 64 give the same
+   windows/s (2736 vs 2751, within noise) but 32 needs 1.66x fewer expensive
+   MR tests per window (120.5 vs 200.2), i.e. the same speed with real MR
+   headroom; chunk 16 is latency-bound (2069 win/s) and chunk 128 wastes tests
+   (384.5/window) while being slower (2163 win/s). */
+#define MINING_JUMP2_CHUNK_DEFAULT 32
 
 struct fused_flight_window {
     uint32_t nonce;
@@ -1718,11 +1786,13 @@ static int crt_fused_collect_batch(struct gpu_sieve_ctx *gpu_sieve,
                                    size_t prime_count)
 {
     uint32_t total = fl->total_count;
+    STAGE_T0(collect);
     if (total > 0) {
         if (gpu_fermat_collect(fermat, fl->slot, is_prime, total) < 0) {
             return 0;
         }
     }
+    STAGE_ADD(collect, worker_id);
 
     uint64_t *d_batch = gpu_sieve_candidate_buffer(gpu_sieve, fl->buf);
 
@@ -2074,17 +2144,28 @@ static int crt_fused_chain_flight(struct gpu_sieve_ctx *gpu_sieve,
         }
         if (rtotal > 0) {
             uint32_t gathered = 0;
+            STAGE_T0(chain_gather);
             if (gpu_fermat_gather_run(fermat, d_batch, cs->cum, cs->lo,
                                       cs->hi, cs->dcum, K, fl->limbs,
                                       &gathered) != 0 ||
                 gathered != rtotal)
                 return 0;
+            STAGE_ADD(chain_gather, worker_id);
+            STAGE_T0(chain_mr);
             if (gpu_fermat_submit_device(
                     fermat, fl->slot, gpu_fermat_gather_buffer(fermat),
                     (size_t)rtotal) < 0 ||
                 gpu_fermat_collect(fermat, fl->slot, cs->flags,
                                    (size_t)rtotal) < 0)
                 return 0;
+            STAGE_ADD(chain_mr, worker_id);
+            STAGE_COUNT(chain_rounds, worker_id, 1);
+            /* Kernel-busy accounting for the chain path: the MR context
+               accumulates CUDA-event time for every submit/collect pair, so
+               publishing it here lets acc/wall separate kernel execution from
+               the host round-trip wait. */
+            atomic_store(&g_worker_stats[worker_id].gpu_accounted_us,
+                         gpu_fermat_accounted_us(fermat));
         }
         rounds++;
         any_active = 0;
@@ -2238,12 +2319,14 @@ static int crt_fused_drain_partial(struct gpu_sieve_ctx *gpu_sieve,
     if (chain_on) {
         if (fl->n_windows <= 0)
             return 1;
+        STAGE_T0(chain);
         if (!crt_fused_chain_flight(gpu_sieve, fermat, worker_id, rt, fl,
                                     offsets, is_prime, chain_cs, chain_chunk,
                                     p1, p2, nadd_full) &&
             !crt_fused_fullscan_flight(gpu_sieve, fermat, worker_id, rt, fl,
                                        offsets, is_prime, p1, p2, nadd_full))
             return 0;
+        STAGE_ADD(chain, worker_id);
         fl->n_windows = 0;
         fl->total_count = 0;
         return 1;
@@ -2810,6 +2893,7 @@ void *worker_thread_run_crt(void *arg) {
 
     /* Reset this worker's counters before it begins scanning. */
     atomic_store(&g_worker_stats[worker_id].nonces_processed, 0);
+    worker_stage_reset(worker_id);
     atomic_store(&g_worker_stats[worker_id].candidates_generated, 0);
     atomic_store(&g_worker_stats[worker_id].candidates_tested, 0);
     atomic_store(&g_worker_stats[worker_id].euler_passes, 0);
@@ -2994,8 +3078,14 @@ void *worker_thread_run_crt(void *arg) {
        chain walks the class-filtered survivor list and the reported visible
        pairs are identical to the full scan's (every skipped interior pair
        has span < thr and can never qualify; a qualifying consecutive pair
-       is found by the FIND_END phase). */
-    int mining_jump2 = worker_env_enabled(getenv("MINING_JUMP2"));
+       is found by the FIND_END phase).
+
+       DEFAULT ON (2026-09-15): measured +70-76% windows/s with 5.2x fewer
+       expensive MR tests per window (620.7 -> 120.3 at both shift512 and
+       shift507, fused chain, RTX 3070, order swapped).  MINING_JUMP2=0
+       restores the full scan.  Still inert without FUSED_GPU=1. */
+    const char *mj2_env = getenv("MINING_JUMP2");
+    int mining_jump2 = (mj2_env && mj2_env[0] == '0') ? 0 : 1;
     int mining_jump2_batch = 64;
     {
         const char *mb = getenv("MINING_JUMP2_BATCH");
@@ -3344,6 +3434,7 @@ void *worker_thread_run_crt(void *arg) {
                                intact bitmap.  Submission cadence stays
                                per-window and unchanged: extract + MR submit
                                for THIS window only, right after its mark. */
+                            STAGE_T0(mark);
                             int mark_ok = 0;
                             int row_mode = (rows > 1) && rowP_limbs_valid;
                             if (exported <= (size_t)gpu_limbs &&
@@ -3419,6 +3510,7 @@ void *worker_thread_run_crt(void *arg) {
                                     }
                                 }
                             }
+                            STAGE_ADD(mark, worker_id);
 
                             uint32_t head_count = 0;
                             if (mark_ok) {
@@ -3443,6 +3535,7 @@ void *worker_thread_run_crt(void *arg) {
                                            sizeof(fl->step_limbs));
                                 }
                             }
+                            STAGE_T0(extract);
                             if (mark_ok &&
                                 crt_fused_append_window(
                                     gpu_sieve, f,
@@ -3457,6 +3550,16 @@ void *worker_thread_run_crt(void *arg) {
                                     &head_count,
                                     half_class, base_mod60, back_limit,
                                     fl->total_count)) {
+                                STAGE_ADD(extract, worker_id);
+                                /* Publish the CUDA-event kernel accounting of
+                                   the sieve stages (no-op unless the sieve was
+                                   initialised with GPU_SIEVE_TIMING=1). */
+                                atomic_store(
+                                    &g_worker_stats[worker_id].sieve_mark_us,
+                                    gpu_sieve_accounted_mark_us(gpu_sieve));
+                                atomic_store(
+                                    &g_worker_stats[worker_id].sieve_extract_us,
+                                    gpu_sieve_accounted_extract_us(gpu_sieve));
                                 struct fused_flight_window *wv =
                                     &fl->wins[w_in];
                                 wv->nonce = nonce;
@@ -3480,6 +3583,7 @@ void *worker_thread_run_crt(void *arg) {
                                        flight; a full scan of the same flight
                                        is the exact fallback. */
                                     if (w_in == flight_batch - 1) {
+                                        STAGE_T0(chain);
                                         if (!crt_fused_chain_flight(
                                                 gpu_sieve, fused_fermat,
                                                 worker_id, rt, fl,
@@ -3518,6 +3622,7 @@ void *worker_thread_run_crt(void *arg) {
                                         }
                                         fl->n_windows = 0;
                                         fl->total_count = 0;
+                                        STAGE_ADD(chain, worker_id);
                                     }
                                 } else if (w_in == flight_batch - 1) {
                                     uint64_t *d_batch =
@@ -3849,6 +3954,15 @@ void worker_get_stats(uint32_t worker_id, struct worker_stats *stats) {
     stats->gpu_sieve_windows = atomic_load(&g_worker_stats[worker_id].gpu_sieve_windows);
     stats->smart_tail_skipped = atomic_load(&g_worker_stats[worker_id].smart_tail_skipped);
     stats->gpu_accounted_us = atomic_load(&g_worker_stats[worker_id].gpu_accounted_us);
+    stats->us_mark = atomic_load(&g_worker_stats[worker_id].us_mark);
+    stats->us_extract = atomic_load(&g_worker_stats[worker_id].us_extract);
+    stats->us_collect = atomic_load(&g_worker_stats[worker_id].us_collect);
+    stats->us_chain = atomic_load(&g_worker_stats[worker_id].us_chain);
+    stats->us_chain_gather = atomic_load(&g_worker_stats[worker_id].us_chain_gather);
+    stats->us_chain_mr = atomic_load(&g_worker_stats[worker_id].us_chain_mr);
+    stats->chain_rounds = atomic_load(&g_worker_stats[worker_id].chain_rounds);
+    stats->sieve_mark_us = atomic_load(&g_worker_stats[worker_id].sieve_mark_us);
+    stats->sieve_extract_us = atomic_load(&g_worker_stats[worker_id].sieve_extract_us);
 }
 
 /* Get pending gap from queue (thread-safe) */

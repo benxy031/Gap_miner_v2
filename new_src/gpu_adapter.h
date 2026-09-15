@@ -26,8 +26,18 @@
    to it, and any candidates beyond it would otherwise go untested).
    Raised from 8192 to 40000: the CGBN kernel is latency-bound, so larger
    batches amortize the per-launch/tail overhead (measured 1.28M/s @10k →
-   1.52M/s @40k candidates, still climbing). */
-#define GPU_ADAPTER_MAX_BATCH 160000U
+   1.52M/s @40k candidates, still climbing).
+   Raised 40000 -> 160000, then -> 320000 (2026-09-15): the same effect is now
+   documented for the GAP_HUNT chain, where a round has a ~4 ms per-LAUNCH
+   floor (measured with GAP_HUNT_TIMING=1) that is amortized over the windows
+   sharing the round.  The chain's default batch is 64 windows, which at
+   shift1017 is 64 x ~2676 real survivors = 171k candidates per round (the walk
+   fails closed with "cum + nc > GPU_ADAPTER_MAX_BATCH" when the staging is too
+   small), and the hunt's safety estimate asks for a little more headroom.
+   Cost is device/pinned staging memory: max_batch x NL limbs x 8 B per slot,
+   with 2 AoS + 2 SoA device slots plus pinned host copies -> ~200 MB per
+   adapter at NL=20 (the miner sizes one adapter per worker). */
+#define GPU_ADAPTER_MAX_BATCH 320000U
 
 /* GPU candidate batch (input to GPU) */
 struct gpu_batch {

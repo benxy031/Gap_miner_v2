@@ -102,6 +102,7 @@ TEST_CRT_RUNTIME = $(BIN_DIR)/test_crt_runtime
 TEST_CRT_SUBMISSION = $(BIN_DIR)/test_crt_submission
 TEST_GAP_HUNT = $(BIN_DIR)/test_gap_hunt
 BENCH_FERMAT = $(BIN_DIR)/bench_fermat
+BENCH_MARK = $(BIN_DIR)/bench_mark
 COVER_MAX = $(BIN_DIR)/cover_max
 
 # Phony targets
@@ -109,6 +110,8 @@ COVER_MAX = $(BIN_DIR)/cover_max
 
 # Default target
 all: $(BIN_DIR) $(BUILD_DIR) $(OBJECTS) $(MAIN_BINARY) $(TEST_GAP_DETECTION) $(TEST_PRIMALITY) $(TEST_WORKER_THREADS) $(TEST_GAPCOIN_RPC) $(TEST_BLOCK_SUBMISSION) $(TEST_SIEVE_CORE) $(TEST_GPU_FERMAT) $(TEST_GPU_SIEVE) $(TEST_GPU_RESOLVE) $(TEST_GAP_DIST) $(TEST_HALFCLASS) $(TEST_GAP_PRIORITY) $(TEST_CRT_SET) $(TEST_GAP_TARGET) $(TEST_COVERING) $(TEST_CRT_RUNTIME) $(TEST_CRT_SUBMISSION) $(TEST_GAP_HUNT) $(CRT_GEN) $(GEN_CRT) $(COVER_MAX)
+
+# CUDA-only dev tool, not part of the default build: make bin/bench_mark WITH_CUDA=1
 
 # Create directories
 $(BIN_DIR):
@@ -192,6 +195,16 @@ $(TEST_HALFCLASS): $(BUILD_DIR)/$(SRC_DIR)/halfclass.o $(BUILD_DIR)/$(SRC_DIR)/g
 $(BENCH_FERMAT): $(OBJECTS) $(BUILD_DIR)/tools/bench_fermat.o | $(BIN_DIR)
 	$(CC) $(CFLAGS) $^ $(LDFLAGS) -lpthread -o $@
 	@echo "✓ Built: $@"
+
+# GPU bitmap-mark kernel cost-model microbenchmark (dev tool, CUDA only).
+# Standalone TU (does not link the miner objects); needs nvcc.
+$(BENCH_MARK): $(BUILD_DIR)/tools/bench_mark.o | $(BIN_DIR)
+	$(NVCC) $(BUILD_DIR)/tools/bench_mark.o -L$(CUDA_LIBDIR) -lcudart -lm -o $@
+	@echo "✓ Built: $@"
+
+$(BUILD_DIR)/tools/%.o: tools/%.cu | $(BUILD_DIR)
+	@mkdir -p $(dir $@)
+	$(NVCC) -O3 $(CUDA_ARCH) -std=c++17 -I$(SRC_DIR)/gpu -c $< -o $@
 
 # Link test_gap_priority
 $(TEST_GAP_PRIORITY): $(OBJECTS) $(BUILD_DIR)/$(TEST_DIR)/test_gap_priority.o | $(BIN_DIR)

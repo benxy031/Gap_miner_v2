@@ -99,6 +99,18 @@ longest run 65 vs 69, mean fwd run 12.3 vs 12.2 (near-neutral tradeoff).
 **DEPLOYED** (2026-09-07) as `data/crt/m23/shift450_p67_covermax_m30.txt`;
 `test_crt_runtime` ALL TESTS PASSED.
 
+### p130 config (`shift1017_p130_lex_m30.txt`)
+
+| run | restarts | best survivors | coverage |
+|---|---|---|---|
+| file | — | 1563 | 94.0954% |
+| 600 s search | 397 | **1544** | **94.1672%** |
+
+Improvement: −19 survivors (−1.2%), +0.072 pp coverage; longest run 123 vs
+117, mean fwd run 16.1 vs 15.9 (strictly better). **CERTIFIED** (2026-09-12)
+as `data/crt/m23/shift1017_p130_covermax_m30.txt`; `test_crt_runtime` ALL
+TESTS PASSED. Fleet deployment pending (merit-30+ hunt setup).
+
 ## Conclusion
 
 - **p74 config: certified done.** 1355 restarts of a stronger optimizer

@@ -2,8 +2,7 @@
  * Copyright (C) 2026  GapMiner V2 contributors
  * SPDX-License-Identifier: GPL-3.0-or-later
  *
- * Parity test for the fused-pipeline Stage 1 GPU extract+pack kernel.
- *
+ * Parity test for the fused-pipeline Stage 1 GPU extract+pack kernel. *
  * The GPU path (gpu_sieve_mark_from_base + gpu_sieve_extract_pack) must
  * produce the exact same survivor set as a CPU reference that uses the
  * identical arithmetic (GMP for base mod p, then odd-slot marking and
@@ -21,10 +20,17 @@
  * without WITH_CUDA=1 (there is no GPU kernel to exercise).
  */
 
+/* setenv/unsetenv need the POSIX 2008 feature macro under -std=c99. */
+#define _POSIX_C_SOURCE 200809L
+
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <gmp.h>
+
+#ifdef WITH_CUDA
+#include <cuda_runtime.h>
+#endif
 
 #include "../new_src/gpu/gpu_sieve.h"
 
@@ -371,6 +377,135 @@ static int run_one_row_batch(gpu_sieve_ctx *ctx, const mpz_t base,
     return pass;
 }
 
+/* Pair-batch parity (the rows == 1 path): gpu_sieve_mark_batch_from_bases
+   marks TWO windows (bases of the SAME parity, so both share one
+   odd_interval_size) into the two ping-pong device bitmaps.  Verified per
+   window against the CPU reference: device bitmap equality AND survivor
+   offsets.  This path is where GPU_MARK_SPLIT's pair variant runs (dense
+   domain = p <= window), so the caller runs it with the split off and on. */
+static int run_one_pair_batch(gpu_sieve_ctx *ctx, const mpz_t base0,
+                              const mpz_t base1, int limbs,
+                              uint64_t interval_size, const uint64_t *primes,
+                              size_t prime_count, const uint64_t *inv_p,
+                              const char *label) {
+    if (mpz_tstbit(base0, 0) != mpz_tstbit(base1, 0)) {
+        fprintf(stderr, "  FAIL: pair bases must share parity (%s)\n", label);
+        return 0;
+    }
+    uint64_t first_odd_offset = mpz_tstbit(base0, 0) ? 0U : 1U;
+    uint64_t odd_count = (interval_size - first_odd_offset + 1U) >> 1;
+    uint64_t bitmap_words = (odd_count + 63U) >> 6;
+
+    uint64_t base_limbs_pairs[64];
+    mpz_to_limbs(base0, base_limbs_pairs, (size_t)limbs);
+    mpz_to_limbs(base1, base_limbs_pairs + limbs, (size_t)limbs);
+
+    uint64_t *base_mod_p = (uint64_t *)malloc(prime_count * sizeof(uint64_t));
+    uint64_t *cpu_bitmap =
+        (uint64_t *)calloc(bitmap_words ? bitmap_words : 1, sizeof(uint64_t));
+    uint64_t *gpu_bitmap =
+        (uint64_t *)calloc(bitmap_words ? bitmap_words : 1, sizeof(uint64_t));
+    uint64_t *cpu_offsets = (uint64_t *)malloc(odd_count * sizeof(uint64_t));
+    uint64_t *gpu_offsets = (uint64_t *)malloc(odd_count * sizeof(uint64_t));
+    if (!base_mod_p || !cpu_bitmap || !gpu_bitmap || !cpu_offsets ||
+        !gpu_offsets) {
+        fprintf(stderr, "  FAIL: out of memory (%s)\n", label);
+        free(base_mod_p); free(cpu_bitmap); free(gpu_bitmap);
+        free(cpu_offsets); free(gpu_offsets);
+        return 0;
+    }
+
+    int ok = gpu_sieve_mark_batch_from_bases(ctx, odd_count, base_limbs_pairs,
+                                             limbs, primes, inv_p, prime_count);
+    if (!ok) {
+        fprintf(stderr, "  FAIL: gpu_sieve_mark_batch_from_bases returned 0 "
+                        "(%s)\n", label);
+        free(base_mod_p); free(cpu_bitmap); free(gpu_bitmap);
+        free(cpu_offsets); free(gpu_offsets);
+        return 0;
+    }
+
+    mpz_t bm;
+    mpz_init(bm);
+    int pass = 1;
+    for (int w = 0; w < 2 && pass; w++) {
+        mpz_set(bm, w == 0 ? base0 : base1);
+        for (size_t i = 0; i < prime_count; i++) {
+            base_mod_p[i] = mpz_fdiv_ui(bm, primes[i]);
+        }
+        memset(cpu_bitmap, 0, (size_t)bitmap_words * sizeof(*cpu_bitmap));
+        cpu_mark_odd(primes, prime_count, base_mod_p, odd_count,
+                     first_odd_offset, cpu_bitmap);
+        size_t cpu_count = cpu_extract(cpu_bitmap, bitmap_words, odd_count,
+                                       first_odd_offset, cpu_offsets);
+
+        uint64_t *d_bmp = gpu_sieve_pingpong_bitmap(ctx, w);
+        if (!d_bmp) {
+            fprintf(stderr, "  FAIL: ping-pong bitmap %d unavailable (%s)\n", w,
+                    label);
+            pass = 0;
+            break;
+        }
+        if (cudaMemcpy(gpu_bitmap, d_bmp,
+                       (size_t)bitmap_words * sizeof(uint64_t),
+                       cudaMemcpyDeviceToHost) != cudaSuccess) {
+            fprintf(stderr, "  FAIL: bitmap D2H copy (%s, window %d)\n", label,
+                    w);
+            pass = 0;
+            break;
+        }
+        if (memcmp(cpu_bitmap, gpu_bitmap,
+                   (size_t)bitmap_words * sizeof(uint64_t)) != 0) {
+            fprintf(stderr, "  FAIL: pair bitmap mismatch (%s, window %d)\n",
+                    label, w);
+            for (uint64_t k = 0; k < bitmap_words; k++) {
+                if (cpu_bitmap[k] != gpu_bitmap[k]) {
+                    fprintf(stderr, "        first diff word %llu: "
+                                    "cpu=0x%016llx gpu=0x%016llx\n",
+                            (unsigned long long)k,
+                            (unsigned long long)cpu_bitmap[k],
+                            (unsigned long long)gpu_bitmap[k]);
+                    break;
+                }
+            }
+            pass = 0;
+            break;
+        }
+
+        uint64_t limbs_m[32];
+        mpz_to_limbs(bm, limbs_m, 32);
+        unsigned int gpu_count = 0;
+        uint64_t *d_cands = NULL;
+        ok = gpu_sieve_extract_pack_device_range_bitmap(
+            ctx, d_bmp, odd_count, first_odd_offset, 0, odd_count, 0,
+            limbs_m, limbs, &d_cands, gpu_offsets, &gpu_count, 0,
+            UINT64_MAX, 0, 0);
+        if (!ok || gpu_count != (unsigned int)cpu_count) {
+            fprintf(stderr, "  FAIL: pair survivors (%s, window %d): "
+                            "gpu=%u cpu=%zu\n", label, w, gpu_count, cpu_count);
+            pass = 0;
+            break;
+        }
+        qsort(cpu_offsets, cpu_count, sizeof(uint64_t), cmp_u64);
+        qsort(gpu_offsets, gpu_count, sizeof(uint64_t), cmp_u64);
+        if (memcmp(cpu_offsets, gpu_offsets,
+                   cpu_count * sizeof(uint64_t)) != 0) {
+            fprintf(stderr, "  FAIL: pair survivor offsets (%s, window %d)\n",
+                    label, w);
+            pass = 0;
+            break;
+        }
+    }
+
+    if (pass) {
+        printf("  OK  %s: 2 windows, bitmap+survivors match\n", label);
+    }
+    mpz_clear(bm);
+    free(base_mod_p); free(cpu_bitmap); free(gpu_bitmap);
+    free(cpu_offsets); free(gpu_offsets);
+    return pass;
+}
+
 static int run_gpu_sieve_parity_test(void) {
     printf("[TEST] GPU sieve extract+pack parity vs CPU reference...\n");
 
@@ -538,10 +673,94 @@ static int run_gpu_sieve_parity_test(void) {
                                    "euclid-rows step=255255 odd")) {
                 pass = 0;
             }
+
+            /* Split (chunked) dense marking: GPU_MARK_SPLIT=1 replaces the
+               per-prime row walk for p <= window by work items over
+               (prime, row, chunk).  Same slot sets must come out.  This
+               table (primes up to 100k) with a 16k window covers BOTH sides:
+               the split prefix (p <= 16384) and the untouched sparse suffix
+               (p > 16384) in the same call. */
+            setenv("GPU_MARK_SPLIT", "1", 1);
+            for (int step_parity = 0; step_parity < 2 && pass;
+                 step_parity++) {
+                mpz_urandomb(step, rng, 506UL);
+                if (step_parity) mpz_setbit(step, 0);
+                else mpz_clrbit(step, 0);
+                mpz_urandomb(base, rng, 64UL * 20UL - 32UL);
+                if (step_parity) mpz_setbit(base, 0); else mpz_clrbit(base, 0);
+                snprintf(label, sizeof(label),
+                         "split-rows step=%s window=16384 rows=16",
+                         step_parity ? "odd" : "even");
+                if (!run_one_row_batch(ctx, base, step, 20, 16384U, 16,
+                                       primes2, prime_count2, inv_p2, label)) {
+                    pass = 0;
+                }
+            }
+            /* Split-only domain: every prime in the table is <= the window. */
+            setenv("GPU_MARK_SPLIT_SLOTS", "64", 1);
+            for (int parity = 0; parity < 2 && pass; parity++) {
+                mpz_urandomb(step, rng, 506UL);
+                mpz_setbit(step, 0);
+                mpz_urandomb(base, rng, 64UL * 20UL - 32UL);
+                if (parity) mpz_setbit(base, 0); else mpz_clrbit(base, 0);
+                snprintf(label, sizeof(label),
+                         "split-rows parity=%s slots=64",
+                         parity ? "odd" : "even");
+                if (!run_one_row_batch(ctx, base, step, 20, 32768U, 4,
+                                       primes, prime_count, inv_p, label)) {
+                    pass = 0;
+                }
+            }
+            unsetenv("GPU_MARK_SPLIT_SLOTS");
+            unsetenv("GPU_MARK_SPLIT");
             mpz_clear(step);
             free(primes2);
             free(inv_p2);
         }
+    }
+
+    /* Pair-batch path (rows == 1): two windows marked by ONE kernel into the
+       ping-pong bitmaps.  Run with GPU_MARK_SPLIT off (per-prime straggler
+       walk) and on (chunked work items) — both must produce the CPU bitmap
+       exactly.  Two window sizes: 16384 (table reaches past the window, so
+       the split prefix and the sparse suffix are exercised together) and
+       32768 (whole table below the window = pure split domain). */
+    {
+        mpz_t b0, b1;
+        mpz_init(b0);
+        mpz_init(b1);
+        static const uint64_t pair_intervals[] = {16384U, 32768U};
+        for (int split = 0; split < 2 && pass; split++) {
+            setenv("GPU_MARK_SPLIT", split ? "1" : "0", 1);
+            for (size_t ci = 0;
+                 ci < sizeof(pair_intervals) / sizeof(pair_intervals[0]) &&
+                 pass;
+                 ci++) {
+                for (int parity = 0; parity < 2 && pass; parity++) {
+                    mpz_urandomb(b0, rng, 64UL * 20UL - 32UL);
+                    mpz_urandomb(b1, rng, 64UL * 20UL - 32UL);
+                    if (parity) {
+                        mpz_setbit(b0, 0);
+                        mpz_setbit(b1, 0);
+                    } else {
+                        mpz_clrbit(b0, 0);
+                        mpz_clrbit(b1, 0);
+                    }
+                    snprintf(label, sizeof(label),
+                             "pair rows1 parity=%s window=%llu split=%d",
+                             parity ? "odd" : "even",
+                             (unsigned long long)pair_intervals[ci], split);
+                    if (!run_one_pair_batch(ctx, b0, b1, 20,
+                                            pair_intervals[ci], primes,
+                                            prime_count, inv_p, label)) {
+                        pass = 0;
+                    }
+                }
+            }
+        }
+        unsetenv("GPU_MARK_SPLIT");
+        mpz_clear(b0);
+        mpz_clear(b1);
     }
 
     mpz_clear(base);
@@ -552,7 +771,6 @@ static int run_gpu_sieve_parity_test(void) {
 
     return pass;
 }
-
 #endif /* WITH_CUDA */
 
 int main(void) {

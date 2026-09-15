@@ -51,6 +51,21 @@ Status: ISSUED 2026-09-07. Companion to `docs/COVERAGE_MAX_EXPERIMENT.md`
   file).
 - Layer: *exact fact* (the two survivor counts and test outcomes above).
 
+## Certificate D — p130 config improvement (issued 2026-09-12)
+
+- Old file: `data/crt/m23/shift1017_p130_lex_m30.txt`
+  → 1563 survivors = 94.0954% coverage.
+- **Certified file: `data/crt/m23/shift1017_p130_covermax_m30.txt`
+  → 1544 survivors = 94.1672% coverage** (−19 survivors, +0.072 pp).
+- Evidence: 600 s / 397 restarts; best found at elapsed 180 s (restart
+  114), stable for the remaining ~280 restarts. Independent Python re-check
+  of the constellation: longest covered run 123 vs 117, mean forward run
+  16.1 vs 15.9 — strictly better, no regression.
+- Validation: `bin/test_crt_runtime data/crt/m23/shift1017_p130_covermax_m30.txt`
+  → **ALL TESTS PASSED** (window 52944 survivors: 3739).
+- Layer: *exact fact* (the two survivor counts and test outcomes above).
+- Deployment: fleet lines pending user decision (merit-30+ hunt setup).
+
 ## Deployment record
 
 | Change | File |
@@ -61,7 +76,8 @@ Status: ISSUED 2026-09-07. Companion to `docs/COVERAGE_MAX_EXPERIMENT.md`
 | Search tool + Makefile target | `tools/cover_max.c`, `Makefile` (`bin/cover_max`) |
 
 Deployed covers: p98 `shift720_p98_covermax_m23.txt` (952 survivors) and p67
-`shift450_p67_covermax_m30.txt` (1101 survivors).
+`shift450_p67_covermax_m30.txt` (1101 survivors). Certified, deployment-ready:
+p130 `shift1017_p130_covermax_m30.txt` (1544 survivors).
 
 Commit at deployment: `8cc2a6f` (working tree also carries unrelated
 README/merits changes).

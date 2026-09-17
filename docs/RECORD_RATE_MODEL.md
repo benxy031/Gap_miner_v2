@@ -309,8 +309,134 @@ no single rescale fits both covers — strong moves 5.7 → 4.9 (divide) or
 against an observed 10. The slope is now reported as a **DIAG** line only and
 is never applied to sigma. Registered in `docs/CLOSED_FINGERPRINTS.md`.
 
-## 9. What this does not claim
+## 9. Tail shape: exponential rejected at depth, replacement NOT determined (2026-09-17)
 
+Tool: `scripts/tail_shape.py` (stdlib-only; `--selftest` verifies every
+estimator on synthetic samples before use: exp 0.03 % off, stretched
+beta 1.3485 vs 1.3500, GPD xi 0.2456 vs 0.2500, and GPD on exponential data
+returns xi = +0.0006, i.e. no false heavy tail).
+
+### 9.1 The measured signature (shift507 lex walk, 755 202 gaps)
+
+Mean excess E[m - M0 | m >= M0] must be CONSTANT for an exponential:
+
+| M0 | 8 | 10 | 12 | 14 | 16 | 18 | 19 | 20 |
+|---|---|---|---|---|---|---|---|---|
+| measured sigma | 1.261 | 1.292 | 1.283 | 1.293 | 1.186 | 0.980 | 0.858 | 0.770 |
+| n | 755202 | 153383 | 32622 | 6864 | 1509 | 295 | 119 | 42 |
+
+FACT: the mean excess falls by ~35 % between M0 = 12 and M0 = 19. The
+shift1017 lex walk shows the opposite-or-flat behaviour (1.372 at 8, 1.300 at
+16, 1.489 at 18 with n=142, 1.295 at 20 with n=39). So the deep-tail
+behaviour is a property of (size, cover), exactly like sigma.
+
+### 9.2 Family fits (held out, never in-sample)
+
+Fitted above u_fit, scored on the exceedances above u_test:
+
+| fit above | family | params | held-out LL | sum abs(z) |
+|---|---|---|---|---|
+| u=12, n=32622 | exp | sigma=1.2840 | -10739.94 | 5.04 |
+| u=12 | stretched | beta=1.0062 lam=1.2873 | -10737.33 | 4.64 |
+| u=12 | gpd | xi=-0.0001 scale=1.2841 | -10739.79 | 5.03 |
+| u=16, n=1509 | exp | sigma=1.1868 | -328.44 | 2.28 |
+| u=16 | stretched | beta=1.0519 lam=1.2104 | -323.77 | 1.52 |
+| u=16 | **gpd** | **xi=-0.0843 scale=1.2869** | **-320.67** | **0.73** |
+
+FACT: fitted at u=12 BOTH two-parameter families collapse onto the
+exponential (beta=1.006, xi=-0.0001). The deep behaviour only appears when
+the fit moves to u=16, where the GPD wins on both criteria (Delta-LL = 7.8
+vs exp, i.e. 2Delta-LL = 15.5 for one extra parameter).
+FACT: the exponential over-predicts the held-out deep count: at M0=20 it
+predicts 64.2 gaps where 42 were observed (z = -2.8).
+
+### 9.3 The replacement is NOT determined
+
+FACT: xi is stably negative for the shift507 walk but its magnitude drifts
+with the fit threshold: -0.0043 (u=13), -0.0562 (14), -0.0701 (15),
+-0.0843 (16), -0.1269 (17), -0.0431 (18). The implied finite upper endpoint
+(u + scale/|xi|) therefore spans roughly **merit 26 to 45** — and the record
+rate is exponentially sensitive to it (the endpoint is a hard cutoff).
+FACT: for the shift1017 lex walk the same scan gives xi = -0.0151, -0.0215,
+-0.0071, **+0.0828, +0.0972** — the sign flips to positive (heavy) at u >= 16.
+
+INFERENCE: the exponential merit tail is **rejected** at the record depth
+(both by the mean-excess signature and by the held-out Poisson z), but no
+single replacement family is established, and the shape cannot be transferred
+between covers. Consequences:
+
+* Absolute record-rate projections must quote the **family spread**, not a
+  sigma perturbation. On the shift507 lex file the sigma +-5 % band was 4.86x
+  while the exp/stretched/gpd spread is ~5 orders of magnitude
+  (9.9e7 / 4.3e8 / 1.1e13 gaps per record from u_rec=17.5), because the GPD
+  endpoint (~27.5) sits just above the cheapest record target (~26.4).
+* The pairwise **ranking** must be judged against that same spread; the
+  `band` column now reports whichever spread is active (`band_kind`).
+* `record_rate_model.py --tail exp|stretched|gpd --u-rec auto|m0|X` selects the
+  extrapolating family; the default (`exp`, `u_rec=m0`) reproduces the earlier
+  numbers exactly (regression-checked: 2.677e6 and 2.141e7 gaps/record).
+
+### 9.4 Implementation trap found while wiring this up
+
+GPD with `xi < 0` has a finite upper endpoint, and beyond it the standard
+formula `(1 + xi*x/B) ** (-1/xi)` raises a NEGATIVE base to a fractional
+exponent, which in Python returns a **complex number** instead of failing.
+Every downstream sum then silently becomes complex (`TypeError` only much
+later, if at all). Both `survival` and `logpdf` now return 0 / -inf past the
+endpoint, and `--selftest` covers the three families.
+
+### 9.5 Honest bounds on this section
+
+* The u=16 fit rests on 1509 exceedances and the M0=20 check on 42; the
+  endpoint estimate is not resolved, only the *rejection* of the pure
+  exponential at depth is.
+* Two-parameter families were compared at several thresholds, so the reported
+  p-value (2Delta-LL = 15.5, ~8e-5 before any multiple-comparison penalty)
+  should be treated as suggestive, not definitive.
+* Nothing here was walked: no GPU time, no cover regenerated, no record made.
+* The shape is measured on the N3 (threshold 8) and fleet-snapshot
+  (threshold 18) files; the live fleet files at 16866/17240 gaps are 10x
+  larger and will settle part of this — rerun `tail_shape.py` on them with
+  `--u-fit 18 --u-test 21,23,25`.
+
+### 9.6 Pooling rules (and why the local files cannot settle this)
+
+`tail_shape.py --pool` merges files into one fit and enforces two conditions,
+both of which caught a real error in the first attempt:
+
+1. **Same `L = ln(anchor)` within 0.1 %.** Different `L` means a different
+   size, so the merit axes are not comparable at all — hard refusal.
+   Caught: `data/gap_hunt_records_f2.txt` is shift450 (L = 488.669), NOT the
+   shift507 file it looks like next to `f1` (L = 528.178, spread 7.8 %), so
+   pooling it with `f1` was refused.
+2. **`u_fit` >= the highest member report threshold.** A walker only reports
+   gaps above its own `--gap-hunt-min-merit`, so between a low member threshold
+   and a high one the high-threshold walker contributes nothing and the pooled
+   density in that band is under-sampled. The first pooled run used u_fit=19
+   across members with thresholds 8 / 19 / 21 and produced a spurious
+   sigma(19) = 1.579 — a mixture artifact, since 107 of the 327 gaps above 19
+   came from the threshold-21 member — together with a +3.4 sigma excess at
+   M0=21. With the rule enforced the fit correctly starts at 21.0118.
+
+The **anchor-digit prefix** printed by the tool is informational only: offsets
+are tiny next to the base, so any cover at the same shift shares a long
+prefix. It does not prove the same cover; the fleet conf does.
+
+RESULT (FACT): the valid pooled sample holds only n_fit = 123 above 21 with a
+single usable held-out point (n = 16). The three families differ by
+Delta-LL = 0.16 and all |z| < 1 — **no discrimination**. Locally the deep tail
+cannot be settled; the N3 u=16 fit (n = 1509, Delta-LL = 7.8) stays the only
+discriminating measurement, and the fleet's LIVE files (16 866 / 17 240 gaps at
+threshold 18, ~10-50x the local snapshots) are the ones that can settle it.
+Command for the fleet box (pooling is not needed there — each file is already
+big):
+
+```
+scripts/tail_shape.py data/gap_hunt_records_f1.txt \
+    data/gap_hunt_records_f2.txt --u-fit 18 --u-test 21,23,25
+```
+
+## 10. What this does not claim
 * Not a record claim: the tool emits no `FIRST_KNOWN_OCCURRENCE`; it only
   evaluates the same predicate the watcher uses.
 * Not an absolute-time predictor: sigma uncertainty alone moves the numbers by

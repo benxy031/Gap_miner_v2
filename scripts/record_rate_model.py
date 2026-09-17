@@ -60,6 +60,7 @@ Usage
 """
 
 import argparse
+import bisect
 import math
 import os
 import sys
@@ -72,6 +73,80 @@ DEFAULT_TABLE = "data/prime_gap_merits.txt"
 # measured L exactly (shift507 -> 528.18, shift1017 -> 881.68).
 SIGMA_ANCHORS = [(528.178, 1.2618), (881.683, 1.3716)]
 SHIPPED_SHIFTS = [258, 450, 507, 998, 1017]
+
+# Tail-shape machinery lives in tail_shape.py (same directory).  It is only
+# needed for --tail / --u-rec; without it the tool still runs exponential-only.
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+try:
+    import tail_shape as ts
+    HAVE_TAIL_SHAPE = True
+except ImportError:                      # pragma: no cover - fleet boxes
+    ts = None
+    HAVE_TAIL_SHAPE = False
+
+
+class _PureExp:
+    """Exponential survival from the report threshold: S(x) = exp(-(x-m0)/s)."""
+
+    def __init__(self, sigma, m0):
+        self.sigma = sigma
+        self.u = m0
+
+    def s(self, x):
+        return math.exp(-max(0.0, x - self.u) / self.sigma)
+
+
+class Surv:
+    """HYBRID survival: empirical below u_rec, fitted family above it.
+
+    This is the honest arrangement: where the walk has data we use the data,
+    and the exp/stretched/GPD families then differ ONLY in the extrapolation
+    beyond u_rec - which is exactly the question being asked.  With u_rec = m0
+    the object reproduces the exponential-from-the-threshold behaviour used
+    before, so --u-rec is a strictly additive knob.
+    """
+
+    def __init__(self, kind, params, u_rec, merits_sorted, sigma_equiv):
+        self.kind, self.params, self.u = kind, params, u_rec
+        self.ms = sorted(merits_sorted)
+        self.n = len(self.ms)
+        self.sigma = sigma_equiv
+        self.s_u = (self.n - bisect.bisect_right(self.ms, u_rec)) / self.n
+
+    def s(self, x):
+        if x <= self.u:
+            return (self.n - bisect.bisect_right(self.ms, x)) / self.n
+        return self.s_u * ts.survival(self.kind, self.params, x - self.u)
+
+    def label(self):
+        return f"{self.kind} above u_rec={self.u:g}"
+
+
+def auto_u_rec(merits, min_n=300.0):
+    """Deepest 0.5-step threshold that still has >= min_n exceedances."""
+    ms = sorted(merits)
+    n = len(ms)
+    u = ms[0]
+    best = u
+    while u <= ms[-1]:
+        if (n - bisect.bisect_right(ms, u)) >= min_n:
+            best = u
+        u += 0.5
+    return best
+
+
+def build_family_surv(merits, u_rec, kind, min_fit=60):
+    """Fit `kind` above u_rec; return a Surv or None if the data is too thin."""
+    if not HAVE_TAIL_SHAPE:
+        return None
+    xs = [m - u_rec for m in merits if m > u_rec]
+    if len(xs) < min_fit:
+        return None
+    params = ts.fit(kind, xs)
+    sig = ts.mean_excess(kind, params, 0.0)
+    if not (sig and sig == sig and sig > 1e-6):      # NaN / degenerate guard
+        sig = sum(xs) / len(xs)
+    return Surv(kind, params, u_rec, merits, sig), params
 
 
 # --------------------------------------------------------------------------
@@ -170,7 +245,8 @@ def reachable_entries(table, L, m0, sigma, margin, span_sigmas=26.0):
     few-hundred-entry sum that can go inside a bisection).
     """
     inv = 1.0 / L
-    limit = m0 + span_sigmas * sigma + margin
+    sg = sigma.sigma if isinstance(sigma, (_PureExp, Surv)) else sigma
+    limit = m0 + span_sigmas * sg + margin
     out = []
     for g, mu in table.items():
         lo = (g - 0.5) * inv
@@ -180,14 +256,18 @@ def reachable_entries(table, L, m0, sigma, margin, span_sigmas=26.0):
 
 
 def p_record(entries, L, sigma, m0, margin=0.0):
-    """P(one reported gap is a record) - or beats by `margin` merit units."""
-    inv = 1.0 / L
+    """P(one reported gap is a record) - or beats by `margin` merit units.
+
+    `sigma` may be a float (exponential from m0) or a Surv (hybrid empirical +
+    fitted family), which is what `--tail`/`--u-rec` select.
+    """
+    S = sigma if isinstance(sigma, (_PureExp, Surv)) else _PureExp(sigma, m0)
     total = 0.0
     for lo, hi, mu in entries:
         a = max(lo, mu + margin, m0)
         b = max(hi, m0)
         if a < b:
-            total += math.exp(-(a - m0) / sigma) - math.exp(-(b - m0) / sigma)
+            total += S.s(a) - S.s(b)
     return total
 
 
@@ -238,12 +318,13 @@ def easiest_target(entries, L, sigma, m0):
 
     Returns (gap, required_merit, bin_lower_edge, contribution).
     """
+    S = sigma if isinstance(sigma, (_PureExp, Surv)) else _PureExp(sigma, m0)
     best = (0, float("nan"), float("nan"), 0.0)
     for lo, hi, mu in entries:
         a = max(lo, mu, m0)
         b = max(hi, m0)
         if a < b:
-            c = math.exp(-(a - m0) / sigma) - math.exp(-(b - m0) / sigma)
+            c = S.s(a) - S.s(b)
             if c > best[3]:
                 best = (int(round(0.5 * (lo + hi) * L)), mu, lo, c)
     return best
@@ -291,6 +372,42 @@ def analyse(path, rows, table, m0, args):
     sigma, se, n_tail = fit_sigma(merits, m0)
     res["sigma"], res["sigma_se"], res["n_tail"] = sigma, se, n_tail
 
+    # --- tail-shape families (extrapolation above u_rec) ------------------
+    # Empirical survival below u_rec, fitted family above it, so exp /
+    # stretched / gpd differ ONLY in the extrapolation.  u_rec = m0 reproduces
+    # the pure-exponential-from-the-threshold behaviour exactly.
+    u_rec = m0
+    if HAVE_TAIL_SHAPE:
+        if args.u_rec == "auto":
+            u_rec = auto_u_rec(merits, 300.0)
+        elif args.u_rec != "m0":
+            u_rec = float(args.u_rec)
+    res["u_rec"] = u_rec
+    fams = {}
+    n_exc = sum(1 for m in merits if m > u_rec)
+    for fam in (ts.FAMILIES if HAVE_TAIL_SHAPE else ()):
+        got = build_family_surv(merits, u_rec, fam)
+        if got is None:
+            continue
+        surv, params = got
+        p_f = p_record(reachable_entries(table, L, u_rec, surv, 0.0),
+                       L, surv, u_rec, 0.0)
+        fams[fam] = {"params": params, "p": p_f,
+                     "gpr": (1.0 / p_f) if p_f > 0 else float("inf"),
+                     "E": p_f * res["n"]}
+        if fam == "gpd" and params.get("xi", 0.0) < -0.02:
+            fams[fam]["endpoint"] = u_rec + params["beta_scale"] / abs(params["xi"])
+    res["families"] = fams
+    res["n_exceedances"] = n_exc
+    res["families"] = fams
+    sel = None
+    if HAVE_TAIL_SHAPE and args.tail != "exp" and args.tail in fams:
+        sel = build_family_surv(merits, u_rec, args.tail)
+    t_obj = sel[0] if sel else sigma
+    t_m0 = u_rec if sel else m0
+    res["tail_used"] = args.tail if sel else "exp"
+    res["u_rec_used"] = t_m0
+
     # --- split model: fit on the first part, predict the second -----------
     if args.holdout and args.holdout > 0.0 and ln_starts:
         order = sorted(range(len(rows)), key=lambda i: rows[i][2])
@@ -331,9 +448,9 @@ def analyse(path, rows, table, m0, args):
             )
 
     # --- full-sample prediction + closest-approach quantiles --------------
-    ent = reachable_entries(table, L, m0, sigma, 0.0)
+    ent = reachable_entries(table, L, t_m0, t_obj, 0.0)
     res["n_entries"] = len(ent)
-    p = p_record(ent, L, sigma, m0)
+    p = p_record(ent, L, t_obj, t_m0)
     res["p_record"] = p
     res["expected"] = p * res["n"]
     res["p_zero"] = math.exp(-res["expected"]) if res["expected"] < 700 else 0.0
@@ -341,29 +458,33 @@ def analyse(path, rows, table, m0, args):
 
     qs = {}
     for q in (0.05, 0.25, 0.5, 0.75, 0.95):
-        qs[q] = dbest_quantile(ent, L, sigma, m0, res["n"], q)
+        qs[q] = dbest_quantile(ent, L, t_obj, t_m0, res["n"], q)
     res["dbest_q"] = qs
     if not math.isnan(res["d_best"]):
         res["d_best_sigmas"] = res["d_best"] / sigma
         # where does the observation sit in the predicted d_best CDF?
         res["d_best_cdf"] = (
-            1.0 - p_record(ent, L, sigma, m0, res["d_best"])
+            1.0 - p_record(ent, L, t_obj, t_m0, res["d_best"])
         ) ** res["n"]
 
-    # --- nearest target + sigma sensitivity band --------------------------
-    g_star, mu_star, lo_star, c_star = easiest_target(ent, L, sigma, m0)
+    # --- nearest target + uncertainty band --------------------------------
+    g_star, mu_star, lo_star, c_star = easiest_target(ent, L, t_obj, t_m0)
     res["t_easy"] = (g_star, mu_star, lo_star, c_star)
-    band = {}
-    for f in (0.95, 1.0, 1.05):
-        sg = sigma * f
-        p_f = p_record(reachable_entries(table, L, m0, sg, 0.0), L, sg, m0)
-        band[f] = (1.0 / p_f) if p_f > 0 else float("inf")
+    if sel is None:
+        band = {}
+        for f in (0.95, 1.0, 1.05):
+            sg = sigma * f
+            p_f = p_record(reachable_entries(table, L, m0, sg, 0.0), L, sg, m0)
+            band[f] = (1.0 / p_f) if p_f > 0 else float("inf")
+        res["band_kind"] = "sigma +-5%"
+    else:
+        # with a fitted family the honest uncertainty is the FAMILY spread,
+        # not a sigma perturbation: the shape is what we do not know.
+        band = {k: v["gpr"] for k, v in fams.items()}
+        res["band_kind"] = "tail-family spread"
     res["gpr_band"] = band
-    res["band_factor"] = (
-        band[0.95] / band[1.05]
-        if band[1.05] > 0 and band[1.05] != float("inf")
-        else float("nan")
-    )
+    finite = [v for v in band.values() if v > 0 and v != float("inf")]
+    res["band_factor"] = (max(finite) / min(finite)) if len(finite) > 1 else float("nan")
     res["obs_gaps_per_record"] = (
         res["n"] / res["n_records"] if res.get("n_records") else float("nan")
     )
@@ -433,13 +554,14 @@ def near_targets(rows, table, L, sigma, m0, top_n):
     the best merit this walk already produced at that exact size, and the
     margin between them (positive = beaten, i.e. a record).
     """
+    S = sigma if isinstance(sigma, (_PureExp, Surv)) else _PureExp(sigma, m0)
     ent = reachable_entries(table, L, m0, sigma, 0.0)
     scored = []
     for lo, hi, mu in ent:
         a = max(lo, mu, m0)
         b = max(hi, m0)
         if a < b:
-            c = math.exp(-(a - m0) / sigma) - math.exp(-(b - m0) / sigma)
+            c = S.s(a) - S.s(b)
             scored.append((c, int(round(0.5 * (lo + hi) * L)), mu))
     scored.sort(reverse=True)
     best_at = {}
@@ -559,11 +681,28 @@ def report(res):
               f" {mu_star:.4f}  (bin edge {lo_star:.3f}, p-contrib {c_star:.2e})")
     band = res.get("gpr_band", {})
     if band:
-        print("  INFER sigma sensitivity (gaps/rec): "
-              + "  ".join(f"sigma*{k:.2f}={v:.2e}" for k, v in sorted(band.items())))
+        print(f"  INFER {res.get('band_kind', 'band')} (gaps/rec): "
+              + "  ".join(f"{k if isinstance(k, str) else format(k, '.2f')}"
+                          f"={v:.2e}"
+                          for k, v in sorted(band.items(),
+                                             key=lambda kv: str(kv[0]))))
         print(f"  INFER band factor                : {res['band_factor']:.2f}x"
               f"  (ranking vs another file is only resolved if the ratio"
               f" exceeds this)")
+    fams = res.get("families", {})
+    if fams:
+        print(f"  INFER tail families above u_rec={res['u_rec']:g}"
+              f" (empirical below, fitted above; n_exc={res.get('n_exceedances', 0)}):")
+        for k, v in fams.items():
+            ep = (f"  endpoint~{v['endpoint']:.1f}" if "endpoint" in v else "")
+            print(f"        {k:10} {ts.describe(k, v['params']):38}"
+                  f" gaps/rec={v['gpr']:.3e}  E={v['E']:.2f}{ep}")
+        if res.get("n_exceedances", 0) < 300:
+            print("        WARNING: fewer than 300 exceedances above u_rec ->"
+                  " the SHAPE is not resolved; the spread below is an upper"
+                  " bound on the ignorance, not a measurement")
+        print(f"        headline uses '{res.get('tail_used', 'exp')}'"
+              f" (u_rec={res.get('u_rec_used', float('nan')):g})")
     if "frontier_slope" in res:
         print(f"  DIAG  frontier slope dmu/dg      : {res['frontier_slope']:+.3e}"
               f"   L*dmu/dg = {res['frontier_slope'] * res['L']:+.4f}"
@@ -637,6 +776,15 @@ def main():
     ap.add_argument("--sigma-fixed", type=float, default=None,
                     help="use one sigma for every shift (removes the sigma(L)"
                          " extrapolation from the scan)")
+    ap.add_argument("--tail", choices=("exp", "stretched", "gpd"),
+                    default="exp",
+                    help="extrapolating family above --u-rec (default exp)")
+    ap.add_argument("--u-rec", default="auto",
+                    help="threshold above which the fitted family takes over:"
+                         " 'auto' (deepest with n>=300), 'm0' (report"
+                         " threshold = the old behaviour), or a number")
+    ap.add_argument("--sigma-band", action="store_true",
+                    help="force the +-5%% sigma band even with --tail != exp")
     args = ap.parse_args()
 
     if not args.files and not args.shift_scan:

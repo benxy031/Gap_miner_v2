@@ -71,8 +71,16 @@ DEFAULT_TABLE = "data/prime_gap_merits.txt"
 # Measured tail scales (docs: gap_hunt_records_f1/f2, scripts/analyze_n3.py).
 # The hunt anchor is 2^(255+shift), so L = (255+shift)*ln2 reproduces the
 # measured L exactly (shift507 -> 528.18, shift1017 -> 881.68).
-SIGMA_ANCHORS = [(528.178, 1.2618), (881.683, 1.3716)]
-SHIPPED_SHIFTS = [258, 450, 507, 998, 1017]
+# Half-width, in gap-size units, of the merit bin that one table entry stands
+# for.  Gaps between odd primes are EVEN, so the walk can only produce sizes on
+# the even lattice: a gap of size g occupies merit in [(g-1)/L, (g+1)/L) and
+# the neighbouring table entry g+2 starts exactly at (g+1)/L.  Half-width 1.0
+# therefore tiles the merit axis without gaps; half-width 0.5 leaves half of it
+# uncovered and under-counts p_record by exactly 2x.
+# VERIFIED against a direct Monte-Carlo on the real table (2026-09-17):
+#   half-width 0.5 -> bin/MC = 0.505 (strong), 0.497 (lex)
+#   half-width 1.0 -> bin/MC = 1.00
+BIN_HALF = 1.0
 
 # Tail-shape machinery lives in tail_shape.py (same directory).  It is only
 # needed for --tail / --u-rec; without it the tool still runs exponential-only.
@@ -249,26 +257,52 @@ def reachable_entries(table, L, m0, sigma, margin, span_sigmas=26.0):
     limit = m0 + span_sigmas * sg + margin
     out = []
     for g, mu in table.items():
-        lo = (g - 0.5) * inv
+        lo = (g - BIN_HALF) * inv
         if lo < limit:
-            out.append((lo, (g + 0.5) * inv, mu))
+            out.append((lo, (g + BIN_HALF) * inv, mu))
     return out
 
 
-def p_record(entries, L, sigma, m0, margin=0.0):
+def p_record(entries, L, sigma, m0, margin=0.0, mu_shift=0.0):
     """P(one reported gap is a record) - or beats by `margin` merit units.
 
     `sigma` may be a float (exponential from m0) or a Surv (hybrid empirical +
     fitted family), which is what `--tail`/`--u-rec` select.
+    `mu_shift` moves EVERY table requirement by that many merit units, which is
+    how the frontier-table uncertainty is probed (negative = easier frontier).
     """
     S = sigma if isinstance(sigma, (_PureExp, Surv)) else _PureExp(sigma, m0)
     total = 0.0
     for lo, hi, mu in entries:
-        a = max(lo, mu + margin, m0)
+        a = max(lo, mu + mu_shift + margin, m0)
         b = max(hi, m0)
         if a < b:
             total += S.s(a) - S.s(b)
     return total
+
+
+def calibrate_mu_shift(entries, L, sigma, m0, n, n_obs):
+    """Uniform frontier shift that would make E[records] match the observation.
+
+    Returns (shift, reachable).  Everything else in the model is already
+    verified (exponential tail, constant L, size = round(m*L)), so this is the
+    single free input: if the observed record count needs a large negative
+    shift, the frontier TABLE disagrees with the one used here.
+    """
+    def gap(x):
+        return n * p_record(entries, L, sigma, m0, 0.0, x) - n_obs
+
+    lo, hi = -8.0, 8.0
+    f_lo, f_hi = gap(lo), gap(hi)
+    if f_lo < 0.0 or f_hi > 0.0:
+        return float("nan"), False
+    for _ in range(60):
+        mid = 0.5 * (lo + hi)
+        if gap(mid) > 0.0:
+            lo = mid
+        else:
+            hi = mid
+    return 0.5 * (lo + hi), True
 
 
 def dbest_quantile(entries, L, sigma, m0, n, q):
@@ -488,6 +522,24 @@ def analyse(path, rows, table, m0, args):
     res["obs_gaps_per_record"] = (
         res["n"] / res["n_records"] if res.get("n_records") else float("nan")
     )
+
+    # --- frontier-table probe ---------------------------------------------
+    # Everything else in the pipeline is verified (exponential tail for this
+    # cover, L constant to 0.000%, size = the even-gap lattice, bin verified
+    # against Monte-Carlo), so the table is the only remaining free input.
+    # These two probes quantify it: a sensitivity grid (what a uniform table
+    # error would do) and a calibration solve (how large it would have to be).
+    res["mu_grid"] = {}
+    if not math.isnan(L):
+        ent_x = reachable_entries(table, L, t_m0, t_obj, 1.5)
+        for x in (-1.5, -1.0, -0.5, 0.5):
+            p_x = p_record(ent_x, L, t_obj, t_m0, 0.0, x)
+            res["mu_grid"][x] = p_x * res["n"]
+        if res.get("n_records"):
+            sh, ok = calibrate_mu_shift(ent, L, t_obj, t_m0, res["n"],
+                                       res["n_records"])
+            res["mu_needed"] = sh
+            res["mu_needed_ok"] = ok
 
     # --- frontier slope in the target region: DIAGNOSTIC ONLY ------------
     # Do NOT rescale sigma by it.  The pointwise sum in p_record already
@@ -723,6 +775,24 @@ def report(res):
         gph = res["gph"]
         print(f"  INFER gaps/hour supplied         : {gph:.0f}"
               f"   -> hours per record = {res['gaps_per_record'] / gph:.1f}")
+    grid = res.get("mu_grid", {})
+    if grid:
+        base = res["expected"]
+        print("  PROBE uniform frontier shift (all table requirements moved):"
+              " E[records]")
+        for x in sorted(grid):
+            ratio = f"   (x{grid[x]/base:.2f} vs nominal)" if base > 0 else ""
+            print(f"        mu {x:+.2f}  ->  E = {grid[x]:8.3f}{ratio}")
+        if "mu_needed" in res:
+            if res["mu_needed_ok"]:
+                print(f"  PROBE required shift to reproduce the {res['n_records']}"
+                      f" observed record(s): mu {res['mu_needed']:+.3f}"
+                      f"  (i.e. the frontier table would have to be"
+                      f" {abs(res['mu_needed']):.2f} merit EASIER)")
+            else:
+                print(f"  PROBE no uniform shift in [-8,+8] reproduces the"
+                      f" observed {res['n_records']} record(s) -> the gap is NOT"
+                      f" a uniform table offset")
     sw = res.get("sweep")
     if sw:
         best = max(sw, key=lambda r: r[4])
@@ -783,9 +853,18 @@ def main():
                     help="threshold above which the fitted family takes over:"
                          " 'auto' (deepest with n>=300), 'm0' (report"
                          " threshold = the old behaviour), or a number")
+    ap.add_argument("--bin-half", type=float, default=None,
+                    help="override the merit-bin half-width in gap-size units"
+                         " (default 1.0 = the even-gap lattice; 0.5 reproduces"
+                         " the pre-2026-09-17 numbers, which were 2x low)")
     ap.add_argument("--sigma-band", action="store_true",
                     help="force the +-5%% sigma band even with --tail != exp")
     args = ap.parse_args()
+    if args.bin_half is not None:
+        global BIN_HALF
+        BIN_HALF = args.bin_half
+        print(f"NOTE: bin half-width overridden to {BIN_HALF:g} gap units "
+              f"(1.0 = correct for the even-gap lattice)")
 
     if not args.files and not args.shift_scan:
         ap.error("give at least one gap file or --shift-scan")

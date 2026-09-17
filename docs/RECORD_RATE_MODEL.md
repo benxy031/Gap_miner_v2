@@ -75,8 +75,11 @@ which is what makes the validation testable without a single GPU-second.
 | observed `d_best` | −6.7532 (−5.35 σ) | −3.9694 (−2.89 σ) |
 | predicted `d_best` median | −4.58 | **−4.00** |
 | observed CDF position | 0.112 | **0.514** |
-| E[records], P(observe 0) | 0.035, 0.965 | 0.087, 0.916 |
-| gaps per record | 2.141e7 | **2.677e6** |
+| E[records], P(observe 0) | 0.071, 0.932 | 0.175, 0.840 |
+| gaps per record | 1.071e7 | **1.339e6** |
+
+(values corrected by §10; the pre-correction figures were 0.035/0.965,
+0.087/0.916, 2.141e7 and 2.677e6)
 
 Out-of-sample (fit sigma on the first half by anchor order, predict the rest):
 
@@ -309,7 +312,7 @@ no single rescale fits both covers — strong moves 5.7 → 4.9 (divide) or
 against an observed 10. The slope is now reported as a **DIAG** line only and
 is never applied to sigma. Registered in `docs/CLOSED_FINGERPRINTS.md`.
 
-## 9. Tail shape: exponential rejected at depth, replacement NOT determined (2026-09-17)
+## 9. Tail shape: is the deep tail exponential? (§9.1-9.6 = small-sample pass, superseded by the powered result in §9.7)
 
 Tool: `scripts/tail_shape.py` (stdlib-only; `--selftest` verifies every
 estimator on synthetic samples before use: exp 0.03 % off, stretched
@@ -427,7 +430,8 @@ single usable held-out point (n = 16). The three families differ by
 Delta-LL = 0.16 and all |z| < 1 — **no discrimination**. Locally the deep tail
 cannot be settled; the N3 u=16 fit (n = 1509, Delta-LL = 7.8) stays the only
 discriminating measurement, and the fleet's LIVE files (16 866 / 17 240 gaps at
-threshold 18, ~10-50x the local snapshots) are the ones that can settle it.
+threshold 18, ~10-50x the local snapshots) are the ones that can settle it —
+**done in §9.7, which supersedes §9.1-9.6.**
 Command for the fleet box (pooling is not needed there — each file is already
 big):
 
@@ -436,7 +440,138 @@ scripts/tail_shape.py data/gap_hunt_records_f1.txt \
     data/gap_hunt_records_f2.txt --u-fit 18 --u-test 21,23,25
 ```
 
-## 10. What this does not claim
+### 9.7 Powered fleet result (2026-09-17): the ceiling was a small-sample artifact
+
+Command on the live fleet files (16 893 / 17 275 gaps at threshold 18):
+
+```
+scripts/tail_shape.py data/gap_hunt_records_f1.txt \
+    data/gap_hunt_records_f2.txt --u-fit 18 --u-test 21,23,25
+```
+
+| file | measured mean excess @21 / 23 / 25 | best held-out LL | xi(gpd) |
+|---|---|---|---|
+| f1 strong | 1.2997 (n=1482) / 1.1992 (325) / 1.3130 (58) | **exp** -2329.20 | -0.0179 |
+| f2 lex | 1.2933 (1888) / 1.2493 (390) / 1.2123 (59) | **gpd** -2916.46 | -0.0275 |
+
+FACT (f1 strong): the exponential has the best held-out log-likelihood;
+Delta-LL(exp - gpd) = 1.78, i.e. 2Delta-LL = 3.6 for one extra parameter ->
+**not significant**. The mean excess is FLAT within errors (the 23-point dips
+1.4 sigma and reverses at 25). The exponential is ADEQUATE here.
+FACT (f2 lex): the GPD wins by Delta-LL = 8.77 (2Delta-LL = 17.5, p ~ 3e-5) and
+the exponential over-predicts the held-out deep counts - at M0=23, 441.5
+predicted vs 390 observed (z = -2.45); at M0=25, 101.9 vs 59 (z = **-4.25**).
+The mean excess falls 1.293 -> 1.212. The exponential is REJECTED here.
+FACT: both shape parameters are MILD (-0.018, -0.0275) and the implied
+endpoints (~69 for lex, effectively unbounded for strong) sit far above the
+operating range (merit <= 30).
+
+DERIVED - this refutes the headline of §9.3:
+
+* The "finite merit ceiling at 26-45" came from a fit at u=16 on n=1509. With
+  10x more data at the record-relevant threshold the ceiling moves to ~69 and
+  the shape parameter shrinks by ~3x. That claim is downgraded from
+  HYPOTHESIS-with-numbers to **refuted as stated**; the u=16 endpoint was a
+  small-sample artifact.
+* The exponential is therefore NOT the problem for the strong cover - its tail
+  IS exponential. The strong-cover record surplus (13 observed vs 5.69
+  predicted, §8.3) is **not a tail-shape effect**; the remaining candidate is
+  the record probability GIVEN a deep gap, i.e. size-exact landing and/or the
+  provenance of the frontier table (§3).
+* For the lex cover the better-fitting family predicts ~2x FEWER records, i.e.
+  it makes the model *worse* (exp E = 9.06 vs observed 10). The exponential's
+  agreement with the lex record count is therefore not evidence FOR the
+  exponential - it may be a cancellation.
+
+BONUS - model-free confirmation of the tail crossing (§8.2):
+`tail_compare.py` measured sigma at the report threshold: strong 1.2741 < lex
+1.3621. The mean-excess curves here say the opposite at depth: strong is flat
+(1.30 / 1.20 / 1.31) while lex falls (1.29 / 1.25 / 1.21). Two independent,
+model-free statistics on the same files agree, so the crossing no longer rests
+on a single sigma comparison.
+
+The tool's own NOTE was correct in advance: for the strong cover it printed
+"xi is indistinguishable from 0 at this threshold ... refit higher". Refitting
+higher costs sample size faster than it buys shape resolution (n=325 at M0=23,
+n=58 at M0=25), so the honest statement is: **as far as 17k gaps at threshold
+18 can see, the strong cover's tail is exponential and the lex cover's is very
+slightly lighter.**
+
+## 10. Correction (2026-09-17): the size bin must be 2/L wide
+
+**The bug.** Gaps between odd primes are EVEN, so the walk can only produce
+sizes on the even lattice. A gap of size `g` therefore occupies merit in
+`[(g-1)/L, (g+1)/L)` — width `2/L` — and the next table entry `g+2` starts
+exactly at `(g+1)/L`, so those bins tile the merit axis. The code used a
+half-width of 0.5, leaving **half the merit axis uncovered**, which made
+`p_record` exactly 2x too small.
+
+**How it was found, and the trap on the way.** A synthetic self-test (data
+generated exactly per the model's own assumptions: exponential merit tail,
+size = round(m*L), a known frontier) reported the model 10x low — which is what
+made me look. The first synthetic table was *derived from the sample itself*,
+so it was sparse and the arithmetic of that test was misleading in its own
+right. The decisive evidence is a direct **Monte-Carlo on the REAL table**:
+draw merits from the tail, map to the even-gap lattice, look up the table.
+
+| half-width | bin-sum vs Monte-Carlo (strong / lex) |
+|---|---|
+| 0.5 (old) | 0.507 / 0.510 |
+| 1.0 (fixed) | **1.014 / 1.019** |
+
+Supporting fact: the real table is **100 % dense** in the record-relevant band
+(2501 entries for 2500 possible even sizes in [21000, 26000], 5501 for 5500 in
+[21000, 32000]) and contains **no odd gap above 1000**, so the lattice argument
+applies cleanly.
+
+**Impact.** `p_record` x2, `E[records]` x2, gaps-per-record /2. Crucially the
+**band factors and every inter-file ratio are unchanged** (both scale by 2), so
+the ranking verdicts in §2, §5 and §8 still stand as written.
+`--bin-half 0.5` reproduces the pre-correction numbers exactly
+(f1 2.141e7, f2 2.677e6), which is the proof that the change is isolated.
+
+| quantity | f1 (shift507 lex) | f2 (shift1017 lex) |
+|---|---|---|
+| E[records], corrected | 0.071 (P(obs 0)=0.932) | 0.175 (P(obs 0)=0.840) |
+| gaps per record, corrected | 1.071e7 | 1.339e6 |
+| superseded values | 0.035 / 2.141e7 | 0.087 / 2.677e6 |
+
+The `--mu-shift` grid and calibration solve added for the frontier audit are
+kept as diagnostics, but they are **no longer needed to explain the
+strong-cover surplus**: that surplus was this bug.
+
+## 11. The fleet arithmetic closes
+
+Correcting the bin (x2) and using the independently measured tail shape per
+cover:
+
+| | observed | old model | corrected bin | + measured tail |
+|---|---|---|---|---|
+| f1 strong, in-sample | 13 | 5.69 (2.3x low) | 11.38 (**1.14x low**) | 11.38 (exponential tail verified §9.7) |
+| f1 strong, holdout | 8 | 1.94 (4.1x low) | 3.89 (2.1x low) | 3.89 |
+| f2 lex, in-sample | 10 | 9.06 (1.10x low) | 18.12 (1.81x high) | **~10.6 ✓** |
+| f2 lex, holdout | 7 | 5.52 | 11.04 (1.58x high) | **~6.5 ✓** |
+
+The lex rows use the measured over-prediction of the exponential at depth
+(§9.7: 101.9 predicted vs 59 observed at M0=25 = 1.73x) as the correction
+factor. Both covers therefore reconcile to within ~15 % once each correction is
+applied on its own evidence. **The 2.3x/4.1x discrepancy that motivated the
+whole frontier audit and the tail-shape investigation was a factor-2 bin bug in
+my own code**, not the tail and not the table.
+
+Consequences worth stating plainly:
+
+* Numbers reported earlier today for `E[records]` and gaps-per-record
+  (5.69 / 9.06 / 2.96e3 / 1.90e3 / 2.677e6 / 2.141e7) are **superseded** by a
+  factor 2. Use `--bin-half 0.5` only to reproduce them deliberately.
+* The *qualitative* results survive untouched: the ranking and band rule, the
+  threshold-invariance tautology, the size-exact frontier finding, the tail
+  crossing, the rejection of `sigma_eff`, and the tail-shape verdicts.
+* Any future probability kernel of the form "a lattice quantity lands in a
+  bin" must be validated against a Monte-Carlo on the real table BEFORE it is
+  used to score coverings.
+
+## 12. What this does not claim
 * Not a record claim: the tool emits no `FIRST_KNOWN_OCCURRENCE`; it only
   evaluates the same predicate the watcher uses.
 * Not an absolute-time predictor: sigma uncertainty alone moves the numbers by

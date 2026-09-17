@@ -1239,7 +1239,29 @@ int gap_hunt_run(const struct gap_hunt_config *cfg) {
             uint64_t dw_tick = windows - win_last;   /* windows in THIS tick */
             t_last = tn;
             win_last = windows;
-            save_state(cfg->state_path, next_k, last_prime, have_last);
+            /* CONSERVATIVE WATERMARK: a flight that is still in the air has
+               been FILLED but not yet COLLECTED, so its windows are not in the
+               output file yet.  Saving next_k here would claim them as done and
+               a hard kill (SIGKILL/OOM/power, i.e. anything that skips the
+               drain below) would then skip up to g_batch windows forever.
+               Save the oldest unprocessed window instead: after a hard kill the
+               walk redoes at most one batch, which is harmless (the same gaps
+               are re-emitted), while a skip is a lost lottery ticket. */
+            uint64_t k_safe = next_k;
+            if (A.active && A.base_k[0] < k_safe)
+                k_safe = A.base_k[0];
+            if (B.active && B.base_k[0] < k_safe)
+                k_safe = B.base_k[0];
+            if (getenv("GAPDEBUG"))
+                fprintf(stderr, "[GAPDEBUG] watermark next_k=%llu "
+                        "A(act=%d n=%u k0=%llu) B(act=%d n=%u k0=%llu) "
+                        "-> k_safe=%llu\n",
+                        (unsigned long long)next_k, A.active, A.n_windows,
+                        (unsigned long long)A.base_k[0],
+                        B.active, B.n_windows,
+                        (unsigned long long)B.base_k[0],
+                        (unsigned long long)k_safe);
+            save_state(cfg->state_path, k_safe, last_prime, have_last);
             last_save = windows;
             fprintf(stderr,
                     "[GAP_HUNT] k=%llu windows=%llu gaps=%llu best_merit=%.6f "

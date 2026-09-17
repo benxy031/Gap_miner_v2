@@ -133,6 +133,24 @@ def main():
             fo.write(f"# snapshot table={table_path} sha256[:12]={sha12} "
                      f"gaps={n_gaps} date={stamp}\n")
 
+    # Records already claimed: (gap, merit, start).  Makes the catch-up pass
+    # below and every restart idempotent - the walker can also re-emit the same
+    # gap after a restart, which must not create a second claim.
+    logged = set()
+    try:
+        with open(out_path, "r", errors="ignore") as fo:
+            for ln in fo:
+                p = ln.split()
+                if len(p) >= 3 and not ln.startswith("#"):
+                    try:
+                        logged.add((int(p[0]), f"{float(p[1]):.6f}", p[2]))
+                    except ValueError:
+                        pass
+    except FileNotFoundError:
+        pass
+    if logged:
+        print(f"[watch] {len(logged)} record(s) already claimed in {out_path}")
+
     checked = 0
     records = 0
     start_str = ""
@@ -148,6 +166,11 @@ def main():
             return  # unknown gap: not a record (miner convention)
         best = table[gap]
         if merit > best:
+            key = (gap, f"{merit:.6f}", start_str)
+            if key in logged:
+                table[gap] = merit   # already claimed; do not claim twice
+                return
+            logged.add(key)
             records += 1
             stamp = datetime.datetime.now(datetime.timezone.utc).strftime(
                 "%Y-%m-%dT%H:%M:%SZ")
@@ -168,6 +191,18 @@ def main():
         return 0
 
     # Follow mode (tail -F-like, tolerates truncation/rotation).
+    # CATCH-UP FIRST: the loop below seeks to EOF, so any record written while
+    # no watcher was running (crashed watcher, walker started by hand, a manual
+    # run) would silently NEVER be claimed.  Read the whole file once before
+    # following; the `logged` set keeps this idempotent across restarts.
+    try:
+        with open(log_path, "r") as f:
+            for line in f:
+                process_line(line.rstrip("\n"), out_path)
+        print(f"[watch] catch-up: {checked} lines seen, "
+              f"{records} new record(s) claimed")
+    except FileNotFoundError:
+        pass
     while True:
         try:
             with open(log_path, "r") as f:

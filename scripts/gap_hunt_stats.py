@@ -76,6 +76,42 @@ def parse_file(path):
     return recs
 
 
+def file_integrity(path):
+    """(lines, distinct_starts, duplicate_lines, size_hist).
+
+    A "duplicate" in a report is ambiguous because merit is a FUNCTION of the
+    gap size when L = ln(anchor) is constant (measured spread 0.000%): two
+    genuinely different gaps of the same size print identically.  Only the
+    start prime distinguishes them, so integrity must be checked on the raw
+    line.  Locally 2453 sizes repeat in 755202 gaps, i.e. repeated
+    (gap, merit) pairs are EXPECTED and are not evidence of a re-emission.
+    """
+    lines = 0
+    starts = set()
+    seen = set()
+    dup = 0
+    hist = {}
+    with open(path, "r", errors="ignore") as f:
+        for line in f:
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            parts = line.split()
+            if len(parts) < 3:
+                continue
+            lines += 1
+            starts.add(parts[2])
+            if line in seen:
+                dup += 1
+            else:
+                seen.add(line)
+            try:
+                hist[int(parts[0])] = hist.get(int(parts[0]), 0) + 1
+            except ValueError:
+                pass
+    return lines, len(starts), dup, hist
+
+
 def main():
     args = sys.argv[1:]
     table_path = "data/prime_gap_merits.txt"
@@ -98,6 +134,7 @@ def main():
     if not files:
         print("no results files found", file=sys.stderr)
         return 2
+    l_info = []
 
     for path in files:
         recs = parse_file(path)
@@ -109,6 +146,7 @@ def main():
         best = merits[-1]
         best_gap = max((g for g, m, _ in recs if m == best), default=0)
         L = sum(ln for _, _, ln in recs) / len(recs)
+        l_info.append((path, L))
 
         # sigma: mean excess over threshold (exponential MLE)
         sig_me = sum(m - m_min for m in merits) / len(merits)
@@ -166,16 +204,30 @@ def main():
         print(f"== {path}")
         print(f"   records={n} threshold={m_min:.4f} best={best:.6f} "
               f"(gap {best_gap}) logbase~{L:.1f}")
+        lines, dstarts, dup, size_hist = file_integrity(path)
+        print(f"   integrity: lines={lines} distinct_starts={dstarts} "
+              f"duplicate_lines={dup}"
+              + ("  [OK: no line appears twice]" if dup == 0 else
+                 f"  [WARNING: {dup} identical line(s) -> re-emitted gap]"))
+        if dstarts < lines and dup == 0:
+            print(f"   NOTE: {lines - dstarts} repeated start(s) that are not"
+                  f" identical lines -> same size, different gaps (normal;"
+                  f" merit is a function of the gap size at constant L)")
+        # sizes carried by more than one gap are printed with an xN suffix so
+        # the lists below can never be misread as duplicates
+        def szn(g):
+            c = size_hist.get(g, 1)
+            return f" x{c}" if c > 1 else ""
         print(f"   sigma: mean-excess={sig_me:.3f}"
               + (f"  quantile={sig_q:.3f}" if sig_q else "")
               + ("  [n<30: NOISY — prior 1.29 used below]" if small else ""))
         if found:
             print(f"   *** {len(found)} RECORD(S) ALREADY FOUND ***")
             for d, g, m, _ in found:
-                print(f"      gap={g} merit={m:.6f} delta={d:.6f}")
+                print(f"      gap={g}{szn(g)} merit={m:.6f} delta={d:.6f}")
         print("   closest to a record:")
         for d, g, m, tag in near:
-            print(f"      gap={g} merit={m:.6f} "
+            print(f"      gap={g}{szn(g)} merit={m:.6f} "
                   f"needed={table[g]:.6f} delta={d:.6f}")
         print(f"   P(next reported gap is a record): easiest target "
               f"merit={m_easy:.3f} (gap {tgt[0][1]})")
@@ -202,6 +254,22 @@ def main():
         for m, g, bm in tgt[:8]:
             print(f"      {m:.3f}  {g}  (table {bm:.4f})")
         print()
+
+    # Cross-file guard (AFTER the loop): the default glob is
+    # data/gap_hunt_records*.txt, which can mix DIFFERENT shifts/covers
+    # (locally f1 = shift507 L=528.178 while f2 = shift450 L=488.669).  A report
+    # that silently merges them invites wrong conclusions, so say it out loud.
+    if len(l_info) > 1:
+        lo = min(x[1] for x in l_info)
+        hi = max(x[1] for x in l_info)
+        if lo > 0.0 and (hi - lo) / hi > 0.001:
+            print("\nWARNING: this file set mixes different size scales "
+                  "(L = ln anchor):")
+            for p, l in l_info:
+                print(f"          {os.path.basename(p):38} L={l:.3f}"
+                      f"  shift~{l / 0.693147 - 255:.0f}")
+            print("         Different configurations: compare them per file, "
+                  "never as one pooled sample.")
     return 0
 
 

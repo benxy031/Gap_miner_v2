@@ -732,9 +732,14 @@ static void gpu_pending_flush(uint32_t worker_id, struct worker_config *config,
         int inflight_mask = 0;
         int next_slot = 0;
         while (off < st->total && gpu_ok) {
+            /* Chunk at the CONTEXT's real cap, not the compile-time macro:
+               a stale gpu_adapter.o can carry an older/smaller cap, and a
+               batch above it is truncated silently (2026-09-17 incident). */
+            uint32_t cap = (uint32_t)gpu_fermat_max_batch(
+                gpu_adapter_get_fermat_ctx(gpu));
+            if (cap == 0) cap = GPU_ADAPTER_MAX_BATCH;
             uint64_t remaining = st->total - off;
-            uint32_t chunk = remaining > GPU_ADAPTER_MAX_BATCH ?
-                             GPU_ADAPTER_MAX_BATCH : (uint32_t)remaining;
+            uint32_t chunk = remaining > cap ? cap : (uint32_t)remaining;
             if (gpu_adapter_async_submit_packed(gpu, next_slot,
                                                 packed + off * (size_t)limbs,
                                                 chunk) != 0) {
@@ -1568,9 +1573,13 @@ static int crt_gpu_batch_test(struct gpu_adapter *gpu, int limbs,
 
     uint64_t done = 0;
     int slot = 0;
+    /* Same rule as above: chunk at the context's real cap. */
+    uint32_t mb_cap = (uint32_t)gpu_fermat_max_batch(
+        gpu_adapter_get_fermat_ctx(gpu));
+    if (mb_cap == 0) mb_cap = GPU_ADAPTER_MAX_BATCH;
     while (done < count) {
-        uint32_t chunk = (count - done) > GPU_ADAPTER_MAX_BATCH ?
-                         GPU_ADAPTER_MAX_BATCH : (uint32_t)(count - done);
+        uint32_t chunk = (count - done) > mb_cap ?
+                         mb_cap : (uint32_t)(count - done);
         if (gpu_adapter_async_submit_packed(gpu, slot,
                                             packed + done * (size_t)limbs,
                                             chunk) != 0) {
@@ -1609,6 +1618,16 @@ static int crt_gpu_batch_test(struct gpu_adapter *gpu, int limbs,
    gather staging buffers are per-ctx) and the full-class fused path.
    Fail-closed: any chain error falls back to a full scan of the same
    flight, and any further error disables the fused path. */
+/* HARD cap 128.  It was raised to 256 on 2026-09-17 and IMMEDIATELY REVERTED:
+   with MAX=256 the chain's emitted merit-candidate set no longer matches the
+   full scan (MINING_JUMP2_VERIFY=1 at K=256: the first flights print clean,
+   then windows=256 bad_windows=75..83 bad_pairs=14..28), so some downstream
+   buffer or assumption is still 128-wide and degrades SILENTLY instead of
+   failing closed.  The apparent +15% throughput at K=256 (5564/5692 win/s vs
+   4864/4911 at K=128, quiet GPU, order swapped) is therefore INVALID - it
+   measured the wrong path.  Reopen only together with a parity-clean audit of
+   every 128-wide assumption in the chain gather/submit/collect path.  K=128 is
+   parity-verified (windows=128 bad_windows=0 bad_pairs=0). */
 #define MINING_JUMP2_BATCH_MAX 128
 /* Per-window chain chunk.  Measured (RTX 3070, shift512 p75, live difficulty
    ~23.9, 1 thread, fused path, 120-300 s): chunk 32 and 64 give the same
@@ -3086,7 +3105,10 @@ void *worker_thread_run_crt(void *arg) {
        restores the full scan.  Still inert without FUSED_GPU=1. */
     const char *mj2_env = getenv("MINING_JUMP2");
     int mining_jump2 = (mj2_env && mj2_env[0] == '0') ? 0 : 1;
-    int mining_jump2_batch = 64;
+    /* Default 128 (was 64, 2026-09-17): +35% measured on the quiet dev GPU at
+       shift512 (K=64 3902/3780 -> K=128 5218/5175 win/s, order swapped, same
+       120.3 MR tests per window), parity-verified at 128. */
+    int mining_jump2_batch = 128;
     {
         const char *mb = getenv("MINING_JUMP2_BATCH");
         if (mb && *mb) {

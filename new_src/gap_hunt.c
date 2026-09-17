@@ -149,8 +149,12 @@ static int load_state(const char *path, uint64_t *k, mpz_t last_prime,
    ~3.6 ms fixed + 0.76 us/test), so every window in a round pays that floor
    divided by the number of windows sharing it.  More windows per round =
    cheaper rounds; the device cost is only the gather/candidate buffers
-   (K x chunk x limbs), well within the 160000-candidate adapter cap. */
-#define GAP_HUNT_BATCH_MAX 64
+   (K x chunk x limbs), well within the 160000-candidate adapter cap.
+   Cap raised 64 -> 128 (2026-09-17): the ~4 ms per-launch floor is still the
+   amortization target (32 -> 64 measured +21% at shift1017, +28% at shift507),
+   so a further doubling is now testable; the default stays 64 until the A/B
+   with the raised cap is in. */
+#define GAP_HUNT_BATCH_MAX 128
 /* Default 64 (was 32).  A chain round has a ~4 ms per-LAUNCH floor, so the
    windows sharing a round split it: doubling the batch is worth +21% (shift1017
    559 -> 679 win/s) and +28% (shift507 1876 -> 2406 win/s) with the same tested
@@ -159,6 +163,11 @@ static int g_batch = 64;       /* GAP_HUNT_BATCH env, clamped 1..MAX */
 static int g_quarter = 0;      /* GAP_HUNT_QUARTER env: 4-visible-class scan */
 static uint64_t g_kmax = 0;    /* GAP_HUNT_KMAX env: stop hook (tests/bench) */
 #define GAP_HUNT_JUMP_CAP 16   /* per-window gap capacity in jump mode */
+/* Hard line cap for the GHDBG_DUMP_K diagnostics file.  The cap is the point:
+   the first version of that hook could dump every candidate of every window,
+   which wrote 8.1 GB and took the editor down (2026-09-17).  A diagnostic must
+   never be able to flood the terminal again. */
+#define GHDUMP_CAP 40000
 static int g_jump = 0;         /* GAP_HUNT_JUMP env: Kehrig-style walk */
 /* Per-window chunk cap for the chain.  Default 32 (was 64): with a 64-window
    batch the round floor is amortized, so the optimum moves to the smaller
@@ -219,6 +228,7 @@ struct gh_ctx {
     int gpu_limbs;
     uint64_t *base_limbs;
     uint64_t capacity;          /* host offsets capacity per window */
+    uint64_t cap;               /* REAL per-submit candidate cap of the MR ctx */
     uint64_t interval;
     uint64_t odd_interval_size;
     uint64_t back_limit;
@@ -561,9 +571,10 @@ static int gh_batch_fill(struct gh_batch *b, int slot, uint64_t k0,
                     (unsigned long long)k, i);
             return 0;
         }
-        if (cum + nc > GPU_ADAPTER_MAX_BATCH) {
-            fprintf(stderr, "[GAP_HUNT] fill fail: cum=%u + nc=%u > %u "
-                    "(k=%llu i=%u)\n", cum, nc, GPU_ADAPTER_MAX_BATCH,
+        if (cum + nc > g->cap) {
+            fprintf(stderr, "[GAP_HUNT] fill fail: cum=%u + nc=%u > %llu "
+                    "(k=%llu i=%u)\n", cum, nc,
+                    (unsigned long long)g->cap,
                     (unsigned long long)k, i);
             return 0;
         }
@@ -581,7 +592,7 @@ static int gh_batch_fill(struct gh_batch *b, int slot, uint64_t k0,
                 return 0;
             if ((uint64_t)(nc + nc2) > g->capacity)
                 return 0;
-            if (cum + nc2 > GPU_ADAPTER_MAX_BATCH)
+            if (cum + nc2 > g->cap)
                 return 0;
             b->count[i] = nc + nc2;
             cum += nc2;
@@ -730,10 +741,44 @@ static void gh_batch_process(struct gh_batch *b, const uint8_t *flags,
            window; its first prime has an unknown predecessor. */
         *have_last = 0;
         uint64_t prev_off = 0;
+        /* Bounded dump hook (diagnostics only).  GHDBG_DUMP_K=<k> writes EVERY
+           candidate of that ONE window (index, offset, MR verdict) into
+           GHDBG_DUMP_FILE (default /tmp/ghdump_<k>.txt), hard-capped at
+           GHDUMP_CAP lines.  That is what a missed gap must be diagnosed
+           with: is the endpoint absent from the candidate list, or present
+           with a wrong flag? */
+        const char *dump_k_env = getenv("GHDBG_DUMP_K");
+        FILE *dump_fp = NULL;
+        long dump_lines = 0;
+        if (dump_k_env && dump_k_env[0] &&
+            (unsigned long long)b->base_k[i] ==
+                strtoull(dump_k_env, NULL, 10)) {
+            const char *df = getenv("GHDBG_DUMP_FILE");
+            char dpath[512];
+            if (!df || !df[0]) {
+                snprintf(dpath, sizeof(dpath), "/tmp/ghdump_%s.txt", dump_k_env);
+                df = dpath;
+            }
+            dump_fp = fopen(df, "w");
+            if (dump_fp)
+                fprintf(dump_fp, "[GHDUMP] win k=%llu count=%u\n",
+                        (unsigned long long)b->base_k[i], b->count[i]);
+        }
         for (uint32_t j = 0; j < b->count[i]; j++) {
-            if (!flags[b->cum[i] + j])
+            uint8_t is_prime = flags[b->cum[i] + j];
+            if (dump_fp && dump_lines < GHDUMP_CAP) {
+                fprintf(dump_fp, "[GHDUMP]   j=%u off=%llu prime=%u\n", j,
+                        (unsigned long long)b->win_off[i][j], is_prime);
+                dump_lines++;
+            }
+            if (!is_prime)
                 continue;
             uint64_t off = b->win_off[i][j];
+            if (dump_fp && dump_lines < GHDUMP_CAP) {
+                fprintf(dump_fp, "[GHDUMP]   prime off=%llu\n",
+                        (unsigned long long)off);
+                dump_lines++;
+            }
             mpz_set(p1, b->win_base[i]);
             mpz_add_ui(p1, p1, off);
             if (*have_last) {
@@ -826,6 +871,12 @@ static void gh_batch_process(struct gh_batch *b, const uint8_t *flags,
             mpz_set(last_prime, p1);
             *have_last = 1;
             prev_off = off;
+        }
+        if (dump_fp) {
+            fprintf(dump_fp, "[GHDUMP] end (lines=%ld, cap=%d)\n",
+                    dump_lines, GHDUMP_CAP);
+            fclose(dump_fp);
+            dump_fp = NULL;
         }
         (*windows)++;
     }
@@ -931,6 +982,23 @@ int gap_hunt_run(const struct gap_hunt_config *cfg) {
         crt_runtime_free(&rt);
         return 1;
     }
+    /* Geometry dump (GAPDEBUG=1): window k covers
+       [b0 + k*P - back_limit, b0 + k*P - back_limit + interval), so a
+       reported start prime maps back with k = (p + back_limit - b0) / P.
+       Needed to reproduce a specific window from its emitted gap. */
+    if (getenv("GAPDEBUG")) {
+        char *b0s = mpz_get_str(NULL, 10, b0);
+        char *ps = mpz_get_str(NULL, 10, P);
+        fprintf(stderr, "[GHDBG] geometry: back_limit=%llu interval=%llu "
+                        "window=%llu n_primes=%u shift=%u\n",
+                (unsigned long long)back_limit,
+                (unsigned long long)interval,
+                (unsigned long long)rt.window, rt.n_primes, rt.shift);
+        fprintf(stderr, "[GHDBG] b0=%s\n", b0s);
+        fprintf(stderr, "[GHDBG] P=%s\n", ps);
+        free(b0s);
+        free(ps);
+    }
 
     /* GAP_HUNT_TIMING=1 must also turn on the gpu_sieve CUDA-event accounting,
        which is armed at gpu_sieve_init() below, so it has to be exported
@@ -1019,25 +1087,34 @@ int gap_hunt_run(const struct gap_hunt_config *cfg) {
     base_limbs = (uint64_t *)calloc((size_t)gpu_limbs, sizeof(uint64_t));
     size_t win_cap = (size_t)sieve.candidate_capacity;
     /* Batch/round guard: one chain round submits up to g_batch x survivors
-       candidates, and the MR staging buffers (GPU_ADAPTER_MAX_BATCH) must hold
-       them -- the fill fails closed otherwise.  NOTE: win_cap is the per-window
-       CAPACITY (an upper bound), not the survivor count; clamping with it would
-       shrink the batch to a handful of windows (measured: batch 6 at shift507,
-       3 at shift1017 -> 420 and 67 win/s).  Use the observed survivor density
-       instead: a CRT cover leaves ~1/8 of the odd slots as survivors, so
-       odd_interval_size/8 is a realistic estimate with margin, and the hard
-       `cum + nc > cap` check in the fill remains the final guard. */
+       candidates and the MR context must hold them -- the fill fails closed
+       otherwise.  The bound comes from the CONTEXT (gpu_fermat_max_batch),
+       never from the compile-time macro: on 2026-09-17 a stale gpu_adapter.o
+       still carried the old 160000 while this file guarded against the newer
+       320000, so every oversize batch was truncated silently and its tail
+       windows lost their verdicts (the full-scan miss investigated that day).
+       NOTE: win_cap is the per-window CAPACITY (an upper bound), not the
+       survivor count; clamping with it would shrink the batch to a handful of
+       windows (measured: batch 6 at shift507, 3 at shift1017 -> 420 and
+       67 win/s).  Use the observed survivor density instead: a CRT cover
+       leaves ~1/8 of the odd slots as survivors, so odd_interval_size/8 is a
+       realistic estimate with margin, and the hard `cum + nc > cap` check in
+       the fill remains the final guard. */
+    uint64_t cap_real = 0;   /* real per-submit cap of the MR context */
     {
         uint64_t est = (uint64_t)(odd_interval_size / 8U);
+        cap_real = (uint64_t)gpu_fermat_max_batch(fermat);
+        if (cap_real == 0)
+            cap_real = GPU_ADAPTER_MAX_BATCH;
         if (est < 1) est = 1;
-        if ((uint64_t)g_batch * est > GPU_ADAPTER_MAX_BATCH) {
-            int nb = (int)(GPU_ADAPTER_MAX_BATCH / est);
+        if ((uint64_t)g_batch * est > cap_real) {
+            int nb = (int)(cap_real / est);
             if (nb < 1) nb = 1;
             if (nb != g_batch) {
                 fprintf(stderr, "[GAP_HUNT] batch reduced %d -> %d "
-                                "(est survivors/window=%llu, cap %u)\n",
+                                "(est survivors/window=%llu, cap %llu)\n",
                         g_batch, nb, (unsigned long long)est,
-                        GPU_ADAPTER_MAX_BATCH);
+                        (unsigned long long)cap_real);
                 g_batch = nb;
             }
         }
@@ -1089,12 +1166,14 @@ int gap_hunt_run(const struct gap_hunt_config *cfg) {
 
     fprintf(stderr,
             "[GAP_HUNT] walk: shift=%u n_primes=%u P bits=%.0f window=%llu "
-            "sieve=%u batch=%d quarter=%d jump=%d jump2=%d jump2_chunk=%d "
+            "sieve=%u batch=%d mrcap=%llu quarter=%d jump=%d jump2=%d "
+            "jump2_chunk=%d "
             "kmax=%llu min_merit=%.6f "
             "k0=%llu device=%d\n",
             rt.shift, rt.n_primes,
             (double)mpz_sizeinbase(P, 2),
-            (unsigned long long)rt.window, sieve_primes, g_batch, g_quarter,
+            (unsigned long long)rt.window, sieve_primes, g_batch,
+            (unsigned long long)cap_real, g_quarter,
             g_jump, g_jump2, g_jump2_chunk,
             (unsigned long long)g_kmax, cfg->min_merit,
             (unsigned long long)k, cfg->device);
@@ -1145,6 +1224,7 @@ int gap_hunt_run(const struct gap_hunt_config *cfg) {
     g.gpu_limbs = gpu_limbs;
     g.base_limbs = base_limbs;
     g.capacity = (uint64_t)sieve.candidate_capacity;
+    g.cap = cap_real;
     g.interval = interval;
     g.odd_interval_size = odd_interval_size;
     g.back_limit = back_limit;

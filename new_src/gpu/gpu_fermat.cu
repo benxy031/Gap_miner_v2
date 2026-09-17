@@ -1402,6 +1402,37 @@ static int gpu_fermat_submit_locked(gpu_fermat_ctx *ctx, int slot,
     return 0;
 }
 
+/* Real per-call candidate cap of a context (see header). */
+size_t gpu_fermat_max_batch(const gpu_fermat_ctx *ctx)
+{
+    return ctx ? ctx->max_batch : 0;
+}
+
+/* Loud clamp.  The silent version of this line cost the GAP_HUNT wipe-out of
+   2026-09-17: a stale gpu_adapter.o (built 2026-09-04, before
+   GPU_ADAPTER_MAX_BATCH was raised 160000 -> 320000 in gpu_adapter.h) created
+   the context with max_batch = 160000 while every freshly built caller
+   verified its batch size against the 320000 macro.  Every submit was then
+   truncated to its first 160000 candidates WITHOUT a word, the tail windows'
+   MR results stayed zero, and their gaps vanished from the full-scan output.
+   Callers that must not lose candidates must size batches from
+   gpu_fermat_max_batch(ctx); this function only guarantees that if one ever
+   overshoots, it is visible. */
+static size_t gpu_fermat_clamp(gpu_fermat_ctx *ctx, size_t count)
+{
+    if (count <= ctx->max_batch)
+        return count;
+    static int warned = 0;
+    if (!warned) {
+        warned = 1;
+        fprintf(stderr, "[gpu_fermat] WARNING: batch of %zu candidates "
+                        "truncated to ctx max_batch=%zu -- %zu candidates NOT "
+                        "tested (stale object / macro mismatch?)\n",
+                count, ctx->max_batch, count - ctx->max_batch);
+    }
+    return ctx->max_batch;
+}
+
 /* Non-blocking variant: returns -1 immediately if the slot is still busy.
    See header for full contract. */
 int gpu_fermat_submit_try(gpu_fermat_ctx *ctx, int slot,
@@ -1409,7 +1440,7 @@ int gpu_fermat_submit_try(gpu_fermat_ctx *ctx, int slot,
 {
     if (!ctx || !candidates || count == 0) return -1;
     if (slot < 0 || slot > 1) return -1;
-    if (count > ctx->max_batch) count = ctx->max_batch;
+    count = gpu_fermat_clamp(ctx, count);
 
     pthread_mutex_lock(&ctx->slot_mu[slot]);
     if (ctx->pending[slot] != 0) {
@@ -1429,7 +1460,7 @@ int gpu_fermat_submit(gpu_fermat_ctx *ctx, int slot,
 {
     if (!ctx || !candidates || count == 0) return -1;
     if (slot < 0 || slot > 1) return -1;
-    if (count > ctx->max_batch) count = ctx->max_batch;
+    count = gpu_fermat_clamp(ctx, count);
 
     pthread_mutex_lock(&ctx->slot_mu[slot]);
         /* Block until the slot is free — collect() broadcasts slot_cv
@@ -1505,7 +1536,7 @@ int gpu_fermat_test_batch(gpu_fermat_ctx *ctx,
                           size_t count)
 {
     if (!ctx || !candidates || !results || count == 0) return 0;
-    if (count > ctx->max_batch) count = ctx->max_batch;
+    count = gpu_fermat_clamp(ctx, count);
 
     if (gpu_fermat_submit(ctx, 0, candidates, count) < 0)
         return -1;
@@ -1522,7 +1553,7 @@ int gpu_fermat_submit_device(gpu_fermat_ctx *ctx, int slot,
 {
     if (!ctx || !d_candidates || count == 0) return -1;
     if (slot < 0 || slot > 1) return -1;
-    if (count > ctx->max_batch) count = ctx->max_batch;
+    count = gpu_fermat_clamp(ctx, count);
 
     pthread_mutex_lock(&ctx->slot_mu[slot]);
     while (ctx->pending[slot] != 0)
@@ -1535,6 +1566,18 @@ int gpu_fermat_submit_device(gpu_fermat_ctx *ctx, int slot,
     }
 
     int active_limbs = __atomic_load_n(&ctx->active_limbs, __ATOMIC_RELAXED);
+
+    /* Bounded diagnostics (GHDBG_SUBMIT=1): print the first large device
+       submit so the caller's staging limits can be checked against the real
+       count and max_batch.  One line per process, never a stream. */
+    if (count > 100000 && getenv("GHDBG_SUBMIT")) {
+        static int ghdbg_once = 0;
+        if (!ghdbg_once) {
+            ghdbg_once = 1;
+            fprintf(stderr, "[GHDBG] submit_device count=%zu max_batch=%zu "
+                            "limbs=%d\n", count, ctx->max_batch, active_limbs);
+        }
+    }
 
     /* AoS only: d_candidates is the AoS buffer from gpu_sieve_extract_pack. */
     if (ctx->time_inited[slot])
@@ -1578,7 +1621,7 @@ int gpu_fermat_test_device(gpu_fermat_ctx *ctx,
                            size_t count)
 {
     if (!ctx || !d_candidates || !results || count == 0) return 0;
-    if (count > ctx->max_batch) count = ctx->max_batch;
+    count = gpu_fermat_clamp(ctx, count);
 
     if (gpu_fermat_submit_device(ctx, 0, d_candidates, count) < 0)
         return -1;

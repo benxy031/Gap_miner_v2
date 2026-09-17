@@ -48,6 +48,15 @@ int gpu_fermat_device_count(void);
    Returns NULL on failure (no GPU, driver error, out of memory). */
 gpu_fermat_ctx *gpu_fermat_init(int device_id, size_t max_batch);
 
+/* Real per-call candidate cap of this context (the value passed to
+   gpu_fermat_init; every submit clamps to it).  Callers that size their own
+   staging or guards MUST use THIS value, not a compile-time macro: if the
+   macro and the context were built from different header revisions the
+   context is the smaller and the excess candidates would be dropped silently
+   (the 2026-09-17 hunt incident: stale gpu_adapter.o carried 160000 while the
+   callers verified against 320000, so every submit lost its tail). */
+size_t gpu_fermat_max_batch(const gpu_fermat_ctx *ctx);
+
 /* Batch Fermat primality test (synchronous — blocks until complete).
    candidates: array of count candidates, each GPU_NLIMBS uint64_t limbs
                in little-endian limb order (limb[0] = least significant).

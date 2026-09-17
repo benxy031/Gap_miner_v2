@@ -116,6 +116,9 @@ scripts/ab_shift_compare.sh          # accepted blocks / qualifying gaps per hou
 
 # ── Record-rate model: ranking without GPU time (docs/RECORD_RATE_MODEL.md) ─
 scripts/record_rate_model.py gap_hunt_records_f1.txt gap_hunt_records_f2.txt
+                                     # predicted vs observed records per file;
+                                     # the `band` column is the +-5% sigma error
+                                     # - a ranking is only real above it (§8)
 scripts/record_rate_model.py --targets 6 gap_hunt_records_f2.txt   # nearest record targets
 scripts/record_rate_model.py --shift-scan 900,1000,1017,1050       # shift/size alignment
 scripts/tail_compare.py data/gap_hunt_records_f1.txt data/gap_hunt_records_f2.txt

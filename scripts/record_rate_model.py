@@ -359,25 +359,31 @@ def analyse(path, rows, table, m0, args):
         p_f = p_record(reachable_entries(table, L, m0, sg, 0.0), L, sg, m0)
         band[f] = (1.0 / p_f) if p_f > 0 else float("inf")
     res["gpr_band"] = band
+    res["band_factor"] = (
+        band[0.95] / band[1.05]
+        if band[1.05] > 0 and band[1.05] != float("inf")
+        else float("nan")
+    )
+    res["obs_gaps_per_record"] = (
+        res["n"] / res["n_records"] if res.get("n_records") else float("nan")
+    )
 
-    # frontier slope in the TARGET region (g* +-5%), which is what actually
-    # sets the margin tail; the observed gap range may lie elsewhere entirely.
+    # --- frontier slope in the target region: DIAGNOSTIC ONLY ------------
+    # Do NOT rescale sigma by it.  The pointwise sum in p_record already
+    # evaluates mu(g) at EVERY size, so folding the frontier slope into sigma
+    # would double-count it.  Measured 2026-09-17 on the fleet pair (shift1017
+    # strong vs lex, threshold 18): with the slope folded in either direction
+    # the strong-cover prediction moves 5.7 -> 4.9 (divide) or -> 12.8
+    # (multiply) against an observed 13, while the lex prediction moves
+    # 9.1 -> 6.3 or -> 19.3 against an observed 10 - no single rescale is
+    # right for both covers, and the un-rescaled form is the one that
+    # reproduces lex (1.10x).  The earlier divide-by-(1-L*dmu/dg) form was
+    # also inverted: for mu(g) = a - b*g the margin grows with merit at rate
+    # (1+bL) > 1, so sigma_D = sigma*(1-L*dmu/dg), not sigma/(...).
     if g_star > 0:
         slope, npts = frontier_slope(table, int(g_star * 0.95), int(g_star * 1.05))
         res["frontier_slope"] = slope
         res["frontier_pts"] = npts
-        if not math.isnan(slope):
-            mod = 1.0 - L * slope
-            res["frontier_mod"] = mod
-            res["sigma_eff"] = sigma / mod if mod > 0.05 else float("nan")
-            if res["sigma_eff"] == res["sigma_eff"]:
-                ent_eff = reachable_entries(table, L, m0, res["sigma_eff"], 0.0)
-                res["p_record_eff"] = p_record(ent_eff, L, res["sigma_eff"], m0)
-                res["gaps_per_record_eff"] = (
-                    1.0 / res["p_record_eff"]
-                    if res["p_record_eff"] > 0
-                    else float("inf")
-                )
 
     if args.gph:
         for key, val in args.gph:
@@ -555,15 +561,14 @@ def report(res):
     if band:
         print("  INFER sigma sensitivity (gaps/rec): "
               + "  ".join(f"sigma*{k:.2f}={v:.2e}" for k, v in sorted(band.items())))
-    if "frontier_mod" in res:
-        print(f"  INFER frontier slope dmu/dg      : {res['frontier_slope']:+.3e}"
+        print(f"  INFER band factor                : {res['band_factor']:.2f}x"
+              f"  (ranking vs another file is only resolved if the ratio"
+              f" exceeds this)")
+    if "frontier_slope" in res:
+        print(f"  DIAG  frontier slope dmu/dg      : {res['frontier_slope']:+.3e}"
               f"   L*dmu/dg = {res['frontier_slope'] * res['L']:+.4f}"
-              f"  -> sigma_eff = {res['sigma_eff']:.4f}"
-              f"  ({res['frontier_pts']} entries near the target)")
-        if "gaps_per_record_eff" in res:
-            print(f"  INFER gaps/record with sigma_eff :"
-                  f" {res['gaps_per_record_eff']:.3e}"
-                  f"   (nominal sigma gives {res['gaps_per_record']:.3e})")
+              f"  ({res['frontier_pts']} entries near the target; diagnostic only,"
+              f" NOT applied to sigma)")
     if "ho_observed" in res:
         print(f"  HOLD  fit sigma on first half    : {res['ho_sigma']:.4f}"
               f"   (n_fit={res['ho_n_fit']})")
@@ -686,16 +691,30 @@ def main():
 
     if len(results) > 1:
         print("\n=== ranking (records first) ===")
-        print(f"{'file':34} {'n':>9} {'sigma':>7} {'gaps/rec':>10}"
-              f" {'hrs/rec':>10} {'obs':>4}")
+        print(f"{'file':34} {'n':>8} {'sigma':>7} {'pred g/rec':>11}"
+              f" {'obs g/rec':>10} {'band':>6} {'recs':>5} {'pred E':>7}")
         for r in sorted(results, key=lambda x: x.get("gaps_per_record", 1e18)):
-            hrs = "--"
-            if "gph" in r and r.get("gaps_per_record", float("inf")) < 1e17:
-                hrs = f"{r['gaps_per_record'] / r['gph']:.1f}"
-            print(f"{r['name']:34} {r['n']:9d} {r['sigma']:7.4f}"
-                  f" {r['gaps_per_record']:10.3e} {hrs:>10} {r['n_records']:4d}")
+            print(f"{r['name']:34} {r['n']:8d} {r['sigma']:7.4f}"
+                  f" {r['gaps_per_record']:11.3e}"
+                  f" {r.get('obs_gaps_per_record', float('nan')):10.3e}"
+                  f" {r.get('band_factor', float('nan')):5.2f}x"
+                  f" {r['n_records']:5d} {r['expected']:7.2f}")
+        ranks = sorted(results, key=lambda x: x.get("gaps_per_record", 1e18))
+        for i in range(len(ranks) - 1):
+            a, b = ranks[i], ranks[i + 1]
+            ratio = b["gaps_per_record"] / a["gaps_per_record"]
+            need = max(a.get("band_factor", 1.0), b.get("band_factor", 1.0))
+            if ratio < need:
+                print(f"WARNING: {a['name']} vs {b['name']}: predicted ratio"
+                      f" {ratio:.2f}x < band factor {need:.2f}x -> RANKING NOT"
+                      f" RESOLVED by this data (a 5% sigma error swaps them)")
         print("\nNOTE: gaps/record is a per-gap lottery ratio; hours/record needs a"
               "\n      measured gaps/hour per configuration (--gph NAME=VALUE).")
+        print("NOTE: 'band' is the spread from a +-5% sigma error; a ranking is"
+              "\n      only real when the predicted ratio exceeds it.  Check"
+              " 'obs g/rec' too:")
+        print("      when the model ranks two configs opposite to the observed"
+              "\n      counts, the model is under-determined and the data wins.")
 
 
 if __name__ == "__main__":

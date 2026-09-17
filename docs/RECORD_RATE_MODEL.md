@@ -185,7 +185,8 @@ a shift change.
 | FACT | The cheapest reachable target over shifts 200..1050 needs merit 24.2381, at shifts 1000 and 1017. |
 | DERIVED | `p_record` is a sum over size-exact targets; the walk is a lottery on landing on a size, not just on merit height. |
 | DERIVED | Threshold invariance is a property of the exponential tail, not a measurement. |
-| INFERENCE | The model is adequate for ranking configurations; f2 ≈ 8.0× f1 per reported gap (2.677e6 vs 2.141e7). |
+| INFERENCE | The model is adequate for ranking configurations **only where the predicted ratio exceeds the +-5 % sigma band**; the N3 pair (8.0x vs bands 3.9-4.9x) qualifies, the fleet strong/lex pair (1.56x vs 1.9x) does not. |
+| INFERENCE | Calibrated on the lex cover (1.10x in-sample, 1.27x out-of-sample) and pessimistic on the strong cover (2.3x / 4.1x under) at threshold 18. |
 | INFERENCE | The fleet shift is within ~7 % of the model optimum for record rate per gap. |
 | HYPOTHESIS | A frontier-targeted cover objective (maximise `p_record`, not a generic tail) beats lex-m30 at equal survivor count. |
 | HYPOTHESIS | The strong/lex cover tails cross: near-threshold sigma favours lex, the record depth (and the record count) favour strong. ~2 sigma only. |
@@ -244,20 +245,37 @@ explicit TAIL CROSSING warning when the two verdicts differ in sign.
 
 ### 8.3 Model check on data that actually contains records
 
-Using `p(threshold) = p(8) * exp((threshold−8)/sigma)` with the shift1017
-N3 anchor `p(8) = 3.735e-07` (§2):
+`scripts/record_rate_model.py data/gap_hunt_records_f1.txt \
+  data/gap_hunt_records_f2.txt --m0 18 --targets 10` on the live fleet files:
 
-| file | sigma near threshold | E[records] | observed |
-|---|---|---|---|
-| f2 lex | 1.3621 | 9.9 | **10** |
-| f1 strong | 1.2741 | 6.4 | **13** |
+| | f1 strong | f2 lex |
+|---|---|---|
+| reported gaps | 16866 | 17240 |
+| observed records | **13** | **10** |
+| sigma at M0=18 | 1.2744 ± 0.0098 | 1.3627 ± 0.0104 |
+| predicted E[records] | 5.69 (2.3x under) | 9.06 (1.10x under) |
+| predicted gaps/record | 2.96e3 | 1.90e3 |
+| **observed gaps/record** | **1.30e3** | **1.72e3** |
+| holdout: E vs observed | 1.94 vs 8 (4.1x under) | 5.52 vs 7 (1.27x under) |
+| holdout `d_best` CDF position | 0.944 | **0.489** |
 
-INFERENCE: for lex the model is exact to 1 %; for strong it under-predicts by
-2×, in the same direction as the tail crossing (a cover whose near-threshold
-sigma is low but whose deep sigma is high). Poisson P(N≥13 | 6.4) ≈ 2 %, so
-the crossing has independent support at the ~2 sigma level — a HYPOTHESIS, not
-a result. This is the first validation of the model against a non-zero record
-count, and it is much stronger evidence than §2's 0-in-989k test.
+INFERENCE: the model is calibrated on the lex cover (1.10x in-sample, 1.27x
+out-of-sample, holdout closest-approach sitting on the model median) and
+under-predicts the strong cover by 2.3x (4.1x out-of-sample). The residual is
+cover-specific, which is the same phenomenon as the tail crossing in §8.2:
+a single exponential fitted at the report threshold cannot describe both
+covers at the record depth. The under-prediction is the *safe* direction for
+allocation, but it is a real bias and it must be quoted with the numbers.
+
+**The ranking is NOT resolved for this pair.** The predicted ratio is
+1.56x (2.96e3 / 1.90e3) while a ±5 % sigma error alone moves each file by
+1.90–1.98x — so the model ranks the files with less confidence than its own
+uncertainty, and the observed counts rank them the *other* way (13 vs 10, a
+0.6 sigma difference, i.e. indistinguishable). The tool now prints the band
+factor per file and emits `WARNING: ... RANKING NOT RESOLVED` whenever the
+predicted ratio is smaller than the band. Ranking is only meaningful where
+that warning does not fire — e.g. the N3 pair (§2) at 8.0x against bands of
+3.9–4.9x.
 
 ### 8.4 What this closes
 
@@ -266,17 +284,30 @@ The hoped-for lever "optimise covers for sigma, not for survivor count"
 cover optimised for the near-threshold sigma would not raise the record rate.
 Closed in `docs/CLOSED_FINGERPRINTS.md` with its reopen trigger.
 
-### 8.5 Tooling defect found and fixed
+### 8.5 Tooling defects found and fixed
 
-`scripts/tail_compare.py` computed its VERDICT at the default `M0 = 10`, which
-for this data lies *below* the report threshold (18): the fit then measures
-`(threshold − M0) + sigma` and inflates the standard error by the same factor,
-turning the real 6.2 sigma into 0.9 sigma ("no significant tail difference").
-Fixed: the verdict threshold auto-clamps to the highest minimum merit of the
-two files, a NOTE explains the clamp, and a second verdict is printed at the
-deepest threshold with n ≥ 100 in both files (plus the crossing warning).
-Regression-checked: the N3 size-comparison default pair still reports
+Two defects surfaced while interpreting this run.
+
+**(a) `tail_compare.py` verdict below the report threshold.** The VERDICT was
+computed at the default `M0 = 10`, which for this data lies *below* the report
+threshold (18): the fit then measures `(threshold − M0) + sigma` and inflates
+the standard error by the same factor, turning the real 6.2 sigma into
+0.9 sigma ("no significant tail difference"). Fixed: the verdict threshold
+auto-clamps to the highest minimum merit of the two files, a NOTE explains the
+clamp, a second verdict is printed at the deepest threshold with n ≥ 100 in
+both files, and a TAIL CROSSING warning fires when the two verdicts differ in
+sign. Regression-checked: the N3 default pair still reports
 `M0=10, +0.0992, 14.6 sigma` exactly as before.
+
+**(b) The frontier-slope sigma rescale (`sigma_eff`) was wrong twice.**
+(i) The form was inverted: for `mu(g) = a − b*g` the margin grows with merit
+at rate `(1 + bL) > 1`, so `sigma_D = sigma * (1 − L*dmu/dg)`, not
+`sigma / (1 − L*dmu/dg)`. (ii) Even corrected it double-counts, because
+`p_record` already evaluates `mu(g)` at every size. The fleet data settles it:
+no single rescale fits both covers — strong moves 5.7 → 4.9 (divide) or
+→ 12.8 (multiply) against an observed 13, lex moves 9.1 → 6.3 or → 19.3
+against an observed 10. The slope is now reported as a **DIAG** line only and
+is never applied to sigma. Registered in `docs/CLOSED_FINGERPRINTS.md`.
 
 ## 9. What this does not claim
 

@@ -1618,17 +1618,20 @@ static int crt_gpu_batch_test(struct gpu_adapter *gpu, int limbs,
    gather staging buffers are per-ctx) and the full-class fused path.
    Fail-closed: any chain error falls back to a full scan of the same
    flight, and any further error disables the fused path. */
-/* HARD cap 128.  It was raised to 256 on 2026-09-17 and IMMEDIATELY REVERTED:
-   with MAX=256 the chain's emitted merit-candidate set no longer matches the
-   full scan (MINING_JUMP2_VERIFY=1 at K=256: the first flights print clean,
-   then windows=256 bad_windows=75..83 bad_pairs=14..28), so some downstream
-   buffer or assumption is still 128-wide and degrades SILENTLY instead of
-   failing closed.  The apparent +15% throughput at K=256 (5564/5692 win/s vs
-   4864/4911 at K=128, quiet GPU, order swapped) is therefore INVALID - it
-   measured the wrong path.  Reopen only together with a parity-clean audit of
-   every 128-wide assumption in the chain gather/submit/collect path.  K=128 is
-   parity-verified (windows=128 bad_windows=0 bad_pairs=0). */
-#define MINING_JUMP2_BATCH_MAX 128
+/* Cap 128 -> 256 (2026-09-18).  The 2026-09-17 "K=256 silently corrupts the
+   emitted set" verdict was WRONG, and the mistake was in the VERIFIER, not in
+   the chain: MINING_JUMP2_VERIFY replays a full scan of the whole flight in
+   ONE gpu_fermat_submit_device call, so at K=256 it submits K x candidates-per-
+   window (~455k at shift512 p75) which exceeds the MR staging cap (320000).
+   The replay was truncated, the later windows compared against an untested
+   full scan, and the verifier reported bad_windows/bad_pairs exactly for the
+   tail it could not test.  Evidence: the reported bad window count matches the
+   clamp point (256 - 320000/1780 ~ 76) and the loud
+   "[gpu_fermat] WARNING: batch of ... candidates truncated to ctx max_batch"
+   fires on those runs.  The chain's own submits are K x chunk (256 x 32 =
+   8192), three orders of magnitude below the cap, so the chain path itself is
+   unaffected.  The verifier now replays in cap-sized slices. */
+#define MINING_JUMP2_BATCH_MAX 512
 /* Per-window chain chunk.  Measured (RTX 3070, shift512 p75, live difficulty
    ~23.9, 1 thread, fused path, 120-300 s): chunk 32 and 64 give the same
    windows/s (2736 vs 2751, within noise) but 32 needs 1.66x fewer expensive
@@ -2372,12 +2375,35 @@ static void crt_fused_chain_verify(struct gpu_sieve_ctx *gpu_sieve,
     uint64_t *d_batch = gpu_sieve_candidate_buffer(gpu_sieve, fl->buf);
     if (total == 0 || !d_batch)
         return;
-    if (gpu_fermat_submit_device(fermat, fl->slot, d_batch, total) < 0 ||
-        gpu_fermat_collect(fermat, fl->slot, tmp, total) < 0) {
-        fprintf(stderr,
-                "[Worker %u] MINING_JUMP2 VERIFY: full-scan failed\n",
-                worker_id);
-        return;
+    /* Replay the flight's FULL scan into tmp in cap-sized slices.  A single
+       submit of a whole flight exceeds the MR context's batch cap on dense
+       covers (K x candidates-per-window: 256 x ~1800 at shift512, 256 x ~2676
+       at shift1017, vs the 320000 cap), and the resulting truncation made the
+       verifier report the very tail it could not test as "bad" - precisely how
+       the 2026-09-17 "K=256 corrupts the emitted set" false verdict was
+       produced.  Slicing makes the check independent of the flight size. */
+    {
+        size_t cap = gpu_fermat_max_batch(fermat);
+        int limbs = gpu_fermat_get_limbs(fermat);
+        if (cap == 0 || limbs <= 0)
+            return;
+        size_t off = 0;
+        while (off < (size_t)total) {
+            size_t chunk = (size_t)total - off;
+            if (chunk > cap)
+                chunk = cap;
+            if (gpu_fermat_submit_device(fermat, fl->slot,
+                                         d_batch + off * (size_t)limbs,
+                                         chunk) < 0 ||
+                gpu_fermat_collect(fermat, fl->slot, tmp + off, chunk) < 0) {
+                fprintf(stderr,
+                        "[Worker %u] MINING_JUMP2 VERIFY: full-scan failed "
+                        "(off=%zu chunk=%zu total=%u)\n",
+                        worker_id, off, chunk, total);
+                return;
+            }
+            off += chunk;
+        }
     }
     uint32_t cum = 0, bad_windows = 0, bad_pairs = 0;
     uint64_t owned_limit = fl->back_limit + fl->needed_gap;
@@ -3105,10 +3131,20 @@ void *worker_thread_run_crt(void *arg) {
        restores the full scan.  Still inert without FUSED_GPU=1. */
     const char *mj2_env = getenv("MINING_JUMP2");
     int mining_jump2 = (mj2_env && mj2_env[0] == '0') ? 0 : 1;
-    /* Default 128 (was 64, 2026-09-17): +35% measured on the quiet dev GPU at
-       shift512 (K=64 3902/3780 -> K=128 5218/5175 win/s, order swapped, same
-       120.3 MR tests per window), parity-verified at 128. */
-    int mining_jump2_batch = 128;
+    /* Default 512 (was 128 until 2026-09-18; 128 was raised from 64 on
+       2026-09-17).  Measured on the quiet dev GPU, 1 thread, fused chain,
+       chunk 32, 45 s runs: shift512 5264 (K=128) -> 6113 (K=256) -> 6725
+       win/s (K=512); shift1017 1498 -> 1788 -> 2014 win/s.  Each step is
+       parity-verified with the sliced verifier (K=256: 214/67 flights;
+       K=512: 123 flights at shift512; all bad_windows=0 bad_pairs=0).
+       VRAM: the sieve sizes its candidate buffers as 2 x odd_interval_size x K
+       x limbs x 8 B, so the flight batch costs device memory linearly --
+       shift512 K=512 ~1.6 GB, shift1017 K=512 ~4.6 GB (measured 5.6/8 GB used
+       with the adapter).  Lower MINING_JUMP2_BATCH (256 -> ~2.3 GB at
+       shift1017) on cards without that much free memory; if an allocation
+       fails the extract fails closed and the worker drops to the slow CPU
+       path, so an oversize K is never a correctness risk. */
+    int mining_jump2_batch = 512;
     {
         const char *mb = getenv("MINING_JUMP2_BATCH");
         if (mb && *mb) {

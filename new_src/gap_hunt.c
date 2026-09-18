@@ -150,16 +150,28 @@ static int load_state(const char *path, uint64_t *k, mpz_t last_prime,
    divided by the number of windows sharing it.  More windows per round =
    cheaper rounds; the device cost is only the gather/candidate buffers
    (K x chunk x limbs), well within the 160000-candidate adapter cap.
-   Cap raised 64 -> 128 (2026-09-17): the ~4 ms per-launch floor is still the
-   amortization target (32 -> 64 measured +21% at shift1017, +28% at shift507),
-   so a further doubling is now testable; the default stays 64 until the A/B
-   with the raised cap is in. */
-#define GAP_HUNT_BATCH_MAX 128
-/* Default 64 (was 32).  A chain round has a ~4 ms per-LAUNCH floor, so the
-   windows sharing a round split it: doubling the batch is worth +21% (shift1017
-   559 -> 679 win/s) and +28% (shift507 1876 -> 2406 win/s) with the same tested
-   candidates per window. */
-static int g_batch = 64;       /* GAP_HUNT_BATCH env, clamped 1..MAX */
+   Cap raised 64 -> 128 (2026-09-17) and 128 -> 512 (2026-09-18): with the
+   mode-aware cum bound (see the guard in gap_hunt_run) the chain path -- the
+   fleet default -- is no longer limited by the MR context cap, because it
+   never submits the window-major head batch (it gathers K x chunk candidates
+   per round).  The plain path keeps the MR-cap bound and is auto-reduced. */
+#define GAP_HUNT_BATCH_MAX 512
+/* Default 512 (was 64; the ~4 ms per-LAUNCH floor of a chain round is amortized
+   over the windows sharing it).  Doubling history: 32 -> 64 was +21% (shift1017
+   559 -> 679 win/s) and +28% (shift507 1876 -> 2406 win/s); re-measured
+   2026-09-18 on the quiet dev GPU with the mode-aware cum bound (jump2 on,
+   min-merit 19, fixed k range, emitted sets identical): shift507 2452 (K=64)
+   -> 3156 (128) -> 3601 (256) -> **3824 win/s (512) = +56%**; shift1017 881
+   (128) -> 1001 (256) -> **1172 win/s (512) = +33%**.
+   Device cost is `2 x odd_interval_size x K x limbs x 8 B` -- the walk banner
+   prints `vram_est=<MB>` for the configured K: shift507 K=512 ~2.4 GB, shift1017
+   K=512 **6407 MB** by the banner and ~7.3/8 GB actually used (sieve contexts +
+   adapter + display on top), i.e. at high shift K=512 is at the edge of an 8 GB
+   card.  Check `vram_est` against nvidia-smi and set GAP_HUNT_BATCH=256 (~half)
+   where it does not fit; a 12 GB card takes K=512 with room to spare.  An
+   allocation failure is visible ("gpu_sieve: cands[0] alloc: out of memory") and
+   stops the walk; it never falls back silently to a slower path. */
+static int g_batch = 512;      /* GAP_HUNT_BATCH env, clamped 1..MAX */
 static int g_quarter = 0;      /* GAP_HUNT_QUARTER env: 4-visible-class scan */
 static uint64_t g_kmax = 0;    /* GAP_HUNT_KMAX env: stop hook (tests/bench) */
 #define GAP_HUNT_JUMP_CAP 16   /* per-window gap capacity in jump mode */
@@ -1101,23 +1113,34 @@ int gap_hunt_run(const struct gap_hunt_config *cfg) {
        realistic estimate with margin, and the hard `cum + nc > cap` check in
        the fill remains the final guard. */
     uint64_t cap_real = 0;   /* real per-submit cap of the MR context */
+    uint64_t cum_cap = 0;    /* bound on the window-major candidate index */
     {
         uint64_t est = (uint64_t)(odd_interval_size / 8U);
         cap_real = (uint64_t)gpu_fermat_max_batch(fermat);
         if (cap_real == 0)
             cap_real = GPU_ADAPTER_MAX_BATCH;
         if (est < 1) est = 1;
-        if ((uint64_t)g_batch * est > cap_real) {
+        /* The chain paths never submit the window-major head batch: jump2
+           gathers K x chunk candidates per round and the serial jump walks one
+           window at a time.  Their only bound is the capacity of the flags and
+           offsets arrays (g_batch x win_cap), so the MR cap must NOT shrink
+           their batch.  Only the plain path submits the head batch whole and
+           is therefore auto-reduced to fit the MR context. */
+        int head_batch = !(g_jump2 || g_jump);
+        if (head_batch && (uint64_t)g_batch * est > cap_real) {
             int nb = (int)(cap_real / est);
             if (nb < 1) nb = 1;
             if (nb != g_batch) {
                 fprintf(stderr, "[GAP_HUNT] batch reduced %d -> %d "
-                                "(est survivors/window=%llu, cap %llu)\n",
+                                "(est survivors/window=%llu, mrcap=%llu; "
+                                "chain modes avoid this bound)\n",
                         g_batch, nb, (unsigned long long)est,
                         (unsigned long long)cap_real);
                 g_batch = nb;
             }
         }
+        cum_cap = head_batch ? cap_real
+                             : (uint64_t)g_batch * (uint64_t)win_cap;
     }
     uint64_t *offsets = (uint64_t *)malloc(
         2U * (size_t)g_batch * win_cap * sizeof(uint64_t));
@@ -1166,14 +1189,20 @@ int gap_hunt_run(const struct gap_hunt_config *cfg) {
 
     fprintf(stderr,
             "[GAP_HUNT] walk: shift=%u n_primes=%u P bits=%.0f window=%llu "
-            "sieve=%u batch=%d mrcap=%llu quarter=%d jump=%d jump2=%d "
+            "sieve=%u batch=%d mrcap=%llu cumcap=%llu vram_est=%lluMB quarter=%d "
+            "jump=%d "
+            "jump2=%d "
             "jump2_chunk=%d "
             "kmax=%llu min_merit=%.6f "
             "k0=%llu device=%d\n",
             rt.shift, rt.n_primes,
             (double)mpz_sizeinbase(P, 2),
             (unsigned long long)rt.window, sieve_primes, g_batch,
-            (unsigned long long)cap_real, g_quarter,
+            (unsigned long long)cap_real, (unsigned long long)cum_cap,
+            (unsigned long long)(2U * odd_interval_size * (uint64_t)g_batch *
+                                 (uint64_t)gpu_fermat_get_limbs(fermat) * 8U /
+                                 1000000U),
+            g_quarter,
             g_jump, g_jump2, g_jump2_chunk,
             (unsigned long long)g_kmax, cfg->min_merit,
             (unsigned long long)k, cfg->device);
@@ -1224,7 +1253,7 @@ int gap_hunt_run(const struct gap_hunt_config *cfg) {
     g.gpu_limbs = gpu_limbs;
     g.base_limbs = base_limbs;
     g.capacity = (uint64_t)sieve.candidate_capacity;
-    g.cap = cap_real;
+    g.cap = cum_cap;
     g.interval = interval;
     g.odd_interval_size = odd_interval_size;
     g.back_limit = back_limit;

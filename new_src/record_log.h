@@ -20,7 +20,10 @@ int record_log_init(const char *path);
 
 /* Append one line for a BPSW-verified candidate. `status` is a short word
  * such as "dry-run", "queued", "submission-queue-full", "accepted",
- * "rejected", or "stale". `start` is the gap's first prime (p1). */
+ * "rejected", "stale", or "assemble-failed" (the local block assembly
+ * failed, so the gap was never offered to the node -- distinct from "stale",
+ * which means the header rotated before submission). `start` is the gap's
+ * first prime (p1). */
 void record_log_write(uint32_t height, uint32_t shift, uint32_t header_nonce,
                       uint64_t nadd, const mpz_t start, uint32_t gap_length,
                       double merit, const char *status);

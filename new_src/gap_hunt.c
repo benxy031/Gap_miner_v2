@@ -174,7 +174,34 @@ static int load_state(const char *path, uint64_t *k, mpz_t last_prime,
 static int g_batch = 512;      /* GAP_HUNT_BATCH env, clamped 1..MAX */
 static int g_quarter = 0;      /* GAP_HUNT_QUARTER env: 4-visible-class scan */
 static uint64_t g_kmax = 0;    /* GAP_HUNT_KMAX env: stop hook (tests/bench) */
-#define GAP_HUNT_JUMP_CAP 16   /* per-window gap capacity in jump mode */
+/* Per-window chain-pair capacity in jump/jump2 mode. RAISED 16 -> 64 -> 128 on
+   2026-09-18 after MEASURING the real envelope (the number of pairs a window
+   needs scales INVERSELY with the merit threshold: a lower threshold = shorter
+   jumps = more steps). shift507 p74_lex_m30, 16k windows, quiet GPU:
+     merit 10 (the fleet setting) ->  2 pairs/window   (8x margin at cap 16)
+     merit  3                     -> 14 pairs/window   (1.1x margin at cap 16)
+     merit  1                     -> 16 = cap 16 => the walk DIED; re-measured
+                                     with cap 64 the true value is **43**, so
+                                     the old ceiling was 2.7x too small
+   Lower thresholds are a documented record-rate lever (merit 10 is ~14x
+   records/h better than 18), so this ceiling sat directly in the way of a
+   recommended configuration. 128 gives ~3x margin at merit 1 and 64x at the
+   fleet setting; it costs 512 KiB of host arrays (2 x 512 x 128 x 4 B) plus the
+   same on the device for the SERIAL jump path. The mid-walk guard stays
+   fail-closed (truncating a chain silently would drop records) and the startup
+   advisory below warns before the walk when the geometry says the ceiling is
+   reachable. The walk summary reports the observed worst case as
+   `jump2_pairs_max` / `jump2_cap_hits`. */
+#define GAP_HUNT_JUMP_CAP 128
+/* The number of chain pairs ONE window can produce is data-dependent: with a
+   low merit threshold (the fleet configs run --gap-hunt-min-merit 10) and a
+   large window the chain needs many steps, and GAP_HUNT_JUMP_CAP is a
+   compile-time ceiling on that. Two bounded counters make the worst case a
+   measurement instead of an assumption -- reported in the walk summary as
+   `jump2_pairs_max` / `jump2_cap_hits`. (`cap_hits > 0` means the run STOPPED
+   because a window needed more pairs than the ceiling allows.) */
+static uint32_t g_j2_max_pairs = 0;
+static uint64_t g_j2_cap_hits = 0;
 /* Hard line cap for the GHDBG_DUMP_K diagnostics file.  The cap is the point:
    the first version of that hook could dump every candidate of every window,
    which wrote 8.1 GB and took the editor down (2026-09-17).  A diagnostic must
@@ -460,8 +487,19 @@ static int gh_jump2_scan(struct gh_batch *b, int slot, struct gh_ctx *g,
                 for (uint32_t j = 0; j < n; j++)
                     if (fl[j]) { found = base + j; break; }
                 if (found != UINT32_MAX) {
-                    if (b->jump_n[i] >= GAP_HUNT_JUMP_CAP)
+                    if (b->jump_n[i] >= GAP_HUNT_JUMP_CAP) {
+                        g_j2_cap_hits++;
+                        fprintf(stderr,
+                                "[GAP_HUNT] jump2 pair capacity reached: k=%llu "
+                                "i=%u cap=%d pairs/win (chain truncated, walk "
+                                "stops; GAP_HUNT_JUMP_CAP is a compile-time "
+                                "ceiling)\n",
+                                (unsigned long long)b->base_k[i], i,
+                                GAP_HUNT_JUMP_CAP);
                         return 0;   /* fail-closed */
+                    }
+                    if (b->jump_n[i] + 1U > g_j2_max_pairs)
+                        g_j2_max_pairs = b->jump_n[i] + 1U;
                     b->jump_s[i][b->jump_n[i]] =
                         (uint32_t)b->win_off[i][pidx[i]];
                     b->jump_e[i][b->jump_n[i]] =
@@ -895,6 +933,26 @@ static void gh_batch_process(struct gh_batch *b, const uint8_t *flags,
 }
 #endif /* WITH_CUDA (helpers) */
 
+/* Startup advisory for the jump/jump2 per-window pair ceiling.  The chain takes
+   at most ~2 x odd_interval_size / thr steps (offsets are in ODD units, thr is
+   in ADDERS), measured slack 2-4.6x, so this is an upper bound rather than a
+   prediction.  Warning when the bound passes cap/2 turns "the walk dies after
+   hours" into an announcement before the first window. */
+static void gh_jump_capacity_advisory(double min_merit, double thr,
+                                      double odd_span) {
+    if (!(thr > 0.0) || odd_span <= 0.0)
+        return;
+    double est = 2.0 * odd_span / thr;
+    if (est <= (double)GAP_HUNT_JUMP_CAP / 2.0)
+        return;
+    fprintf(stderr,
+            "[GAP_HUNT] WARNING: min-merit %.4f gives a step threshold of %.0f "
+            "adders over a %.0f-offset window, i.e. up to ~%.0f chain pairs per "
+            "window against a capacity of %d. If any window exceeds it the walk "
+            "STOPS (fail-closed). Raise --gap-hunt-min-merit, or rebuild with a "
+            "larger GAP_HUNT_JUMP_CAP.\n",
+            min_merit, thr, odd_span, est, GAP_HUNT_JUMP_CAP);
+}
 int gap_hunt_run(const struct gap_hunt_config *cfg) {
 #ifndef WITH_CUDA
     (void)cfg;
@@ -1207,6 +1265,18 @@ int gap_hunt_run(const struct gap_hunt_config *cfg) {
             (unsigned long long)g_kmax, cfg->min_merit,
             (unsigned long long)k, cfg->device);
 
+    /* A low merit threshold is a legitimate lever (more gaps, more records per
+       hour), but it also makes the per-window chain longer.  Say so BEFORE the
+       walk starts rather than letting the pair ceiling kill it hours in. */
+    if (g_jump2 || g_jump) {
+        double ln_base = gh_log_mpz(b0);
+        if (ln_base > 0.0) {
+            gh_jump_capacity_advisory(cfg->min_merit,
+                                      cfg->min_merit * ln_base,
+                                      (double)odd_interval_size);
+        }
+    }
+
     uint64_t windows = 0, gaps_reported = 0;
     double best_merit = 0.0;
 
@@ -1374,11 +1444,14 @@ int gap_hunt_run(const struct gap_hunt_config *cfg) {
             last_save = windows;
             fprintf(stderr,
                     "[GAP_HUNT] k=%llu windows=%llu gaps=%llu best_merit=%.6f "
-                    "win_s=%.1f win_s_avg=%.1f\n",
+                    "win_s=%.1f win_s_avg=%.1f jump2_pairs_max=%u/%d "
+                    "cap_hits=%llu\n",
                     (unsigned long long)next_k,
                     (unsigned long long)windows,
                     (unsigned long long)gaps_reported, best_merit,
-                    win_s_now, win_s_avg);
+                    win_s_now, win_s_avg,
+                    g_j2_max_pairs, GAP_HUNT_JUMP_CAP,
+                    (unsigned long long)g_j2_cap_hits);
             if (stage_timing) {
                 uint64_t dw = dw_tick;
                 uint64_t mark_now = gpu_sieve_accounted_mark_us(gpu_sieve);
@@ -1478,9 +1551,12 @@ int gap_hunt_run(const struct gap_hunt_config *cfg) {
         double win_s = dt > 0.0 ? (double)windows / dt : 0.0;
         fprintf(stderr,
                 "[GAP_HUNT] stopped: windows=%llu gaps=%llu best_merit=%.6f "
-                "next_k=%llu win_s_avg=%.1f\n",
+                "next_k=%llu win_s_avg=%.1f jump2_pairs_max=%u cap=%d "
+                "jump2_cap_hits=%llu\n",
                 (unsigned long long)windows, (unsigned long long)gaps_reported,
-                best_merit, (unsigned long long)next_k, win_s);
+                best_merit, (unsigned long long)next_k, win_s,
+                g_j2_max_pairs, GAP_HUNT_JUMP_CAP,
+                (unsigned long long)g_j2_cap_hits);
     }
 
     if (out)

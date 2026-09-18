@@ -50,6 +50,10 @@ static uint64_t g_submit_attempts = 0;
 static uint64_t g_submit_accepted = 0;
 static uint64_t g_submit_rejected = 0;
 static uint64_t g_submit_stale = 0;
+/* Assembly failures are NOT staleness: the gap was never offered to the node.
+   They used to be added to g_submit_stale, which made a local buffer bug look
+   like a node rejection (2026-09-18). */
+static uint64_t g_submit_assemble_failed = 0;
 
 /* RPC polling thread state */
 static volatile int g_rpc_running = 0;
@@ -764,17 +768,34 @@ int main(int argc, char *argv[]) {
                     nadd_sz = local_nadd_len;
                 }
 
-                char *block_hex = malloc(GAPCOIN_SUBMIT_HEX_CAP);
+                /* Size the assembly buffer from THIS template: a node whose
+                   mempool holds large transactions hands out templates far
+                   bigger than the 128 KiB floor, and a short buffer makes the
+                   builder fail for every candidate with no RPC attempt (the
+                   2026-09-18 incident: 470 KB of template txs, 6 gaps lost and
+                   mis-counted as "stale"). */
+                size_t hex_cap = gapcoin_gbt_submission_hex_need(tmpl, nadd_sz);
+                if (hex_cap < GAPCOIN_SUBMIT_HEX_CAP) {
+                    hex_cap = GAPCOIN_SUBMIT_HEX_CAP;
+                }
+                char *block_hex = malloc(hex_cap);
                 if (!block_hex ||
                     gapcoin_gbt_work_build_submission_bytes(
                         active_work.header_prefix, entry.header_nonce, tmpl,
                         entry.shift, nadd_ptr, nadd_sz, block_hex,
-                        GAPCOIN_SUBMIT_HEX_CAP) != 0) {
+                        hex_cap) != 0) {
                     fprintf(stderr,
-                            "[Main] Failed to assemble submittable block: height=%u nAdd=%s\n",
-                            entry.height, nadd_dec ? nadd_dec : "?");
+                            "[Main] Failed to assemble submittable block: height=%u "
+                            "nAdd=%s (buffer %zu hex chars = %zu B, template %zu txs; "
+                            "the specific reason is on the [gapcoin_work] line)\n",
+                            entry.height, nadd_dec ? nadd_dec : "?", hex_cap,
+                            hex_cap / 2U, tmpl->transaction_count);
                     free(block_hex);
-                    g_submit_stale++;
+                    g_submit_assemble_failed++;
+                    record_log_write_outcome_big(entry.height, entry.shift,
+                                                 entry.header_nonce, nadd_dec,
+                                                 entry.gap_length, entry.merit,
+                                                 "assemble-failed");
                     free(nadd_dec);
                     continue;
                 }
@@ -995,12 +1016,13 @@ int main(int argc, char *argv[]) {
                   printf("  Header bases: %llu | Current header nonce: %u\n",
                       (unsigned long long)header_bases, active_work.nonce);
                   if (enable_submission) {
-                      printf("  BPSW attempts: %lu | Passed: %lu | Submit: attempts=%llu accepted=%llu rejected=%llu stale=%llu\n",
+                      printf("  BPSW attempts: %lu | Passed: %lu | Submit: attempts=%llu accepted=%llu rejected=%llu stale=%llu asm_fail=%llu\n",
                           stats.total_bpsw_attempts, stats.total_gaps,
                           (unsigned long long)g_submit_attempts,
                           (unsigned long long)g_submit_accepted,
                           (unsigned long long)g_submit_rejected,
-                          (unsigned long long)g_submit_stale);
+                          (unsigned long long)g_submit_stale,
+                          (unsigned long long)g_submit_assemble_failed);
                   } else {
                       printf("  BPSW attempts: %lu | Passed: %lu | Submitted: %lu (dry-run)\n",
                           stats.total_bpsw_attempts, stats.total_gaps,

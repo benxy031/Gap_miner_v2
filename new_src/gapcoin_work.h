@@ -44,8 +44,23 @@ int gapcoin_gbt_work_next_hash(struct gapcoin_gbt_work *work,
  */
 void gapcoin_work_set_payout_script_hex(const char *script_hex);
 
-/* Maximum hex-encoded size of a block assembled by gapcoin_gbt_work_build_submission. */
+/* FLOOR (not a ceiling) for the hex buffer handed to
+ * gapcoin_gbt_work_build_submission*: 256 KiB of hex = a 128 KiB block.
+ * The real requirement is template-dependent and must be obtained from
+ * gapcoin_gbt_submission_hex_need() below -- a node whose mempool holds large
+ * transactions hands out templates far bigger than this, and a caller that
+ * passes this floor as the capacity gets -1 from the builder for every
+ * candidate (2026-09-18 incident: 470 KB of template txs vs this 128 KB cap). */
 #define GAPCOIN_SUBMIT_HEX_CAP (256U * 1024U)
+
+/*
+ * Hex characters required to assemble a submittable block for this template
+ * and nAdd length: 2 x (header + 9 + coinbase upper bound + sum of template tx
+ * sizes) + 1. Returns 0 for a NULL template. Callers must allocate at least
+ * max(GAPCOIN_SUBMIT_HEX_CAP, this) so the builder never fails on capacity.
+ */
+size_t gapcoin_gbt_submission_hex_need(const struct block_template *tmpl,
+                                       size_t nadd_len);
 
 /*
  * Assemble a full, submittable Gapcoin block: header_prefix(80) + nonce(4) +

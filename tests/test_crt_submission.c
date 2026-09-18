@@ -124,9 +124,81 @@ int main(void) {
     }
 
     printf("nAdd round-trip: %zu bytes, block %zu bytes\n", nadd_len, block_len);
-    if (failures == 0) {
-        printf("PASS: big-nAdd block assembly\n");
-    }
     free(block);
+
+    /* ---- Large-template case (2026-09-18 incident) -------------------------
+       A node whose mempool holds large transactions hands out a template far
+       bigger than GAPCOIN_SUBMIT_HEX_CAP (the 128 KiB floor). Assembly MUST
+       succeed when the caller sizes its buffer from
+       gapcoin_gbt_submission_hex_need(), and the old fixed-size buffer MUST be
+       rejected -- that rejection is exactly what silently dropped 6 real gaps
+       (and was mis-counted as "stale"). */
+    {
+        const size_t tx_bytes = 150000U; /* > the old 128 KiB block floor */
+        char *tx_hex = (char *)malloc(tx_bytes * 2U + 1U);
+        if (!tx_hex) {
+            printf("FAIL: cannot allocate tx hex\n");
+            failures++;
+        } else {
+            for (size_t i = 0; i < tx_bytes * 2U; i++) {
+                tx_hex[i] = "0123456789abcdef"[i & 15U];
+            }
+            tx_hex[tx_bytes * 2U] = '\0';
+
+            struct block_template big;
+            memset(&big, 0, sizeof(big));
+            big.height = 2534329U;
+            big.curtime = 1692000000;
+            big.coinbasevalue = 38824970;
+            char *tx_ptrs[1];
+            tx_ptrs[0] = tx_hex;
+            big.transaction_count = 1;
+            big.transaction_data = tx_ptrs;
+
+            size_t need = gapcoin_gbt_submission_hex_need(&big, 90);
+            printf("large template: tx=%zu B -> need=%zu hex chars (floor=%u)\n",
+                   tx_bytes, need, (unsigned)GAPCOIN_SUBMIT_HEX_CAP);
+            if (need <= GAPCOIN_SUBMIT_HEX_CAP) {
+                printf("FAIL: helper does not see the oversized template\n");
+                failures++;
+            }
+
+            char *small = (char *)malloc(GAPCOIN_SUBMIT_HEX_CAP);
+            if (!small || gapcoin_gbt_work_build_submission_bytes(
+                              header_prefix, header_nonce, &big, shift, nadd, 90,
+                              small, GAPCOIN_SUBMIT_HEX_CAP) == 0) {
+                printf("FAIL: oversized template assembled into the old floor "
+                       "buffer (the silent-drop bug)\n");
+                failures++;
+            }
+            free(small);
+
+            char *large = (char *)malloc(need);
+            int big_rc = large ? gapcoin_gbt_work_build_submission_bytes(
+                                     header_prefix, header_nonce, &big, shift,
+                                     nadd, 90, large, need)
+                               : -1;
+            if (big_rc != 0) {
+                printf("FAIL: correctly sized buffer still failed (%d)\n", big_rc);
+                failures++;
+            } else if (strlen(large) + 1U > need) {
+                printf("FAIL: helper under-estimated (%zu > %zu)\n",
+                       strlen(large) + 1U, need);
+                failures++;
+            } else if (!strstr(large, tx_hex)) {
+                printf("FAIL: template tx not found in assembled block\n");
+                failures++;
+            } else {
+                printf("large template: assembled %zu hex chars (helper said %zu)\n",
+                       strlen(large), need);
+            }
+            free(large);
+            free(tx_hex);
+        }
+    }
+
+    if (failures == 0) {
+        printf("PASS: big-nAdd block assembly + oversized-template sizing\n");
+    }
     return failures ? 1 : 0;
 }

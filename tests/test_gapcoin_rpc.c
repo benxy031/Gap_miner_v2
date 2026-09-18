@@ -155,11 +155,30 @@ static int test_rpc_build_submission(void) {
         return 0;
     }
 
-    char block_hex[GAPCOIN_SUBMIT_HEX_CAP];
+    /* Size the assembly buffer from the LIVE template, exactly as main.c does:
+       using the fixed GAPCOIN_SUBMIT_HEX_CAP floor as a ceiling fails on any
+       node whose mempool holds large transactions (2026-09-18: 470 KB of
+       template txs vs the 128 KiB floor -> this very assertion failed while
+       production silently dropped 6 gaps). Heap, not stack: the requirement
+       scales with the mempool. */
+    size_t hex_cap = gapcoin_gbt_submission_hex_need(tmpl, 1);
+    if (hex_cap < GAPCOIN_SUBMIT_HEX_CAP) {
+        hex_cap = GAPCOIN_SUBMIT_HEX_CAP;
+    }
+    char *block_hex = (char *)malloc(hex_cap);
+    if (!block_hex) {
+        printf("  ✗ FAIL: cannot allocate %zu hex chars\n", hex_cap);
+        block_template_free(tmpl);
+        gapcoin_rpc_free(rpc);
+        return 0;
+    }
+    printf("  [info] live template needs %zu hex chars (floor %u)\n", hex_cap,
+           (unsigned)GAPCOIN_SUBMIT_HEX_CAP);
     if (gapcoin_gbt_work_build_submission(work.header_prefix, work.nonce, tmpl,
                                           26, 0, block_hex,
-                                          sizeof(block_hex)) != 0) {
+                                          hex_cap) != 0) {
         printf("  ✗ FAIL: gapcoin_gbt_work_build_submission returned an error\n");
+        free(block_hex);
         block_template_free(tmpl);
         gapcoin_rpc_free(rpc);
         return 0;
@@ -168,6 +187,7 @@ static int test_rpc_build_submission(void) {
     size_t hex_len = strlen(block_hex);
     if (hex_len == 0 || hex_len % 2 != 0) {
         printf("  ✗ FAIL: Submission hex has an invalid length (%zu)\n", hex_len);
+        free(block_hex);
         block_template_free(tmpl);
         gapcoin_rpc_free(rpc);
         return 0;
@@ -180,6 +200,7 @@ static int test_rpc_build_submission(void) {
     }
     if (strncmp(block_hex, expected_prefix, 160) != 0) {
         printf("  ✗ FAIL: Submission header prefix does not match the GBT header\n");
+        free(block_hex);
         block_template_free(tmpl);
         gapcoin_rpc_free(rpc);
         return 0;
@@ -188,6 +209,7 @@ static int test_rpc_build_submission(void) {
     printf("  ✓ PASS: Submission hex (%zu chars) starts with the exact GBT header prefix\n",
            hex_len);
 
+    free(block_hex);
     block_template_free(tmpl);
     gapcoin_rpc_free(rpc);
     return 1;

@@ -306,6 +306,31 @@ int gapcoin_gbt_work_next_hash(struct gapcoin_gbt_work *work,
     return gapcoin_gbt_work_hash(work, h256);
 }
 
+/* Upper bound on the serialized coinbase transaction built by
+   build_coinbase_tx(): version(4) + vin count(1) + prevout(32) + index(4) +
+   script len(1) + script(<=100, the builder's own guard) + sequence(4) +
+   vout count(1) + value(8) + payout len(1) + payout(<=512) + locktime(4)
+   = 672 bytes; rounded up to keep the arithmetic headroom obvious. */
+#define GAPCOIN_COINBASE_TX_MAX 768U
+
+size_t gapcoin_gbt_submission_hex_need(const struct block_template *tmpl,
+                                       size_t nadd_len) {
+    if (!tmpl) return 0;
+    if (nadd_len == 0) nadd_len = 1;
+
+    size_t bytes = 80U + 4U + 2U + 9U + nadd_len; /* header + CompactSize cap */
+    bytes += 9U;                                  /* tx count, worst case 0xff */
+    bytes += GAPCOIN_COINBASE_TX_MAX;
+    for (size_t index = 0; index < tmpl->transaction_count; index++) {
+        const char *hex = tmpl->transaction_data
+                              ? tmpl->transaction_data[index]
+                              : NULL;
+        if (!hex) continue;
+        bytes += strlen(hex) / 2U;
+    }
+    return bytes * 2U + 1U;
+}
+
 int gapcoin_gbt_work_build_submission_bytes(const uint8_t header_prefix[80],
                                             uint32_t header_nonce,
                                             const struct block_template *tmpl,
@@ -314,7 +339,6 @@ int gapcoin_gbt_work_build_submission_bytes(const uint8_t header_prefix[80],
                                             size_t nadd_len,
                                             char *out_hex, size_t out_hex_cap) {
     if (!header_prefix || !tmpl || !out_hex || out_hex_cap == 0) return -1;
-
     /* nAdd: raw little-endian bytes, minimum one zero byte. */
     if (!nadd || nadd_len == 0) {
         static const uint8_t zero = 0;
@@ -343,6 +367,11 @@ int gapcoin_gbt_work_build_submission_bytes(const uint8_t header_prefix[80],
     size_t coinbase_len = 0;
     uint8_t *coinbase_tx = build_coinbase_tx(tmpl, g_payout_script_hex, &coinbase_len);
     if (!coinbase_tx) {
+        fprintf(stderr,
+                "[gapcoin_work] coinbase build failed: height=%u flags=%s "
+                "payout=%s\n",
+                tmpl->height, tmpl->coinbaseaux ? tmpl->coinbaseaux : "(none)",
+                g_payout_script_hex ? g_payout_script_hex : "(OP_TRUE)");
         free(header);
         return -1;
     }
@@ -367,6 +396,13 @@ int gapcoin_gbt_work_build_submission_bytes(const uint8_t header_prefix[80],
         uint8_t *bytes = (hex && len > 0U) ? malloc(len) : NULL;
         if (!hex || len == 0U || strlen(hex) % 2U != 0U || !bytes ||
             decode_hex(hex, bytes, len, 0) != 0) {
+            fprintf(stderr,
+                    "[gapcoin_work] template tx %zu/%zu unusable: %s (len=%zu "
+                    "chars)%s\n",
+                    index + 1U, tmpl->transaction_count,
+                    hex ? "not valid hex" : "missing raw data",
+                    hex ? strlen(hex) : 0U,
+                    bytes ? "" : " (no memory for it)");
             free(bytes);
             ok = 0;
             break;
@@ -381,7 +417,20 @@ int gapcoin_gbt_work_build_submission_bytes(const uint8_t header_prefix[80],
         for (size_t index = 0; index < total_txs; index++) {
             total_len += tx_lens[index];
         }
-        if (total_len * 2U + 1U > out_hex_cap) ok = 0;
+        if (total_len * 2U + 1U > out_hex_cap) {
+            /* Never silent. This is the 2026-09-18 failure mode: a node whose
+               mempool holds large transactions hands out a template bigger than
+               the caller's buffer, and every candidate is then dropped with no
+               submitblock attempt at all. The caller must size its buffer from
+               gapcoin_gbt_submission_hex_need(). */
+            fprintf(stderr,
+                    "[gapcoin_work] block assembly needs %zu hex chars but the "
+                    "buffer holds %zu: block=%zu B (header %zu + 9 + %zu txs, "
+                    "coinbase %zu), nadd=%zu B, shift=%u\n",
+                    total_len * 2U + 1U, out_hex_cap, total_len, header_len,
+                    total_txs, coinbase_len, nadd_len, shift);
+            ok = 0;
+        }
     }
 
     if (ok) {

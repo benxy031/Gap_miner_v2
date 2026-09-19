@@ -88,6 +88,15 @@ FUSED_GPU=1 ./bin/gapminer --host 127.0.0.1 --port 31397 --user benxy031 --pass 
 FUSED_GPU=1 ./bin/gapminer --host 127.0.0.1 --port 31397 --user benxy031 --pass xx \
   --shift 96 --threads 8 --enable-gpu-fermat --sieve-primes 7000000
 
+# ── Mining: GAPCOIN POOL instead of a node (legacy stratum, port 2434) ──────
+# No node is contacted; the pool's share target becomes the merit threshold.
+# ~/.gapminer-pool holds the worker on line 1 and the password on line 2
+# (chmod 600) — see "Pool mining" below for how to create it.
+FUSED_GPU=1 ./bin/gapminer --stratum stratum+tcp://gap.suprnova.cc:2434 \
+  --stratum-auth-file ~/.gapminer-pool \
+  --crt-file data/crt/m23/shift509_p74_covermax_m38.txt --threads 4 \
+  --enable-gpu-fermat --enable-submission
+
 # ── Record hunting (GAP_HUNT): single walker ────────────────────────────────
 ./bin/gapminer --gap-hunt --crt-file data/crt/m23/shift507_p74_lex_m30.txt \
   --gap-hunt-device 0 --gap-hunt-min-merit 19 \
@@ -131,6 +140,24 @@ scripts/tail_shape.py gap_hunt_records_f1.txt --u-fit 16 --u-test 18,20,22
 scripts/tail_shape.py FILE ... --pool --u-fit 21
                                      # merge same-config files (same L, and fit
                                      # above the highest report threshold)
+
+# ── Record LOG report: what did the miner actually find? ───────────────
+# Reads the node log AND the pool log (gapminer_records.log /
+# gapminer_pool_records.log, or any path you give it), pairs each found
+# candidate with the verdict it later received, and answers: how many, how
+# fast, at which merits, ruled how by the work source, and how close to a
+# known record.  --plot writes an 8-panel PNG.
+scripts/records_report.py            # auto: both default logs in CWD
+scripts/records_report.py --source pool --plot
+                                     # pool only -> records_report.png
+                                     # (the output directory is created if it
+                                     # does not exist yet)
+scripts/records_report.py --since 2026-09-19T12:00 --until 2026-09-19T18:00
+                                     # a window; ALSO turns "nothing found"
+                                     # into a 95% rate upper bound (3.0/span)
+scripts/records_report.py --log old.log --share-target 15.772589 --top 10
+scripts/records_report.py --selftest   # verify the tool itself on a synthetic
+                                     # log with a known distribution (sigma 1.2)
 ```
 
 ## GPU acceleration (CUDA)
@@ -375,10 +402,13 @@ covers are deployed in `gap_hunt_fleet.conf`.
 | `--crt-file <path>` | none | Enable CRT covering mode; the file's shift overrides `--shift` |
 | `--sieve-primes <n>` | `50000` | Small-prime sieve limit. Non-CRT + `--enable-gpu-fermat`: adaptive bit-scaled default (`log2(depth)` interpolated between 282-bit → window+halo cover and 311-bit → 20M, clamped to `[cover, 20M]`; measured +14% win/s at shift 55, deeper than 20M makes the CPU sieve the bottleneck). With `HALF_CLASS` the 311-bit anchor drops to 5M (measured peak at shift 55: 5M = 609 win/s vs 20M = 391). CRT mode: `10000000` on CPU, `100000` on GPU, `2000000` on the fused GPU path (`FUSED_GPU=1`; measured on the production host at shift475 live merit: 500K=3183, 1M=3197, 2M=3324, 5M=3205 win/s — 2M is the optimum; older dev-host runs: shift258 3106 win/s at 1M vs 2814 at 5M, shift509 1971 vs 1905). GAP_HUNT: default **`2000000`** (lowered from 10M on 2026-09-15; re-measured with the chunked mark split and the jump2 chain on, where the curve is flat-then-falling: shift507 0.5M=1893, 1M=1908, 2M=1897, 5M=1819, 10M=1736, 20M=1558 win/s; shift1017 2M=599, 5M=596, 10M=593, 20M=538 — 2M is equal-best at both shifts with 5× less prime table and faster startup; record parity at 2M vs 10M verified: identical gap/merit/start over the same k range. The older "deeper sieving trims survivors directly" advice (2M=91, 10M=154, 20M=161 win/s at shift1017) was measured in the full-scan path *before* the mark split, when the host sieve dominated; it no longer holds in chain mode) |
 | `--merit <v>` | node difficulty | Merit threshold override (lower = more BPSW work) |
-| `--enable-submission` | off | Submit BPSW-verified gaps via `submitblock`. The block-assembly buffer is **sized from the live template** (`gapcoin_gbt_submission_hex_need()`: header + CompactSize + a coinbase bound + every template tx), with `GAPCOIN_SUBMIT_HEX_CAP` (256 KiB of hex = a 128 KiB block) only as a FLOOR — a node whose mempool holds large transactions hands out templates well above that floor, and a hard ceiling there makes the builder return `-1` for every candidate with no RPC attempt at all (2026-09-18 incident: 470 KB of template txs vs the old 128 KB cap; 6 gaps lost and, worse, never written to the record log). The stats line reports `Submit: attempts=… accepted=… rejected=… stale=… asm_fail=…`, where **`asm_fail` is local assembly failure, NOT a node rejection**: the gap was never offered to the node (it used to be added to `stale`), and it is written to the record log with `status=assemble-failed`. `stale` means only that the header had already rotated when the gap was queued. Assembly failures are always loud on stderr (`[gapcoin_work] block assembly needs …` / `coinbase build failed` / `template tx N/M unusable`) |
-| `--coinbase-script-hex <hex>` | none (`OP_TRUE`) | Payout scriptPubKey for submitted blocks |
+| `--enable-submission` | off | Submit BPSW-verified gaps via `submitblock`. In **pool mode** (`--stratum`) this is what enables share submission: without it the miner connects, finds qualifying gaps and sends **nothing** to the pool (the record log still fills up, which is exactly how a "mining but never credited" run looks). The block-assembly buffer is **sized from the live template** (`gapcoin_gbt_submission_hex_need()`: header + CompactSize + a coinbase bound + every template tx), with `GAPCOIN_SUBMIT_HEX_CAP` (256 KiB of hex = a 128 KiB block) only as a FLOOR — a node whose mempool holds large transactions hands out templates well above that floor, and a hard ceiling there makes the builder return `-1` for every candidate with no RPC attempt at all (2026-09-18 incident: 470 KB of template txs vs the old 128 KB cap; 6 gaps lost and, worse, never written to the record log). The stats line reports `Submit: attempts=… accepted=… rejected=… stale=… asm_fail=…`, where **`asm_fail` is local assembly failure, NOT a node rejection**: the gap was never offered to the node (it used to be added to `stale`), and it is written to the record log with `status=assemble-failed`. `stale` means only that the header had already rotated when the gap was queued. Assembly failures are always loud on stderr (`[gapcoin_work] block assembly needs …` / `coinbase build failed` / `template tx N/M unusable`) |
+| `--coinbase-script-hex <hex>` | none (`OP_TRUE`) | Payout scriptPubKey for submitted blocks. **Ignored in pool mode** (`--stratum`): the pool owns the coinbase and pays your pool account, so the OP_TRUE fallback warning is suppressed there too |
+| `--stratum <host:port>` | off | Mine on a Gapcoin **pool** instead of a local node (accepts `stratum+tcp://host:port`). Speaks the **legacy** Gapcoin pool protocol — the one the official miners use — which is what suprnova serves on port **2434**; port **2433** is suprnova's private "new stratum" that only their own closed miners implement, so it is not supported. Pool mode contacts **no node**: the pool's 80-byte header becomes the work, the pool's **share target** becomes the merit threshold, and solutions go back as `mining.submit` PoW payloads (`hdr80 + nNonce(LE) + nShift(LE) + nAdd(LE)`, >86 bytes) — no coinbase, no block assembly, no `submitblock`. There is **no share/block flag in the protocol**: the envelope is identical and the pool classifies the solution by merit (share above its target, block above network difficulty), which is why the default threshold is the share target rather than the network difficulty — override with `--merit`. Record-log entries carry `height=0` (the legacy protocol has no height) and the verdict adds `status=accepted` / `rejected` / `unresolved`. Verified live on 2026-09-19 against `gap.suprnova.cc:2434`: 90 s, **88 shares queued, 88 accepted, 0 rejected**, pool share target 15.7726 merit with network difficulty 23.7473 merit decoded from the header; and a 6-minute run after the push-method fix: **308 queued, 308 accepted, 0 rejected** across 40 adopted template rotations. See `docs/POOL_STRATUM.md` |
+| `--stratum-user <name>` | — | Pool worker, or the wallet address for anonymous mining (fallback: `GAPMINER_STRATUM_USER`). Only needed when no auth file is used: a worker name on line 1 of `--stratum-auth-file` takes precedence over this flag |
+| `--stratum-auth-file <path>` | — | Text file with the worker on line 1 and the password on line 2 (a group/other-readable file triggers a warning; use `chmod 600`). Simplest creation, without leaking the password into `ps` or shell history: `{ read -rp 'worker: ' w; read -rsp 'password: ' p; printf '%s\n%s\n' "$w" "$p"; } > ~/.gapminer-pool && chmod 600 ~/.gapminer-pool`. The password is deliberately **not** a CLI option because it would be visible in `ps`; fallbacks are `GAPMINER_STRATUM_PASS`, then `x` (which pools accept for wallet logins). See the Credentials block under Pool mining |
 | `--enable-gpu-fermat` | off | Use the CUDA base-2 MR kernel as the primality filter (requires `WITH_CUDA=1`; falls back to CPU on failure) |
-| `--record-log <path>` | `gapminer_records.log` | Log every BPSW-verified candidate with full parameters; each line carries `new_record=yes/no/unknown` and the strongest claim label `claim=FIRST_KNOWN_OCCURRENCE` (known-corpus first occurrence) or `none` — never a bare "record" |
+| `--record-log <path>` | `gapminer_records.log` (`gapminer_pool_records.log` in pool mode) | Log every BPSW-verified candidate with full parameters; each line carries `new_record=yes/no/unknown` and the strongest claim label `claim=FIRST_KNOWN_OCCURRENCE` (known-corpus first occurrence) or `none` — never a bare "record". **Pool runs write their own file** (`gapminer_pool_records.log`) unless `--record-log` is given, because a pool share is not a node-accepted gap: its verdict comes from the pool (`accepted`/`rejected`/`unresolved`), the threshold is the pool's share target, and `height` is always 0, so mixing the two would change what the node file means without any field saying which source a line came from |
 | `--merit-records <path>` | `data/prime_gap_merits.txt` | Best-known-merit table used to flag `new_record=yes` |
 | `--gap-hunt` | off | Standalone record-hunting walk (requires `--crt-file` and a `WITH_CUDA=1` build; runs the walk and exits instead of starting the miner) |
 | `--gap-hunt-start <hex>` | `2^(255+shift)` | Base anchor for the walk (hex); default follows the CRT file's shift; CRT-aligned internally |
@@ -396,6 +426,7 @@ Environment variables:
 | `GPU_SIEVE_TIMING` | off | CUDA-event accounting for the GPU sieve kernels: adds a `GPU kernel split` line to `ROLLING STATS` with the pure kernel time of the MR, mark and extract launches as a share of uptime (`gpu_sieve_accounted_mark_us` / `_extract_us`). In `--gap-hunt` it additionally prints a `stage us/window` line on the periodic tick (`mark=`/`extract=`/`mr=` per window and as a share of the window). Events are recorded around the launches and read after the stream sync those paths already perform, so no extra synchronization is added. Measured (RTX 3070, shift512 `p75_lex_m30`, difficulty ≈ 23.9, 1 thread, fused chain, chunk 32): **MR 45.6% + mark 31.2% + extract 5.6% = 82.4% of wall is GPU kernel execution** (nvidia-smi utilization 93%, the difference being gather/memset kernels and copies) — that was BEFORE the `GPU_MARK_SPLIT` rewrite; after it the mark share drops to 3.5% and the MR kernel becomes the wall (see `GPU_MARK_SPLIT`). Hunt (jump2, 2M hunt default, per window): shift1017 1683 µs total — mark 59 µs (3.5%) + extract 60 µs (3.6%) + **MR 1421 µs (84.5%)**; shift507 576 µs total — mark 46 µs (8.0%) + extract 30 µs (5.1%) + **MR 387 µs (67%)**, the rest host/gather overhead |
 | `GPU_SIEVE_BATCH` | `1024` | Windows per GPU bitmap-sieve batch (`1..4096`, autotuned) |
 | `FUSED_GPU` | off | Full GPU-resident CRT pipeline (sieve+extract+MR on-device; implies `GPU_SIEVE`, defaults to a 2M deep sieve) |
+| `STRATUM_REFRESH_S` | `10` | Pool mode only: seconds between getwork-style work re-requests (`0` disables). **This is a safety net for a pool that never pushes work, not the mechanism suprnova uses** (it pushes `mining.notify` — see the pool section): its `mining.request` answers with the template cached at session start, so polling cannot detect a rotation (30+ requests in a 5-minute session returned one single template while the pushes carried a newer one). An unchanged answer is not republished, so a short interval costs nothing; two consecutive rejections force an immediate refresh |
 | `FUSED_STAGE_TIMING` | off | Adds a `Fused stage split` line to `ROLLING STATS` with the host wall time of each fused stage (mark / extract / chain, plus the chain's own gather and MR round trips) as a percentage of uptime, and the chain round count. Costs four `clock_gettime` calls per window plus four per chain round — diagnostics only. **`gather` measures the host call only (2026-09-19):** the round's staging kernel now runs on the fermat slot stream with one async parameter upload and no device-wide barrier, so its share of wall dropped from 4.5-17.9% (old binary, chunk 32/16) to **0.2-0.4%** at every chunk, and the time it used to absorb now shows up in `mr` (the submit+collect round trip), which is where the chain's remaining per-round cost lives. Measured (RTX 3070, shift512 `p75_lex_m30`, live difficulty ≈ 23.9, 1 thread, fused chain): at chunk 32 **mark 20.8% + extract 36.2% (host side 57%) vs chain 42.0%** (gather 14.7%, MR round trip 27.0%) with ~16.6k chain rounds per 120 s ≈ 3 ms per round — i.e. after the chunk fix the host sieve side is the bottleneck, not the MR kernel. In the clean chunk-sweep runs the split was mark 35.3% / extract 11.1% / chain 51.8% (rounds 35479) at the default chunk 32 and 36.1% / 11.1% / 51.0% (rounds 23106) at chunk 64; with `GPU MR acc/wall = 0.492` and external `nvidia-smi` utilization **93% (50/50 samples ≥ 90%)** the fused path is GPU-saturated, so the non-MR ~50% of wall is the mark/extract kernels, **not idle time** — hiding the chain round trip (second in-flight context) buys nothing |
 | `GPU_MR_BATCH` | `8` | Windows per accumulated MR batch on the fused path (`1..8`; `1` = per-window, the old behavior). One `gpu_fermat_submit_device` per K windows instead of K small-batch launches. Measured on the dev host (RTX 3070, 8 workers, 20s runs, 0 failures): shift258 K=1 3047 → K=8 **5715 (+88%)**; shift509 K=1 1971 → K=8 **3211 (+63%)**. K=8 vs K=4 (all wins, no regressions): +6.5% (258), +2.7% (450), +4.5% (509), +1.4% (657), +0.7% (720), +1.9% (1008). Candidate counts per window are identical across K (verified per shift). Memory note: K=8 sizes the device candidate buffers at 8 windows; on ≤4 GB cards with 8 workers at shifts ≥ 1008 this may OOM and fail-closed to the CPU path |
 | `GPU_SIEVE_PAIR` | off | Experimental 2-window pair-batched fused mark (one kernel writes both ping-pong bitmaps). Measured **-58%** win/s on the dev host (8 workers / 1 GPU, shift258: 1262 vs 3022); the monolithic kernel starves extract/MR kernels at the GPU scheduler. Benchmark-gated — do not enable in production |
@@ -443,7 +474,230 @@ make clean && make test      # all suites
 ./bin/test_gpu_fermat        # GPU kernel vs GMP ground truth + device-pointer path (WITH_CUDA build)
 ./bin/test_gpu_sieve         # fused extract+pack kernel parity vs CPU sieve (WITH_CUDA build)
 ./bin/test_halfclass         # HALF_CLASS two-pass pipeline parity vs full-class pipeline
+./bin/test_stratum           # pool protocol conformance vs an in-process mock pool (47 checks)
 ```
+
+## Pool mining (legacy stratum)
+
+```bash
+# suprnova: port 2434 is the legacy protocol; 2433 is their private dialect
+bin/gapminer --stratum stratum+tcp://gap.suprnova.cc:2434 \
+             --stratum-auth-file ~/.gapminer-pool \
+             --crt-file data/crt/m23/shift509_p74_covermax_m38.txt \
+             --threads 4 --enable-gpu-fermat --enable-submission
+```
+
+### Credentials
+
+`--stratum-auth-file <path>` points at a **tiny text file** that holds both pool
+credentials:
+
+```
+line 1:  worker name  (or the wallet address for anonymous mining)
+line 2:  password
+```
+
+Create it without leaving the password in your shell history or in `ps`:
+
+```bash
+{ read -rp 'worker: ' w; read -rsp 'password: ' p; printf '%s\n%s\n' "$w" "$p"; } \
+  > ~/.gapminer-pool && chmod 600 ~/.gapminer-pool
+```
+
+The path is free-form — `~/.gapminer-pool` is just the convention used in these
+examples. The miner warns when the file is readable by group or others, because
+the password is in it.
+
+Why a file and not a flag: a `--stratum-pass` option would put the password in
+the process's command line, where every user on the box can read it with `ps`.
+There is therefore deliberately **no password CLI option**. Resolution order:
+
+| value | 1st | 2nd | 3rd | 4th |
+|---|---|---|---|---|
+| worker | auth file line 1 | `--stratum-user` | `GAPMINER_STRATUM_USER` | — (required) |
+| password | auth file line 2 | `GAPMINER_STRATUM_PASS` | `x` | — |
+
+So `--stratum-auth-file` alone is enough; `--stratum-user` is for the case where
+no file is used (or the file holds only a password line). Note the precedence:
+a worker name in the file **wins over** `--stratum-user`.
+
+### Working example: suprnova, verified end to end
+
+```bash
+# 2 workers on one card (the production packing is 2 per card, 4 on 2 cards).
+# setsid+nohup+</dev/null matters on a remote host: a miner started from a
+# terminal that later closes gets SIGHUP and silently stops earning.
+setsid nohup env FUSED_GPU=1 ./bin/gapminer \
+  --stratum stratum+tcp://gap.suprnova.cc:2434 \
+  --stratum-auth-file ~/.gapminer-pool \
+  --crt-file data/crt/m23/shift509_p74_covermax_m38.txt \
+  --threads 2 --enable-gpu-fermat --enable-submission \
+  > gapminer_pool.log 2>&1 < /dev/null &
+```
+
+What it prints (verbatim from the 90 s live run on 2026-09-19, `--threads 2` on
+one RTX 3070):
+
+```
+[Main] Configuration:
+  Work source: pool stratum+tcp://gap.suprnova.cc:2434
+  Payout: the pool account (the pool owns the coinbase at payout)
+  Threads: 2
+  User shift: 509
+  Sieve primes: 2000000
+  Merit threshold: pool share target (read right after connecting)
+  Mode: POOL CRT scan (submission enabled)
+
+[Main] POOL MODE: gap.suprnova.cc:2434 as 'deki.1' (legacy Gapcoin stratum)
+  No local node is used: the pool supplies work and the share target.
+[stratum] connected to gap.suprnova.cc:2434 as 'deki.1'
+[stratum] new work: share=15.772589 merit, network=23.747338 merit
+  Pool share target: 15.7726 merit | network difficulty: 23.7473 merit
+  Active merit threshold: 15.7726 (pool share target)
+
+  Pool shares: queued=88 accepted=88 rejected=0 duplicate=0 send-failed=0 unresolved=0
+  Pool link: connected | reconnects=0 connect-failures=0 | share target=15.7726 network=23.7473 merit
+  Yield: 3520.00 blocks/h expected | 88.733 per Mwin (1 in 11k windows) | 88 candidates @ merit>=15.77 (live) | n=88, 1-sigma 11% | accepted 3520.00/h (100% of 88 attempts)
+```
+
+Reading the pool lines:
+
+| field | meaning | expectation |
+|---|---|---|
+| `share target` (`Pool link`) | the pool's live share difficulty in merit | moves with the pool; the miner follows it automatically **unless** `--merit` pinned a threshold |
+| `queued` | shares handed to the pool client | scales with hashrate: at share merit 15.77 this fleet measured **88.7 per Mwin**, i.e. ~3.2-3.5k shares/h at ~10k win/s |
+| `accepted` / `rejected` | the pool's verdicts (also written to the record log) | rejects should be ~0 (measured 0 of 88 in the short run, **0 of 308 in a 6-minute run after the push fix**); a reject carries the pool's own message, so read it before suspecting the miner |
+| `unresolved` | the connection dropped with the share in flight | **not** a rejection — the pool never answered; the counter exists so a dropped link cannot masquerade as pool-rejected work |
+| `duplicate` / `send-failed` | shares the client refused to queue | `duplicate` = byte-identical payload re-sent after a header rotation (the pool rejects those too, so it is dropped locally); `send-failed` = socket down at send time |
+| `Pool link: down` + `reconnects` | the link dropped and is being retried with backoff | keep mining: the client reconnects and re-requests work on its own; in-flight shares are reported as `unresolved` |
+
+Notes specific to pool work:
+
+* `--enable-submission` is required here too — without it the run is dry-run and
+  **nothing** is sent to the pool (the record log still fills up, which is
+  exactly how a "mining but never credited" run looks).
+* `--coinbase-script-hex` is ignored (and its OP_TRUE warning is suppressed):
+  the pool owns the coinbase, and rewards are paid to your pool account, not to
+  a script you pass here.
+* Everything else is the same pipeline as against a node: `--shift`/`--crt-file`,
+  `--sieve-primes`, `HALF_CLASS`/`QUARTER_CLASS`, and the `FUSED_GPU`/`MINING_JUMP2`
+  chain knobs. `--threads` is the worker count (2 per card in this example).
+* **The record log goes to its own file: `gapminer_pool_records.log`** (node runs
+  keep `gapminer_records.log`; `--record-log <path>` overrides both). Pool shares
+  and node gaps are different objects — the verdict comes from the pool
+  (`accepted`/`rejected`/`unresolved`), the threshold is the pool's share target,
+  and `height` is always 0 — so keeping one file per work source keeps each file's
+  meaning intact. The startup line prints which file is in use:
+  `[RecordLog] Logging BPSW candidates to gapminer_pool_records.log`.
+* `--gap-hunt` still takes precedence: it runs the standalone record walk and
+  exits instead of joining a pool (it writes its own `--gap-hunt-out` file and
+  never opens the record log).
+* Wrong credentials look like two different things: a JSON `error` answered to
+  `mining.request` means the worker/password is rejected, while **no answer at
+  all** means the pool dropped the request (a bogus worker name gets silence, not
+  an error — silence alone is not proof of a broken client).
+* **New work arrives as a push, and the method name is not the one the
+  protocol documents.** suprnova pushes the rotated template as
+  `{"id":null,"method":"mining.notify","params":{"data":...,"difficulty":...}}`
+  — *not* `blockchain.block.new`. A client that filters pushes by method name
+  throws those pushes away without a trace, keeps mining a header the pool has
+  abandoned, and then has **every** share rejected with **no error message**
+  (measured 2026-09-19, shift509 CRT, live pool: 108 accepted, then 202-228
+  rejected in a row across three runs, with six ignored `mining.notify` pushes
+  in five minutes). The miner now accepts **any** push whose `params` carries a
+  work object (a bare object, or a one-element array wrapping one) — the same
+  rule the reference client uses — and re-seats the search on it, logging
+  `new work: ... (pool rotated its template)`; `bin/test_stratum` pins both the
+  `mining.notify` name and a deliberately unknown method name.
+* **Do not try to detect a rotation by polling.** `mining.request` on this pool
+  answers with the template cached at session start: in a 5-minute capture every
+  request returned the same `data`, while the pushes carried a different one.
+  Push delivery is the only mechanism here, which is also why a rejected run
+  looks so strange — the share target and the network difficulty never change.
+  To see the pushes, run with `STRATUM_DEBUG=1` and grep for `push method`.
+* **Work is additionally re-requested on a timer** (`STRATUM_REFRESH_S`, default
+  **10 s**) as a safety net for a pool that pushes nothing. A refresh whose
+  answer is identical is not republished (no chain restart, no dropped shares),
+  so polling costs nothing; a refresh whose answer differs re-seats the search
+  and logs `new work: ... (pool rotated its template)`. Two consecutive
+  rejections also force an immediate refresh, since that is the only signal a
+  message-less rejection gives.
+* Check the pool's dashboard for your worker; the miner's `accepted` counter is
+  the same number, and both should track each other.
+
+### Non-CRT at a pool (the shift-44 command)
+
+The best non-CRT configuration against a node
+(`HALF_CLASS=1 --shift 44 --threads 8 --enable-gpu-fermat --sieve-primes 3000000`)
+becomes this on a pool — same knobs, pool as the work source, plus submission:
+
+```bash
+HALF_CLASS=1 ./bin/gapminer \
+  --stratum stratum+tcp://gap.suprnova.cc:2434 \
+  --stratum-auth-file ~/.gapminer-pool \
+  --shift 44 --threads 8 --enable-gpu-fermat --sieve-primes 3000000 \
+  --enable-submission
+```
+
+It runs correctly, but **it is the wrong tool for pool work** — and that is
+measured, not argued. Both rows below ran 60 s on the same card against the same
+share target (merit 15.77, the pool's live value):
+
+| config | win/s | adders/s | shares earned | share probability per adder |
+|---|---|---|---|---|
+| shift 44 non-CRT + HALF_CLASS (this command) | 549 | 576M | **480/h** (4 in 60 s, 1σ ±50%) | 2.3e-10 |
+| shift 509 CRT `p74_covermax_m38` + chain (example above) | 11,319 | 456M | **3,480/h** (58 in 60 s, 1σ ±13%) | 2.1e-9 |
+
+The non-CRT config covers **26% more adders per second** (its window is 2^20
+adders against the cover's 40,300) and still earns **7× fewer shares**, because
+per-adder share probability is *not* geometry-independent: the covering stretches
+the tail (σ ≈ 1.5 here), which multiplies `P(merit ≥ m)` by ~9×. Two consequences:
+
+* At a pool, prefer a CRT cover config. Adders/s ranks configurations only at
+equal σ, and a miner's hashrate number is not the number the pool credits.
+* Do not compare geometries by the `per Mwin` figure alone: it is per *window*,
+  and these windows differ 26× in adders. Normalize per adder — or per hour —
+  whenever the window sizes differ.
+
+One pool-specific effect worth knowing when tuning: with `HALF_CLASS` the GPU was
+fed ~35% less work (acc/wall 4.0-4.2 in pool mode vs 6.4-6.7 against a node at the
+same window rate), most likely because the hidden-class resolution path fires far
+more often at a low share threshold and that path is CPU-side. It does not flip
+the ranking (`HALF_CLASS` still beats the full-class scan in pool mode, 549 vs
+299 win/s), but it is the one scan knob whose cost is threshold-dependent.
+
+Pool mode replaces the node: the covering file, shift, sieve depth and GPU knobs
+behave exactly as in node mode, but the pool's header takes the place of the GBT
+template and the search front is the pool's **share target** (printed at startup
+and again whenever the pool moves it). Two stats lines are added:
+
+```
+  Pool shares: queued=88 accepted=88 rejected=0 duplicate=0 send-failed=0 unresolved=0
+  Pool link: connected | reconnects=0 connect-failures=0 | share target=15.7726 network=23.7473 merit
+```
+
+Key semantics, all verified against the live pool:
+
+* **No node, no block assembly.** The pool holds the template (its merkle root is
+  already in the header it hands out), so the miner sends the PoW *solution*:
+  `hdr80 + nNonce + nShift + nAdd`, the same shape gapcoind's legacy getwork
+  submit expects. Our CRT shift (2 bytes) and the full-width CRT `nAdd` fit.
+* **Shares vs blocks need no marker.** A solution at or above the share target is
+  a share; at or above network difficulty it is also a block. The pool decides;
+  we only choose the threshold. Mining at network difficulty would starve the
+  pool's share accounting, which is why the default is the share target.
+* **Duplicates are dropped locally** (the pool rejects them) and the verdict is
+  written to the record log by a callback from the receive thread — the worker
+  already logged `status=queued`, so each gap gets `queued` plus one terminal
+  state. A dropped connection reports `unresolved`, never `rejected`.
+* **Reconnects** are automatic with backoff; in-flight shares at the moment of a
+  drop are counted and reported as unresolved instead of being silently lost.
+
+Testing without a pool account: `scripts/mock_stratum_pool.py` is a standalone
+mock pool (work, pushes, gated difficulty changes, optional rejects) and
+`bin/test_stratum` runs the same conformance checks in-process with no network.
+The full protocol reference, field-by-field layout and evidence are in
+`docs/POOL_STRATUM.md`.
 
 ## Rolling stats (`acc/wall`)
 
@@ -499,9 +753,14 @@ used here — it needs a second threshold point, and the naive Cramér form is
 uncalibrated for the chain (measured: P = 1.7e-7 per window against a Cramér
 estimate of 3.5e-9 at m = 23.8 on the fleet, i.e. ~50× fewer, because it is the
 covering, not Poisson hole statistics, that produces the qualifying windows). The **per-million-window** rate is the geometry
-instrument: it divides throughput out, so two covers or shifts can be compared
-directly, and it is the quantity that a "candidates/hour" comparison between
-miners must be reduced to before it means anything. `1 in NM windows` is the
+instrument *at equal window size*: it divides throughput out, so two CRT covers
+(both ~40k-adder windows) can be compared directly. It is **not** comparable
+across window sizes — a non-CRT shift-44 window holds 2^20 adders against a
+cover's 40,300, so at the same threshold non-CRT prints 243 per Mwin against the
+cover's 86 per Mwin while the cover still earns **7× more shares per hour**
+(measured: 480/h vs 3,480/h). When windows differ, normalize per adder or per
+hour instead. For a "candidates/hour" comparison between miners, reduce to
+shares or candidates per hour, never per window. `1 in NM windows` is the
 same number inverted for readability (scaled to `k`/`M` as the rate rises, so a
 low-threshold run does not print a useless `1 in 0.00M windows`). `accepted X/h (Y% of N attempts)` is
 appended only with `--enable-submission`.
@@ -576,7 +835,8 @@ data/prime_gap_merits.txt  Best-known-merit reference table (local only,
                   generated by scripts/update_merits.sh; not in git)
 scripts/          gen_crt_batch.sh, update_merits.sh, ab_shift_compare.sh,
                   watch_gap_hunt_records.py, gap_hunt_stats.py, analyze_n3.py,
-                  tail_compare.py, tail_shape.py, record_rate_model.py
+                  tail_compare.py, tail_shape.py, record_rate_model.py,
+                  records_report.py
 gen_crt.md        CRT covering-file generator guide
 docs/             Architecture references, GAP_HUNT plan, closed-fingerprints registry (dead routes and their reopen triggers)
 ```

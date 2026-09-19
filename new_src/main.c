@@ -26,6 +26,7 @@
 #include <time.h>
 #include <math.h>
 #include <pthread.h>
+#include <sys/stat.h>
 #include <gmp.h>
 #include "miner_farm.h"
 #include "gapcoin_rpc.h"
@@ -37,6 +38,7 @@
 #include "halfclass.h"
 #include "gap_dist.h"
 #include "gap_hunt.h"
+#include "stratum.h"
 #ifdef WITH_CUDA
 #include "gpu/gpu_fermat.h"
 #endif
@@ -62,6 +64,12 @@ static pthread_t g_rpc_thread;
 static struct block_template *g_rpc_template = NULL;
 static uint32_t g_rpc_prev_height = 0;  /* Track previous height to avoid duplicate signaling */
 static pthread_mutex_t g_rpc_lock = PTHREAD_MUTEX_INITIALIZER;
+
+/* Pool (Gapcoin legacy stratum) mode.  g_stratum is NULL unless --stratum is
+   given; in that mode no local node is contacted at all. */
+static struct stratum_ctx *g_stratum = NULL;
+static uint64_t g_pool_queued = 0;       /* shares handed to the pool client */
+static uint64_t g_pool_send_failed = 0;  /* shares the client refused to queue */
 
 static void signal_handler(int sig) {
     printf("\n[Main] Received signal %d, shutting down...\n", sig);
@@ -154,6 +162,173 @@ static void *rpc_poll_thread_func(void *arg) {
     return NULL;
 }
 
+/* ─────────────── Pool mode (Gapcoin legacy stratum) ─────────────── */
+
+/* Accepts "host:port", "stratum+tcp://host:port", "stratum://host:port" and
+   "tcp://host:port".  Returns 0 on a malformed endpoint. */
+static int parse_stratum_endpoint(const char *endpoint, char *host,
+                                  size_t host_cap, char *port, size_t port_cap)
+{
+    const char *p = endpoint;
+    const char *colon;
+    size_t host_len;
+
+    if (!endpoint || !*endpoint)
+        return 0;
+    if (strncmp(p, "stratum+tcp://", 14) == 0) {
+        p += 14;
+    } else if (strncmp(p, "stratum://", 10) == 0) {
+        p += 10;
+    } else if (strncmp(p, "tcp://", 6) == 0) {
+        p += 6;
+    }
+    colon = strrchr(p, ':');
+    if (!colon || colon == p)
+        return 0;
+    host_len = (size_t)(colon - p);
+    if (host_len == 0 || host_len >= host_cap)
+        return 0;
+    if (colon[1] == '\0' || strlen(colon + 1) >= port_cap)
+        return 0;
+    memcpy(host, p, host_len);
+    host[host_len] = '\0';
+    snprintf(port, port_cap, "%s", colon + 1);
+    return 1;
+}
+
+/*
+ * Worker name and password for the pool.
+ *
+ * The password is NEVER taken from the command line: it would be visible in
+ * `ps` to every user on the box.  It comes from --stratum-auth-file (worker on
+ * line 1, password on line 2) or from GAPMINER_STRATUM_PASS.  The worker name
+ * may come from the file, --stratum-user or GAPMINER_STRATUM_USER.  When no
+ * password is available "x" is used, which pools accept for wallet logins
+ * (the legacy Gapcoin pool protocol also accepts mining anonymously with the
+ * wallet address as the worker name).
+ */
+static int resolve_stratum_auth(const char *auth_file, const char *cli_user,
+                                char *user, size_t user_cap, char *pass,
+                                size_t pass_cap)
+{
+    const char *env_user = getenv("GAPMINER_STRATUM_USER");
+    const char *env_pass = getenv("GAPMINER_STRATUM_PASS");
+
+    user[0] = '\0';
+    pass[0] = '\0';
+
+    if (auth_file && *auth_file) {
+        struct stat st;
+        FILE *f = fopen(auth_file, "r");
+        char line[256];
+        if (!f) {
+            fprintf(stderr, "[Main] Cannot open --stratum-auth-file %s\n",
+                    auth_file);
+            return 0;
+        }
+        if (stat(auth_file, &st) == 0 && (st.st_mode & 0077))
+            fprintf(stderr,
+                    "[Main] WARNING: %s is readable by group/others; chmod 600 "
+                    "is recommended (it holds the pool password)\n",
+                    auth_file);
+        if (fgets(line, sizeof(line), f)) {
+            line[strcspn(line, "\r\n")] = '\0';
+            snprintf(user, user_cap, "%.*s", (int)user_cap - 1, line);
+        }
+        if (fgets(line, sizeof(line), f)) {
+            line[strcspn(line, "\r\n")] = '\0';
+            snprintf(pass, pass_cap, "%.*s", (int)pass_cap - 1, line);
+        }
+        fclose(f);
+    }
+    if (user[0] == '\0' && cli_user && *cli_user)
+        snprintf(user, user_cap, "%s", cli_user);
+    if (user[0] == '\0' && env_user && *env_user)
+        snprintf(user, user_cap, "%s", env_user);
+    if (pass[0] == '\0' && env_pass && *env_pass)
+        snprintf(pass, pass_cap, "%s", env_pass);
+    if (user[0] == '\0') {
+        fprintf(stderr, "[Main] Pool mode needs a worker name: use "
+                        "--stratum-user, --stratum-auth-file or "
+                        "GAPMINER_STRATUM_USER\n");
+        return 0;
+    }
+    if (pass[0] == '\0')
+        snprintf(pass, pass_cap, "x");
+    return 1;
+}
+
+/* Hex (>=160 chars) -> 80 header bytes.  Returns 0 on malformed input. */
+static int decode_hex80(const char *hex, uint8_t out[80])
+{
+    if (!hex || strlen(hex) < 160)
+        return 0;
+    for (size_t i = 0; i < 80; i++) {
+        unsigned int bv = 0;
+        if (sscanf(hex + i * 2, "%2x", &bv) != 1)
+            return 0;
+        out[i] = (uint8_t)bv;
+    }
+    return 1;
+}
+
+/* Little-endian nAdd bytes -> decimal string (record log field). */
+static void nadd_bytes_to_dec(const uint8_t *bytes, size_t len, char *out,
+                              size_t out_cap)
+{
+    mpz_t z;
+    char *s;
+
+    if (len == 0) {
+        snprintf(out, out_cap, "0");
+        return;
+    }
+    mpz_init(z);
+    mpz_import(z, len, -1, 1, 0, 0, bytes);
+    s = mpz_get_str(NULL, 10, z);
+    snprintf(out, out_cap, "%s", s ? s : "?");
+    free(s);
+    mpz_clear(z);
+}
+
+/*
+ * Pool verdict -> record log.  Runs on the stratum receive thread, so it never
+ * blocks a worker; record_log_write_outcome_big() is mutex-protected.
+ *
+ * The worker that found the gap already logged status=queued, so this adds the
+ * terminal state: accepted, rejected, or unresolved (the connection dropped
+ * with the share in flight, which is NOT a rejection and must not be counted
+ * as one).  The line is keyed by pool share metadata, because the verdict
+ * arrives asynchronously and carries only a JSON message id.
+ */
+static void pool_verdict_cb(void *user, int accepted,
+                            const struct stratum_share_meta *meta,
+                            const char *message)
+{
+    char nadd_dec[192];
+    (void)user;
+
+    if (!meta)
+        return;
+    nadd_bytes_to_dec(meta->nadd, meta->nadd_len, nadd_dec, sizeof(nadd_dec));
+
+    record_log_write_outcome_big(meta->height, meta->shift, meta->header_nonce,
+                                 nadd_dec, meta->gap_length, meta->merit,
+                                 (accepted == 1) ? "accepted" :
+                                 (accepted == 0) ? "rejected" : "unresolved");
+
+    if (accepted == 1) {
+        printf("[Main] Pool ACCEPTED share: gap=%u merit=%.2f nAdd=%s\n",
+               meta->gap_length, meta->merit, nadd_dec);
+        fflush(stdout);
+    } else {
+        fprintf(stderr, "[Main] Pool %s share: gap=%u merit=%.2f nAdd=%s%s%s\n",
+                (accepted == 0) ? "REJECTED" : "UNRESOLVED",
+                meta->gap_length, meta->merit, nadd_dec,
+                message ? " - " : "", message ? message : "");
+    }
+}
+
 void print_usage(const char *prog_name) {
     printf("Usage: %s [options]\n", prog_name);
     printf("  --host <addr>         Gapcoin RPC host (default: 127.0.0.1)\n");
@@ -178,6 +353,24 @@ void print_usage(const char *prog_name) {
     printf("  --coinbase-script-hex <hex>\n");
     printf("                        Coinbase payout scriptPubKey, hex-encoded (default: none;\n");
     printf("                        falls back to an anyone-can-spend OP_TRUE output with a warning)\n");
+    printf("  --stratum <host:port> Mine on a Gapcoin pool instead of a local node.\n");
+    printf("                        Accepts stratum+tcp://host:port.\n");
+    printf("                        Uses the LEGACY Gapcoin pool protocol (suprnova port\n");
+    printf("                        2434; port 2433 is a private dialect only suprnova's\n");
+    printf("                        own miners speak). The pool supplies the header and\n");
+    printf("                        the share target, which becomes the merit threshold,\n");
+    printf("                        and solutions go back as mining.submit PoW payloads\n");
+    printf("                        (80-byte header + nNonce + nShift + nAdd) - no local\n");
+    printf("                        node, no coinbase, no block assembly.\n");
+    printf("                        The share target is used instead of the network\n");
+    printf("                        difficulty so the pool sees share traffic; override\n");
+    printf("                        with --merit.\n");
+    printf("  --stratum-user <name> Pool worker, or the wallet address for anonymous mining\n");
+    printf("                        (fallback: GAPMINER_STRATUM_USER)\n");
+    printf("  --stratum-auth-file <path>\n");
+    printf("                        File with the worker name on line 1 and the password on\n");
+    printf("                        line 2 (chmod 600). The password is never read from the\n");
+    printf("                        command line; GAPMINER_STRATUM_PASS is the fallback.\n");
     printf("  --enable-gpu-fermat   Batch-test sieve candidates on the CUDA GPU (base-2\n");
     printf("                        Miller-Rabin) as the primality filter, skipping the CPU\n");
     printf("                        Euler test (default: off; requires a WITH_CUDA=1 build;\n");
@@ -196,7 +389,8 @@ void print_usage(const char *prog_name) {
     printf("                        default (MINING_JUMP2=0 restores the full scan;\n");
     printf("                        inert without FUSED_GPU=1).\n");
     printf("  --record-log <path>   Log every BPSW-verified candidate with full parameters\n");
-    printf("                        (default: gapminer_records.log)\n");
+    printf("                        (default: gapminer_records.log, or\n");
+    printf("                        gapminer_pool_records.log in pool/--stratum mode)\n");
     printf("  --merit-records <path>\n");
     printf("                        Reference gap-length -> best-known-merit table used to flag\n");
     printf("                        new records in the record log (default: data/prime_gap_merits.txt,\n");
@@ -233,6 +427,7 @@ int main(int argc, char *argv[]) {
     int enable_gpu_fermat = 0;       /* GPU Fermat pre-filter; off by default */
     int half_class_active = 0;       /* HALF_CLASS two-pass scan (non-CRT) */
     const char *record_log_path = "gapminer_records.log";
+    int record_log_overridden = 0;   /* Set when --record-log is given explicitly */
     const char *merit_records_path = "data/prime_gap_merits.txt";
     /* GAP_HUNT standalone mode */
     int gap_hunt_enabled = 0;
@@ -241,6 +436,10 @@ int main(int argc, char *argv[]) {
     const char *gap_hunt_state = NULL;
     const char *gap_hunt_out = NULL;
     int gap_hunt_device = 0;
+    /* Pool (legacy stratum) mode: --stratum enables it and no node is used */
+    const char *stratum_endpoint = NULL;
+    const char *stratum_user = NULL;
+    const char *stratum_auth_file = NULL;
     
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--host") == 0 && i + 1 < argc) {
@@ -285,12 +484,19 @@ int main(int argc, char *argv[]) {
                 return 1;
             }
             record_log_path = argv[++i];
+            record_log_overridden = 1;
         } else if (strcmp(argv[i], "--merit-records") == 0) {
             if (i + 1 >= argc || argv[i + 1][0] == '-') {
                 fprintf(stderr, "[Main] --merit-records requires a file path\n");
                 return 1;
             }
             merit_records_path = argv[++i];
+        } else if (strcmp(argv[i], "--stratum") == 0 && i + 1 < argc) {
+            stratum_endpoint = argv[++i];
+        } else if (strcmp(argv[i], "--stratum-user") == 0 && i + 1 < argc) {
+            stratum_user = argv[++i];
+        } else if (strcmp(argv[i], "--stratum-auth-file") == 0 && i + 1 < argc) {
+            stratum_auth_file = argv[++i];
         } else if (strcmp(argv[i], "--gap-hunt") == 0) {
             gap_hunt_enabled = 1;
         } else if (strcmp(argv[i], "--gap-hunt-start") == 0 && i + 1 < argc) {
@@ -469,8 +675,16 @@ int main(int argc, char *argv[]) {
     }
     
     printf("[Main] Configuration:\n");
-    printf("  RPC: %s:%u\n", rpc_host, rpc_port);
-    printf("  User: %s\n", rpc_user);
+    if (stratum_endpoint) {
+        /* Pool mode contacts no node, and the pool's share target (read after
+           connecting) is the threshold - saying "RPC" or "live node
+           difficulty" here would describe a source that is not in use. */
+        printf("  Work source: pool %s\n", stratum_endpoint);
+        printf("  Payout: the pool account (the pool owns the coinbase at payout)\n");
+    } else {
+        printf("  RPC: %s:%u\n", rpc_host, rpc_port);
+        printf("  User: %s\n", rpc_user);
+    }
     printf("  Threads: %u\n", num_threads);
     printf("  User shift: %u\n", user_shift);
     if (!crt_mode) {
@@ -483,10 +697,13 @@ int main(int argc, char *argv[]) {
     printf("  Sieve primes: %u\n", sieve_primes);
     if (merit_threshold_overridden) {
         printf("  Merit threshold: %.2f (CLI override)\n", merit_threshold);
+    } else if (stratum_endpoint) {
+        printf("  Merit threshold: pool share target (read right after connecting)\n");
     } else {
         printf("  Merit threshold: live node difficulty\n");
     }
-    printf("  Mode: live %s scan (%s)\n",
+    printf("  Mode: %s %s scan (%s)\n",
+           stratum_endpoint ? "POOL" : "live",
            crt_mode ? "CRT" : "non-CRT",
            enable_submission ? "submission enabled" : "dry-run");
     printf("\n");
@@ -496,7 +713,10 @@ int main(int argc, char *argv[]) {
     }
     if (enable_submission) {
         worker_set_submission_enabled(1);
-        if (!coinbase_script_hex) {
+        /* In pool mode the coinbase belongs to the pool, so the OP_TRUE
+           fallback warning would describe a payout path that does not exist
+           here (and --coinbase-script-hex is ignored). */
+        if (!coinbase_script_hex && !stratum_endpoint) {
             fprintf(stderr,
                     "[Main] WARN: --enable-submission is set without --coinbase-script-hex; "
                     "the coinbase payout will use an anyone-can-spend OP_TRUE output, so any "
@@ -538,43 +758,130 @@ int main(int argc, char *argv[]) {
     }
 
     merit_records_load(merit_records_path);
+
+    /*
+     * Mode switch: a local gapcoind (default) or a Gapcoin POOL over the legacy
+     * stratum protocol.  Pool mode contacts no node at all: the pool hands out
+     * the 80-byte header prefix, its share target becomes the merit threshold
+     * (so the pool sees share traffic, not only the rare network-difficulty
+     * gaps), and solutions go back as mining.submit PoW payloads instead of
+     * assembled blocks.  The pool owns the template -- its merkle root is inside
+     * the header it gave us -- so no coinbase and no block assembly are needed.
+     */
+    int stratum_mode = (stratum_endpoint != NULL);
+
+    /*
+     * Pool runs get their own record log.  A pool share is NOT a node-accepted
+     * gap: the verdict comes from the pool (accepted/rejected/unresolved), the
+     * merit threshold is the pool's share target, and height is always 0 -- so
+     * appending both into gapminer_records.log would silently change what that
+     * file means (its lines carry no field saying which work source they came
+     * from).  --record-log overrides this in both modes.
+     */
+    if (stratum_mode && !record_log_overridden)
+        record_log_path = "gapminer_pool_records.log";
     record_log_init(record_log_path);
 
-    /* Phase 2: Connect to real Gapcoin node */
-    g_rpc = gapcoin_rpc_connect(rpc_host, rpc_port, rpc_user, rpc_pass);
-    if (!g_rpc) {
-        fprintf(stderr, "[Main] Failed to connect to Gapcoin RPC\n");
-        return 1;
-    }
-    
-    /* Get initial mining info */
-    struct mining_info *info = gapcoin_rpc_get_mining_info(g_rpc);
-    if (!info) {
-        fprintf(stderr, "[Main] Failed to get mining info\n");
-        gapcoin_rpc_free(g_rpc);
-        return 1;
-    }
-    
-    printf("[Main] Gapcoin info:\n");
-    printf("  Height: %u\n", info->blocks);
-    printf("  Difficulty: %.2f\n", info->difficulty);
-        printf("  Network power: %.2fM mH/s\n",
-            info->networkminingpower / 1000000.0);
-    if (!merit_threshold_overridden) {
-        if (info->difficulty <= 0.0) {
-            fprintf(stderr, "[Main] Node returned an invalid difficulty\n");
-            mining_info_free(info);
+    struct block_template *tmpl = NULL;
+    struct gapcoin_gbt_work active_work;
+    uint8_t initial_h256[32];
+    uint32_t work_difficulty = 0;   /* integer merit handed to the workers */
+    uint32_t work_height = 0;       /* the pool protocol carries no height (0) */
+    char pool_hdr80_hex[STRATUM_DATA_HEX_SIZE];
+    uint64_t pool_share_ndiff = 0;
+    uint64_t pool_net_ndiff = 0;
+
+    memset(pool_hdr80_hex, 0, sizeof(pool_hdr80_hex));
+
+    if (stratum_mode) {
+        char s_host[256];
+        char s_port[16];
+        char s_user[128];
+        char s_pass[128];
+
+        if (!parse_stratum_endpoint(stratum_endpoint, s_host, sizeof(s_host),
+                                    s_port, sizeof(s_port))) {
+            fprintf(stderr, "[Main] --stratum expects host:port (optionally "
+                            "stratum+tcp://host:port), got '%s'\n",
+                    stratum_endpoint);
+            return 1;
+        }
+        if (!resolve_stratum_auth(stratum_auth_file, stratum_user, s_user,
+                                  sizeof(s_user), s_pass, sizeof(s_pass)))
+            return 1;
+
+        printf("[Main] POOL MODE: %s:%s as '%s' (legacy Gapcoin stratum)\n",
+               s_host, s_port, s_user);
+        printf("  No local node is used: the pool supplies work and the share target.\n");
+
+        g_stratum = stratum_connect(s_host, s_port, s_user, s_pass);
+        if (!g_stratum) {
+            fprintf(stderr, "[Main] Failed to start the stratum client\n");
+            return 1;
+        }
+        stratum_set_verdict_callback(g_stratum, pool_verdict_cb, NULL);
+
+        if (!stratum_wait_work(g_stratum, pool_hdr80_hex, &pool_share_ndiff,
+                               &pool_net_ndiff, 20000)) {
+            fprintf(stderr, "[Main] No work from the pool within 20 s.  Check the "
+                            "worker name, the password and the port: 2434 is the "
+                            "legacy protocol the official miners use, while 2433 "
+                            "is a private dialect only suprnova's miners speak.\n");
+            stratum_disconnect(g_stratum);
+            g_stratum = NULL;
+            return 1;
+        }
+        printf("  Pool share target: %.4f merit | network difficulty: %.4f merit\n",
+               stratum_ndiff_to_merit(pool_share_ndiff),
+               stratum_ndiff_to_merit(pool_net_ndiff));
+        if (!merit_threshold_overridden) {
+            merit_threshold = stratum_ndiff_to_merit(pool_share_ndiff);
+            if (merit_threshold <= 0.0) {
+                fprintf(stderr, "[Main] Pool returned an unusable share target\n");
+                stratum_disconnect(g_stratum);
+                g_stratum = NULL;
+                return 1;
+            }
+        }
+        printf("  Active merit threshold: %.4f (%s)\n", merit_threshold,
+               merit_threshold_overridden ? "CLI override" : "pool share target");
+        printf("\n");
+    } else {
+        /* Phase 2: Connect to real Gapcoin node */
+        g_rpc = gapcoin_rpc_connect(rpc_host, rpc_port, rpc_user, rpc_pass);
+        if (!g_rpc) {
+            fprintf(stderr, "[Main] Failed to connect to Gapcoin RPC\n");
+            return 1;
+        }
+
+        /* Get initial mining info */
+        struct mining_info *info = gapcoin_rpc_get_mining_info(g_rpc);
+        if (!info) {
+            fprintf(stderr, "[Main] Failed to get mining info\n");
             gapcoin_rpc_free(g_rpc);
             return 1;
         }
-        merit_threshold = info->difficulty;
+
+        printf("[Main] Gapcoin info:\n");
+        printf("  Height: %u\n", info->blocks);
+        printf("  Difficulty: %.2f\n", info->difficulty);
+        printf("  Network power: %.2fM mH/s\n",
+               info->networkminingpower / 1000000.0);
+        if (!merit_threshold_overridden) {
+            if (info->difficulty <= 0.0) {
+                fprintf(stderr, "[Main] Node returned an invalid difficulty\n");
+                mining_info_free(info);
+                gapcoin_rpc_free(g_rpc);
+                return 1;
+            }
+            merit_threshold = info->difficulty;
+        }
+        printf("  Active merit threshold: %.2f (%s)\n", merit_threshold,
+               merit_threshold_overridden ? "CLI override" : "live node difficulty");
+        printf("\n");
+
+        mining_info_free(info);
     }
-    printf("  Active merit threshold: %.2f (%s)\n",
-           merit_threshold,
-           merit_threshold_overridden ? "CLI override" : "live node difficulty");
-    printf("\n");
-    
-    mining_info_free(info);
 
     struct miner_farm_config farm_config = {
         .num_gpus = num_threads,
@@ -589,42 +896,60 @@ int main(int argc, char *argv[]) {
         return 1;
     }
 
-    struct block_template *tmpl = gapcoin_rpc_get_block_template(g_rpc);
-    if (!tmpl) {
-        fprintf(stderr, "[Main] Failed to fetch the initial block template\n");
-        miner_farm_free(g_farm);
-        gapcoin_rpc_free(g_rpc);
-        return 1;
-    }
-    fprintf(stderr, "[Main] Loaded GBT: height=%u curtime=%u tx_count=%zu version=%u\n",
-            tmpl->height, tmpl->curtime, tmpl->transaction_count, tmpl->version);
+    if (stratum_mode) {
+        /* Materialize the pool header: decode the 80-byte prefix and pick a
+           nonce whose hash meets Gapcoin's 256-bit requirement (the nonce is
+           part of the PoW payload, so the pool re-checks it itself). */
+        active_work.nonce = 0;
+        if (!decode_hex80(pool_hdr80_hex, active_work.header_prefix) ||
+            gapcoin_gbt_work_hash(&active_work, initial_h256) != 0) {
+            fprintf(stderr, "[Main] Cannot materialize the pool work header\n");
+            miner_farm_free(g_farm);
+            stratum_disconnect(g_stratum);
+            g_stratum = NULL;
+            return 1;
+        }
+        work_difficulty = (uint32_t)merit_threshold;
+        work_height = 0;
+    } else {
+        tmpl = gapcoin_rpc_get_block_template(g_rpc);
+        if (!tmpl) {
+            fprintf(stderr, "[Main] Failed to fetch the initial block template\n");
+            miner_farm_free(g_farm);
+            gapcoin_rpc_free(g_rpc);
+            return 1;
+        }
+        fprintf(stderr, "[Main] Loaded GBT: height=%u curtime=%u tx_count=%zu version=%u\n",
+                tmpl->height, tmpl->curtime, tmpl->transaction_count, tmpl->version);
 
-    struct gapcoin_gbt_work active_work;
-    uint8_t initial_h256[32];
-    if (gapcoin_gbt_work_init(&active_work, tmpl) != 0 ||
-        (!crt_mode && gapcoin_gbt_work_hash(&active_work, initial_h256) != 0)) {
-        fprintf(stderr, "[Main] Cannot materialize the initial GBT header\n");
-        block_template_free(tmpl);
-        miner_farm_free(g_farm);
-        gapcoin_rpc_free(g_rpc);
-        return 1;
+        if (gapcoin_gbt_work_init(&active_work, tmpl) != 0 ||
+            (!crt_mode && gapcoin_gbt_work_hash(&active_work, initial_h256) != 0)) {
+            fprintf(stderr, "[Main] Cannot materialize the initial GBT header\n");
+            block_template_free(tmpl);
+            miner_farm_free(g_farm);
+            gapcoin_rpc_free(g_rpc);
+            return 1;
+        }
+        work_difficulty = (uint32_t)tmpl->difficulty;
+        work_height = tmpl->height;
+        g_rpc_prev_height = tmpl->height;
     }
 
     if (crt_mode) {
-        miner_farm_update_work_crt(g_farm, tmpl->height, user_shift,
-                                   (uint32_t)tmpl->difficulty,
+        miner_farm_update_work_crt(g_farm, work_height, user_shift,
+                                   work_difficulty,
                                    active_work.header_prefix, active_work.nonce);
     } else {
-        miner_farm_update_work(g_farm, tmpl->height, user_shift,
-                               (uint32_t)tmpl->difficulty, initial_h256,
+        miner_farm_update_work(g_farm, work_height, user_shift,
+                               work_difficulty, initial_h256,
                                active_work.nonce);
     }
     uint64_t header_bases = 1;
     if (!crt_mode) {
-        printf("[Main] GBT header base: nonce=%u, shift=%u, window=%u\n",
+        printf("[Main] %s header base: nonce=%u, shift=%u, window=%u\n",
+               stratum_mode ? "Pool" : "GBT",
                active_work.nonce, user_shift, owned_window_size);
     }
-    g_rpc_prev_height = tmpl->height;
     
     /* 3. Set up signal handlers */
     signal(SIGINT, signal_handler);
@@ -641,14 +966,21 @@ int main(int argc, char *argv[]) {
     
     printf("[Main] Workers started, scanning active (%s)...\n",
            enable_submission ? "submission enabled" : "submission disabled");
-    printf("[Main] Connected to %s:%u, waiting for block template updates\n", 
-           rpc_host, rpc_port);
-    
-    /* 5. Start RPC polling thread (fetches blocks asynchronously) */
-    g_rpc_running = 1;
-    if (pthread_create(&g_rpc_thread, NULL, rpc_poll_thread_func, NULL) != 0) {
-        fprintf(stderr, "[Main] Failed to create RPC polling thread\n");
-        return 1;
+    if (stratum_mode) {
+        printf("[Main] Pool client running, waiting for new work pushes\n");
+    } else {
+        printf("[Main] Connected to %s:%u, waiting for block template updates\n",
+               rpc_host, rpc_port);
+    }
+
+    /* 5. Start the RPC polling thread (node mode only: in pool mode the work
+          arrives on the stratum client's receive thread instead). */
+    if (!stratum_mode) {
+        g_rpc_running = 1;
+        if (pthread_create(&g_rpc_thread, NULL, rpc_poll_thread_func, NULL) != 0) {
+            fprintf(stderr, "[Main] Failed to create RPC polling thread\n");
+            return 1;
+        }
     }
     
     /* 6. Main loop: monitor workers and print rolling scan statistics. */
@@ -661,9 +993,10 @@ int main(int argc, char *argv[]) {
     uint64_t prev_gpu_accounted_us = 0;  /* For acc/wall GPU-utilization metric */
     
     while (!g_farm->stop_flag) {
-        /* Check if RPC thread has new block template */
+        /* Check if RPC thread has new block template (node mode; pool mode gets
+           its work from the stratum client, see the block below). */
         pthread_mutex_lock(&g_rpc_lock);
-        if (g_new_block_ready && g_rpc_template) {
+        if (!stratum_mode && g_new_block_ready && g_rpc_template) {
             if (tmpl) {
                 block_template_free(tmpl);
             }
@@ -711,14 +1044,58 @@ int main(int argc, char *argv[]) {
         }
         pthread_mutex_unlock(&g_rpc_lock);
 
+        /* Pool mode: work is pushed by the pool.  A new work item (or a share
+           target change) restarts the search on the new header; the share
+           target keeps the chain threshold current when the pool moves it. */
+        if (stratum_mode) {
+            char new_hdr_hex[STRATUM_DATA_HEX_SIZE];
+            uint64_t s_nd = 0;
+            uint64_t n_nd = 0;
+            if (stratum_poll_work(g_stratum, new_hdr_hex, &s_nd, &n_nd)) {
+                double new_share_merit = stratum_ndiff_to_merit(s_nd);
+                memcpy(pool_hdr80_hex, new_hdr_hex, sizeof(pool_hdr80_hex));
+                active_work.nonce = 0;
+                if (!decode_hex80(new_hdr_hex, active_work.header_prefix) ||
+                    gapcoin_gbt_work_hash(&active_work, initial_h256) != 0) {
+                    fprintf(stderr, "[Main] Stopping: pool work is not a usable header\n");
+                    miner_farm_stop(g_farm);
+                } else {
+                    if (!merit_threshold_overridden && new_share_merit > 0.0 &&
+                        new_share_merit != merit_threshold) {
+                        merit_threshold = new_share_merit;
+                        miner_farm_set_merit_threshold(g_farm, merit_threshold);
+                        printf("[Main] Pool moved the share target to %.4f merit\n",
+                               merit_threshold);
+                    }
+                    work_difficulty = (uint32_t)merit_threshold;
+                    printf("\n");
+                    printf("★ POOL NEW WORK ★ share=%.4f merit | network=%.4f merit | shift=%u\n",
+                           stratum_ndiff_to_merit(s_nd),
+                           stratum_ndiff_to_merit(n_nd), user_shift);
+                    printf("\n");
+                    if (crt_mode) {
+                        miner_farm_update_work_crt(g_farm, work_height, user_shift,
+                                                   work_difficulty,
+                                                   active_work.header_prefix,
+                                                   active_work.nonce);
+                    } else {
+                        miner_farm_update_work(g_farm, work_height, user_shift,
+                                               work_difficulty, initial_h256,
+                                               active_work.nonce);
+                    }
+                    header_bases++;
+                }
+            }
+        }
+
         if (!crt_mode && miner_farm_work_exhausted(g_farm, user_shift)) {
             uint8_t h256[32];
             if (gapcoin_gbt_work_next_hash(&active_work, h256) != 0) {
                 fprintf(stderr, "[Main] Stopping: GBT header nonce range exhausted\n");
                 miner_farm_stop(g_farm);
             } else {
-                miner_farm_update_work(g_farm, tmpl->height, user_shift,
-                                       (uint32_t)tmpl->difficulty, h256, active_work.nonce);
+                miner_farm_update_work(g_farm, work_height, user_shift,
+                                       work_difficulty, h256, active_work.nonce);
                 header_bases++;
                 printf("[Main] Adder range exhausted; rotating GBT header nonce to %u\n",
                        active_work.nonce);
@@ -726,7 +1103,7 @@ int main(int argc, char *argv[]) {
         }
 
         /* Flush any BPSW-verified gaps queued for real submission. */
-        if (enable_submission && tmpl) {
+        if (enable_submission && (tmpl || stratum_mode)) {
             struct gap_queue_entry entry;
             while (worker_get_pending_gap(&entry)) {
                 uint64_t current_generation = atomic_load_explicit(
@@ -766,6 +1143,49 @@ int main(int argc, char *argv[]) {
                     }
                     nadd_ptr = local_nadd;
                     nadd_sz = local_nadd_len;
+                }
+
+                /* Pool mode: send the PoW SOLUTION, not a block.  The payload
+                   is hdr80 + nNonce + nShift + nAdd (>86 bytes) and the pool
+                   holds the template (its merkle root is inside the header it
+                   gave us), so there is nothing to assemble.  There is no
+                   share/block flag either: the pool classifies the solution by
+                   merit.  The verdict arrives asynchronously and is logged by
+                   pool_verdict_cb(); the worker already logged "queued". */
+                if (stratum_mode) {
+                    struct stratum_share_meta meta;
+                    memset(&meta, 0, sizeof(meta));
+                    meta.gap_length = entry.gap_length;
+                    meta.merit = entry.merit;
+                    meta.height = 0;   /* the pool protocol carries no height */
+                    g_submit_attempts++;
+                    if (stratum_submit_share(g_stratum, active_work.header_prefix,
+                                             entry.header_nonce,
+                                             (uint16_t)entry.shift, nadd_ptr,
+                                             nadd_sz, &meta)) {
+                        g_pool_queued++;
+                        printf("[Main] Share queued to pool: nAdd=%s gap=%u merit=%.2f "
+                               "(share target %.4f, network %.4f)\n",
+                               nadd_dec ? nadd_dec : "?", entry.gap_length,
+                               entry.merit, stratum_share_merit(g_stratum),
+                               stratum_network_merit(g_stratum));
+                    } else {
+                        int connected = stratum_is_connected(g_stratum);
+                        g_pool_send_failed++;
+                        fprintf(stderr,
+                                "[Main] Pool share NOT sent (%s): nAdd=%s gap=%u "
+                                "merit=%.2f\n",
+                                connected ? "duplicate solution" : "pool disconnected",
+                                nadd_dec ? nadd_dec : "?", entry.gap_length,
+                                entry.merit);
+                        record_log_write_outcome_big(entry.height, entry.shift,
+                                                     entry.header_nonce, nadd_dec,
+                                                     entry.gap_length, entry.merit,
+                                                     connected ? "duplicate"
+                                                               : "send-failed");
+                    }
+                    free(nadd_dec);
+                    continue;
                 }
 
                 /* Size the assembly buffer from THIS template: a node whose
@@ -851,9 +1271,24 @@ int main(int argc, char *argv[]) {
             struct farm_stats stats;
             miner_farm_get_stats(g_farm, &stats);
             
-            struct mining_info *info = gapcoin_rpc_get_mining_info(g_rpc);
+            struct mining_info pool_info;
+            int pool_info_local = 0;
+            struct mining_info *info;
+            if (stratum_mode) {
+                /* Synthesise what the prints below expect, from the pool.  The
+                   live number shown is the NETWORK difficulty; the pool's SHARE
+                   target is already applied to the workers as the threshold. */
+                memset(&pool_info, 0, sizeof(pool_info));
+                pool_info.blocks = 0;
+                pool_info.difficulty = stratum_network_merit(g_stratum);
+                info = &pool_info;
+                pool_info_local = 1;
+            } else {
+                info = gapcoin_rpc_get_mining_info(g_rpc);
+            }
             if (info) {
-                if (!merit_threshold_overridden && info->difficulty > 0.0 &&
+                if (!pool_info_local && !merit_threshold_overridden &&
+                    info->difficulty > 0.0 &&
                     info->difficulty != merit_threshold) {
                     merit_threshold = info->difficulty;
                     miner_farm_set_merit_threshold(g_farm, merit_threshold);
@@ -1028,6 +1463,26 @@ int main(int argc, char *argv[]) {
                           stats.total_bpsw_attempts, stats.total_gaps,
                           stats.total_submissions);
                   }
+                  if (stratum_mode) {
+                      /* Pool accounting: the verdicts arrive asynchronously, so
+                         these are the authoritative share numbers in pool mode. */
+                      uint64_t p_acc = 0, p_rej = 0, p_dup = 0, p_sf = 0;
+                      uint64_t p_rec = 0, p_cf = 0, p_unres = 0;
+                      stratum_get_stats(g_stratum, &p_acc, &p_rej, &p_dup, &p_sf,
+                                        &p_rec, &p_cf, &p_unres);
+                      printf("  Pool shares: queued=%llu accepted=%llu rejected=%llu "
+                             "duplicate=%llu send-failed=%llu unresolved=%llu\n",
+                             (unsigned long long)g_pool_queued,
+                             (unsigned long long)p_acc, (unsigned long long)p_rej,
+                             (unsigned long long)p_dup, (unsigned long long)p_sf,
+                             (unsigned long long)p_unres);
+                      printf("  Pool link: %s | reconnects=%llu connect-failures=%llu "
+                             "| share target=%.4f network=%.4f merit\n",
+                             stratum_is_connected(g_stratum) ? "connected" : "down",
+                             (unsigned long long)p_rec, (unsigned long long)p_cf,
+                             stratum_share_merit(g_stratum),
+                             stratum_network_merit(g_stratum));
+                  }
                   {
                       /* Yield instrumentation: expected blocks/h is
                          win/s x P(merit >= m), and P is MEASURED here
@@ -1084,14 +1539,23 @@ int main(int argc, char *argv[]) {
                       } else if (up_h > 0.0) {
                           printf(" | n=0 -> 95%% upper %.1f b/h", 3.0 / up_h);
                       }
-                      if (enable_submission && up_h > 0.0)
+                      if (enable_submission && up_h > 0.0) {
+                          /* In pool mode the pool's accepted/rejected verdicts
+                             are the ground truth (they arrive asynchronously). */
+                          uint64_t acc_c = g_submit_accepted;
+                          uint64_t att_c = g_submit_attempts;
+                          if (stratum_mode) {
+                              uint64_t a = 0, r = 0, d = 0, s = 0, rc = 0, cf = 0, u = 0;
+                              stratum_get_stats(g_stratum, &a, &r, &d, &s, &rc,
+                                                &cf, &u);
+                              acc_c = a;
+                              att_c = g_pool_queued;
+                          }
                           printf(" | accepted %.2f/h (%.0f%% of %llu attempts)",
-                              (double)g_submit_accepted / up_h,
-                              g_submit_attempts
-                                  ? 100.0 * (double)g_submit_accepted /
-                                        (double)g_submit_attempts
-                                  : 0.0,
-                              (unsigned long long)g_submit_attempts);
+                              (double)acc_c / up_h,
+                              att_c ? 100.0 * (double)acc_c / (double)att_c : 0.0,
+                              (unsigned long long)att_c);
+                      }
                       printf("\n");
                   }
                   printf("  Max Euler pair: gap=%u | merit=%.2f\n",
@@ -1148,15 +1612,22 @@ int main(int argc, char *argv[]) {
                     printf("---------------------------------------------------------------\n");
                 printf("\n");
                 
-                mining_info_free(info);
+                if (!pool_info_local)
+                    mining_info_free(info);
             }
         }
     }
     
     /* 6. Cleanup */
-    printf("[Main] Stopping RPC thread...\n");
-    g_rpc_running = 0;
-    pthread_join(g_rpc_thread, NULL);
+    if (stratum_mode) {
+        printf("[Main] Disconnecting from the pool...\n");
+        stratum_disconnect(g_stratum);
+        g_stratum = NULL;
+    } else {
+        printf("[Main] Stopping RPC thread...\n");
+        g_rpc_running = 0;
+        pthread_join(g_rpc_thread, NULL);
+    }
     
     printf("[Main] Joining workers...\n");
     miner_farm_join(g_farm);
@@ -1173,6 +1644,7 @@ int main(int argc, char *argv[]) {
         block_template_free(g_rpc_template);
     }
     
+    /* gapcoin_rpc_free(NULL) is a no-op, so pool mode (g_rpc == NULL) is fine. */
     gapcoin_rpc_free(g_rpc);
     record_log_close();
     merit_records_free();

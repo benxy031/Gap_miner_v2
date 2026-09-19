@@ -1028,6 +1028,72 @@ int main(int argc, char *argv[]) {
                           stats.total_bpsw_attempts, stats.total_gaps,
                           stats.total_submissions);
                   }
+                  {
+                      /* Yield instrumentation: expected blocks/h is
+                         win/s x P(merit >= m), and P is MEASURED here
+                         (merit candidates / windows) rather than fitted from a
+                         sigma model.  Identity: candidates/uptime is exactly
+                         win/s x P, so writing it this way cannot drift from
+                         the throughput number.  A sigma model is deliberately
+                         NOT used: it needs a second threshold point, and the
+                         naive Cramer form is uncalibrated for the chain (it
+                         predicts ~50x fewer qualifying windows than are
+                         observed -- measured P 1.7e-7/window against a Cramer
+                         estimate of 3.5e-9 at m=23.8 on the fleet, because the
+                         covering, not Poisson hole statistics, produces them).
+                         The per-million-window rate is the geometry
+                         instrument: it divides out throughput, so two
+                         covers/shifts can be compared directly.  Both figures
+                         are cumulative and therefore only meaningful at a
+                         FIXED threshold -- if the network difficulty moves
+                         during the run the cumulative rate blends thresholds. */
+                      double up_h = (uptime > 0) ? (double)uptime / 3600.0 : 0.0;
+                      double cand = (double)stats.total_merit_candidates;
+                      double win = (double)stats.total_nonces;
+                      double per_win = (win > 0.0) ? cand / win : 0.0;
+                      printf("  Yield: %.2f blocks/h expected | %.3f per Mwin",
+                          (up_h > 0.0) ? cand / up_h : 0.0, per_win * 1e6);
+                      if (per_win > 0.0) {
+                          /* Same number inverted, scaled so low-threshold
+                             runs (merit 10: ~1 candidate per 270 windows)
+                             do not print a useless "1 in 0.00M windows". */
+                          double inv = 1.0 / per_win;
+                          if (inv >= 1e6) {
+                              printf(" (1 in %.2fM windows)", inv / 1e6);
+                          } else if (inv >= 1e3) {
+                              printf(" (1 in %.0fk windows)", inv / 1e3);
+                          } else {
+                              printf(" (1 in %.0f windows)", inv);
+                          }
+                      }
+                      printf(" | %.0f candidates @ merit>=%.2f (%s)",
+                          cand, merit_threshold,
+                          merit_threshold_overridden ? "CLI" : "live");
+                      /* Poisson noise guard.  A rate rebuilt from n events
+                         carries 1/sqrt(n) relative error, so a 30 s sample
+                         with 2 events reads ~20x above the truth (measured
+                         on the dev box: 240 b/h from n=2, while n=0 over the
+                         next 3.1M windows bounded the same quantity at
+                         <38 b/h).  Print the sample size next to the rate so
+                         a short run cannot be mistaken for a measurement,
+                         and print an upper bound rather than a fake 0.00 when
+                         nothing has been seen yet. */
+                      if (cand >= 1.0) {
+                          printf(" | n=%.0f, 1-sigma %.0f%%",
+                              cand, 100.0 / sqrt(cand));
+                      } else if (up_h > 0.0) {
+                          printf(" | n=0 -> 95%% upper %.1f b/h", 3.0 / up_h);
+                      }
+                      if (enable_submission && up_h > 0.0)
+                          printf(" | accepted %.2f/h (%.0f%% of %llu attempts)",
+                              (double)g_submit_accepted / up_h,
+                              g_submit_attempts
+                                  ? 100.0 * (double)g_submit_accepted /
+                                        (double)g_submit_attempts
+                                  : 0.0,
+                              (unsigned long long)g_submit_attempts);
+                      printf("\n");
+                  }
                   printf("  Max Euler pair: gap=%u | merit=%.2f\n",
                       stats.max_gap_length, stats.max_merit);
                   {

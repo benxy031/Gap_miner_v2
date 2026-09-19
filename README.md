@@ -485,6 +485,44 @@ only. Both ratios are geometry-independent and are the metric to compare against
 other miners' per-row test counts (e.g. a 74-prime/S512 cover with 761
 candidates/row and ~19 expensive tests/row).
 
+The block-finding rate is reported on a `Yield` line:
+
+```
+Yield: 9.53 blocks/h expected | 0.289 per Mwin (1 in 3.46M windows) | 57 candidates @ merit>=23.80 (live) | n=57, 1-sigma 13% | accepted 8.92/h (94% of 57 attempts)
+```
+
+`expected blocks/h` is `win/s × P(merit ≥ m)` where **P is measured**, not
+modelled: `P = merit candidates / windows`, so the line is exactly
+`candidates / uptime` (the two forms are identical by construction and cannot
+drift from the `Throughput` line above). A σ-fitted model is deliberately *not*
+used here — it needs a second threshold point, and the naive Cramér form is
+uncalibrated for the chain (measured: P = 1.7e-7 per window against a Cramér
+estimate of 3.5e-9 at m = 23.8 on the fleet, i.e. ~50× fewer, because it is the
+covering, not Poisson hole statistics, that produces the qualifying windows). The **per-million-window** rate is the geometry
+instrument: it divides throughput out, so two covers or shifts can be compared
+directly, and it is the quantity that a "candidates/hour" comparison between
+miners must be reduced to before it means anything. `1 in NM windows` is the
+same number inverted for readability (scaled to `k`/`M` as the rate rises, so a
+low-threshold run does not print a useless `1 in 0.00M windows`). `accepted X/h (Y% of N attempts)` is
+appended only with `--enable-submission`.
+
+Both figures are **cumulative** and therefore only meaningful at a fixed
+threshold: if the network difficulty moves during the run the rate blends
+thresholds (the mix is visible because the line prints the threshold and its
+source, `live` or `CLI`). In dry-run mode the line reports what *would* have been
+submitted. Use it in place of hand-parsing the log for
+`scripts/ab_shift_compare.sh`-style comparisons.
+
+The line always prints the **sample size** of the rate beside it, because a rate
+rebuilt from `n` events carries a 1-sigma relative error of `1/sqrt(n)` and
+finding a qualifying gap is a rare event: a 30 s sample that happens to catch 2
+candidates reported ~240 blocks/h, while the same quantity measured over the
+next 3.1M windows (0 events) is bounded at <38 blocks/h (95% CL) — a ~20x error
+from reading a short run. When `n = 0` the line prints the 95% upper bound
+(`3/uptime`) instead of a meaningless `0.00`, so a cold run cannot be mistaken
+for a measured zero. Trust the figure only once `1/sqrt(n)` is acceptable
+(`n >= 100` for ~+/-10%), which at ~10 blocks/h means hours, not minutes.
+
 In `MINING_JUMP2` mode the `Max Euler pair` line reports the largest **chain certificate span** (≈ active difficulty by construction: the frontier jump pair's gap is `ceil(difficulty·logbase) − ε`, always just below the threshold), not a true consecutive-prime pair — the true per-window max pair (full-scan) is the cross-cover gap ≈ 9-10k (merit ~17-19). `Merit candidates`/BPSW/submission are unaffected (parity-verified, 0 mismatches).
 
 In `HALF_CLASS` mode the `Max Euler pair` and `Merit candidates` lines reflect

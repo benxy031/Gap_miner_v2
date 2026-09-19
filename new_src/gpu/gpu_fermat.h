@@ -148,10 +148,18 @@ int gpu_fermat_jump_scan(gpu_fermat_ctx *ctx,
    allocate the staging buffers once, then per round copy each window's
    candidate slice [lo,hi) (packed AoS, src_cum = window slot prefix) into
    the contiguous staging buffer and return the round total for one tight
-   gpu_fermat_submit_device() call. */
+   gpu_fermat_submit_device() call.
+
+   gpu_fermat_gather_run() is ASYNCHRONOUS on fermat slot `slot`: the upload
+   and the staging kernel are enqueued on that slot's stream, which is also
+   the stream the following gpu_fermat_submit_device() uses, so stream order
+   is the only synchronization needed.  It must be called with the same slot
+   that will be submitted next, and the source buffer must already be
+   complete (the sieve extract path stream-synchronizes before returning). */
 int gpu_fermat_gather_alloc(gpu_fermat_ctx *ctx, uint32_t n_windows,
                             uint32_t chunk_cap, int active_limbs);
-int gpu_fermat_gather_run(gpu_fermat_ctx *ctx, const uint64_t *d_src,
+int gpu_fermat_gather_run(gpu_fermat_ctx *ctx, int slot,
+                          const uint64_t *d_src,
                           const uint32_t *h_src_cum,
                           const uint32_t *h_lo, const uint32_t *h_hi,
                           const uint32_t *h_dst_cum,

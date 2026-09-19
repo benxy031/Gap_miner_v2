@@ -388,7 +388,11 @@ static int gh_jump2_scan(struct gh_batch *b, int slot, struct gh_ctx *g,
         if (total > 0) {
             uint32_t gathered = 0;
             uint64_t rt0 = g_host_timing ? gh_now_us() : 0;
-            if (gpu_fermat_gather_run(g->fermat,
+            /* slot must be the slot submitted below: the gather is async on
+               that slot's stream and relies on stream order, not a device
+               barrier, to make the staging buffer complete before MR reads
+               it (see gpu_fermat_gather_run). */
+            if (gpu_fermat_gather_run(g->fermat, slot,
                     gpu_sieve_candidate_buffer(g->sieve, slot),
                     b->cum, lo, hi, dcum, K, g->fermat_limbs,
                     &gathered) != 0 || gathered != total) {

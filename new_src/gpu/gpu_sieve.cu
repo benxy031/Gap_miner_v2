@@ -1943,12 +1943,50 @@ static int gpu_sieve_extract_pack_impl(gpu_sieve_ctx *ctx,
 
         err = cudaMalloc(&ctx->d_cands_aos[0],
                          cap * (size_t)active_limbs * sizeof(uint64_t));
-        if (err != cudaSuccess) { fprintf(stderr, "gpu_sieve: cands[0] alloc: %s\n",
-                                          cudaGetErrorString(err)); return 0; }
+        if (err != cudaSuccess) {
+            /* Fail-closed is correct here (the worker drops to the CPU
+               sieve), but a bare "out of memory" hides how much was needed
+               and why, and the CPU path is ~600x slower -- print the numbers
+               so an out-of-VRAM run cannot be mistaken for a slow GPU. */
+            size_t want = cap * (size_t)active_limbs * sizeof(uint64_t);
+            size_t vfree = 0, vtotal = 0;
+            cudaMemGetInfo(&vfree, &vtotal);
+            fprintf(stderr,
+                    "gpu_sieve: cands[0] alloc: %s\n"
+                    "gpu_sieve:   needs 2 x %.0f MiB candidate buffers "
+                    "(window %llu x K=%u x %d limbs); device free %.0f of %.0f MiB\n"
+                    "gpu_sieve:   lower MINING_JUMP2_BATCH (now %u) or free VRAM;\n"
+                    "gpu_sieve:   otherwise this worker falls back to the CPU "
+                    "sieve, which is ~600x slower (measured 19 vs 11751 win/s)\n",
+                    cudaGetErrorString(err), (double)want / (1024.0 * 1024.0),
+                    (unsigned long long)ctx->max_odd_interval,
+                    (unsigned)ctx->extract_accum, active_limbs,
+                    (double)vfree / (1024.0 * 1024.0),
+                    (double)vtotal / (1024.0 * 1024.0),
+                    (unsigned)ctx->extract_accum);
+            return 0;
+        }
         err = cudaMalloc(&ctx->d_cands_aos[1],
                          cap * (size_t)active_limbs * sizeof(uint64_t));
-        if (err != cudaSuccess) { fprintf(stderr, "gpu_sieve: cands[1] alloc: %s\n",
-                                          cudaGetErrorString(err)); return 0; }
+        if (err != cudaSuccess) {
+            size_t want = cap * (size_t)active_limbs * sizeof(uint64_t);
+            size_t vfree = 0, vtotal = 0;
+            cudaMemGetInfo(&vfree, &vtotal);
+            fprintf(stderr,
+                    "gpu_sieve: cands[1] alloc: %s\n"
+                    "gpu_sieve:   needs 2 x %.0f MiB candidate buffers "
+                    "(window %llu x K=%u x %d limbs); device free %.0f of %.0f MiB\n"
+                    "gpu_sieve:   lower MINING_JUMP2_BATCH (now %u) or free VRAM;\n"
+                    "gpu_sieve:   otherwise this worker falls back to the CPU "
+                    "sieve, which is ~600x slower (measured 19 vs 11751 win/s)\n",
+                    cudaGetErrorString(err), (double)want / (1024.0 * 1024.0),
+                    (unsigned long long)ctx->max_odd_interval,
+                    (unsigned)ctx->extract_accum, active_limbs,
+                    (double)vfree / (1024.0 * 1024.0),
+                    (double)vtotal / (1024.0 * 1024.0),
+                    (unsigned)ctx->extract_accum);
+            return 0;
+        }
         err = cudaMalloc(&ctx->d_offsets, cap * sizeof(uint64_t));
         if (err != cudaSuccess) { fprintf(stderr, "gpu_sieve: offsets alloc: %s\n",
                                           cudaGetErrorString(err)); return 0; }

@@ -1632,13 +1632,31 @@ static int crt_gpu_batch_test(struct gpu_adapter *gpu, int limbs,
    8192), three orders of magnitude below the cap, so the chain path itself is
    unaffected.  The verifier now replays in cap-sized slices. */
 #define MINING_JUMP2_BATCH_MAX 512
-/* Per-window chain chunk.  Measured (RTX 3070, shift512 p75, live difficulty
-   ~23.9, 1 thread, fused path, 120-300 s): chunk 32 and 64 give the same
-   windows/s (2736 vs 2751, within noise) but 32 needs 1.66x fewer expensive
-   MR tests per window (120.5 vs 200.2), i.e. the same speed with real MR
-   headroom; chunk 16 is latency-bound (2069 win/s) and chunk 128 wastes tests
-   (384.5/window) while being slower (2163 win/s). */
-#define MINING_JUMP2_CHUNK_DEFAULT 32
+/* Per-window chain chunk.  DEFAULT 12 (was 32 until 2026-09-19).
+
+   The chain tests a whole C-wide survivor slice and keeps only ONE prime
+   from it (the first when searching forward, the last when searching
+   backward), so a bigger chunk buys fewer rounds but wastes more MR tests
+   per anchor, while a smaller chunk trades the other way.  Measured on the
+   dev host (RTX 3070, shift509_p74_covermax_m38, live difficulty, fused
+   chain, 90 s arms) the waste side now wins, because the per-round fixed
+   cost is much smaller than it was:
+
+     chunk        8     12          14     16          20     24     32
+     win/s  t=2  10923 11161/11652 11052 10877/11457 11183 10636  9610
+     win/s  t=1    --   7298        --     7168        7774   --    7305
+     win/s  t=4    --  11680        --    10742         --    --     --
+     MR/win      72.8  79.7        83.4   87.1        94.8  103.0 120.2
+
+   The flat region is 12..20 (run-to-run spread is ~4-5%, so the ordering
+   inside it is not resolvable); 8 and >=24 are clearly worse.  Chunk 32 --
+   the previous default, chosen when the gather round carried a device-wide
+   barrier (a 4.5-17.9% share of wall) -- is now 18-21% slower than 12 at two
+   or more workers per GPU.  At ONE worker per GPU chunk 12 (7298) matches
+   the old default 32 (7305) and beats 16 (7168), so 12 regresses nothing.
+   Emitted-set parity vs a full scan is verified at chunk 12/16/24/32
+   (bad_windows=0 bad_pairs=0 over ~900 flights each at --merit 16). */
+#define MINING_JUMP2_CHUNK_DEFAULT 12
 
 struct fused_flight_window {
     uint32_t nonce;
@@ -2134,6 +2152,15 @@ static int crt_fused_chain_flight(struct gpu_sieve_ctx *gpu_sieve,
         if (cs->thr[i] < 1)
             cs->thr[i] = 1;
     }
+    /* NOTE: a round-admission pool (admit N windows, top up as they finish)
+       was implemented and MEASURED on 2026-09-19 -- it is a regression at
+       every size, monotonically: chunk 12, 2 workers, win/s = 9216 (pool
+       128, rounds/1k 73.3) / 10734 (256, 49.9) / 11547 (384, 42.9) vs
+       **11751 with no pool (512, 39.1)**, i.e. the wave already wins.  The
+       wave finishes a flight in max(slices-per-window) rounds, a pool in
+       sum(slices)/pool >= max, so the pool only ever ADDS rounds while the
+       round batch it buys back is worth less than that.  Do not reintroduce
+       without a geometry where a window needs ~1 slice. */
     cs->cum[K] = cum;
     if (cum != total)
         return 0;               /* bookkeeping invariant */
@@ -2167,8 +2194,8 @@ static int crt_fused_chain_flight(struct gpu_sieve_ctx *gpu_sieve,
         if (rtotal > 0) {
             uint32_t gathered = 0;
             STAGE_T0(chain_gather);
-            if (gpu_fermat_gather_run(fermat, d_batch, cs->cum, cs->lo,
-                                      cs->hi, cs->dcum, K, fl->limbs,
+            if (gpu_fermat_gather_run(fermat, fl->slot, d_batch, cs->cum,
+                                      cs->lo, cs->hi, cs->dcum, K, fl->limbs,
                                       &gathered) != 0 ||
                 gathered != rtotal)
                 return 0;

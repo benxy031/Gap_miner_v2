@@ -1174,12 +1174,15 @@ struct gpu_fermat_ctx {
     uint32_t  jump_windows_cap;
     uint32_t  jump_gap_cap;
 
-    /* Jump2 chunk-parallel gather buffers (host-orchestrated jump) */
+    /* Jump2 chunk-parallel gather buffers (host-orchestrated jump).
+       The four per-window parameter vectors (lo, hi, src_cum, dst_cum) live
+       in ONE contiguous device block fed from ONE pinned host block, so a
+       chain round costs a single async upload on the context's own stream
+       instead of four pageable copies on the legacy default stream (which
+       implicitly serializes against every blocking stream in the process). */
     uint64_t *d_gather_buf;       /* contiguous round staging (AoS) */
-    uint32_t *d_gather_lo;
-    uint32_t *d_gather_hi;
-    uint32_t *d_gather_src_cum;
-    uint32_t *d_gather_dst_cum;
+    uint32_t *d_gather_params;    /* [lo | hi | src_cum | dst_cum], n each */
+    uint32_t *h_gather_params;    /* pinned staging, same layout */
     uint32_t  gather_windows_cap;
     uint32_t  gather_chunk_cap;
     int       gather_limbs;
@@ -1725,20 +1728,27 @@ const char *gpu_fermat_kernel_label(int limbs)
 /* ── Jump2 chunk-parallel gather (host-orchestrated backward search) ───────
    Copies per-window candidate slices [lo,hi) from the packed AoS buffer into
    a contiguous round staging buffer so each round's MR batch is one tight
-   submit.  One thread block per window, linear element-wise copy. */
+   submit.  One thread block per window, linear element-wise copy.
+
+   params packs the four per-window vectors: lo at [0], hi at [n_windows],
+   src_cum at [2*n_windows], dst_cum at [3*n_windows]. */
 __global__ static void gather_ranges_kernel_t(const uint64_t * __restrict__ src,
                                               uint64_t * __restrict__ dst,
-                                              const uint32_t * __restrict__ src_cum,
-                                              const uint32_t * __restrict__ lo,
-                                              const uint32_t * __restrict__ hi,
-                                              const uint32_t * __restrict__ dst_cum,
+                                              const uint32_t * __restrict__ params,
+                                              uint32_t n_windows,
                                               uint32_t active_limbs)
 {
     uint32_t w = blockIdx.x;
-    uint32_t n = hi[w] - lo[w];
+    if (w >= n_windows) return;
+    uint32_t lo = params[w];
+    uint32_t hi = params[n_windows + w];
+    uint32_t n = hi - lo;
     if (n == 0) return;
-    uint64_t sbase = (uint64_t)(src_cum[w] + lo[w]) * (uint64_t)active_limbs;
-    uint64_t dbase = (uint64_t)dst_cum[w] * (uint64_t)active_limbs;
+    uint64_t sbase =
+        (uint64_t)(params[2 * (size_t)n_windows + w] + lo) *
+        (uint64_t)active_limbs;
+    uint64_t dbase =
+        (uint64_t)params[3 * (size_t)n_windows + w] * (uint64_t)active_limbs;
     uint64_t total = (uint64_t)n * (uint64_t)active_limbs;
     for (uint64_t t = threadIdx.x; t < total; t += blockDim.x)
         dst[dbase + t] = src[sbase + t];
@@ -1759,15 +1769,11 @@ int gpu_fermat_gather_alloc(gpu_fermat_ctx *ctx, uint32_t n_windows,
         return -1;
 
     if (ctx->d_gather_buf)      cudaFree(ctx->d_gather_buf);
-    if (ctx->d_gather_lo)       cudaFree(ctx->d_gather_lo);
-    if (ctx->d_gather_hi)       cudaFree(ctx->d_gather_hi);
-    if (ctx->d_gather_src_cum)  cudaFree(ctx->d_gather_src_cum);
-    if (ctx->d_gather_dst_cum)  cudaFree(ctx->d_gather_dst_cum);
+    if (ctx->d_gather_params)   cudaFree(ctx->d_gather_params);
+    if (ctx->h_gather_params)   cudaFreeHost(ctx->h_gather_params);
     ctx->d_gather_buf = NULL;
-    ctx->d_gather_lo = NULL;
-    ctx->d_gather_hi = NULL;
-    ctx->d_gather_src_cum = NULL;
-    ctx->d_gather_dst_cum = NULL;
+    ctx->d_gather_params = NULL;
+    ctx->h_gather_params = NULL;
     ctx->gather_windows_cap = 0;
     ctx->gather_chunk_cap = 0;
     ctx->gather_limbs = 0;
@@ -1776,17 +1782,14 @@ int gpu_fermat_gather_alloc(gpu_fermat_ctx *ctx, uint32_t n_windows,
     if (cudaMalloc(&ctx->d_gather_buf,
                    cap * sizeof(uint64_t)) != cudaSuccess)
         return -1;
-    if (cudaMalloc(&ctx->d_gather_lo,
-                   (size_t)n_windows * sizeof(uint32_t)) != cudaSuccess)
+    /* One contiguous parameter block + its pinned twin.  Pinned staging is
+       what makes the per-round upload asynchronous: a pageable source would
+       force a synchronizing staging copy inside the driver. */
+    size_t pbytes = 4 * (size_t)n_windows * sizeof(uint32_t);
+    if (cudaMalloc(&ctx->d_gather_params, pbytes) != cudaSuccess)
         return -1;
-    if (cudaMalloc(&ctx->d_gather_hi,
-                   (size_t)n_windows * sizeof(uint32_t)) != cudaSuccess)
-        return -1;
-    if (cudaMalloc(&ctx->d_gather_src_cum,
-                   (size_t)n_windows * sizeof(uint32_t)) != cudaSuccess)
-        return -1;
-    if (cudaMalloc(&ctx->d_gather_dst_cum,
-                   (size_t)n_windows * sizeof(uint32_t)) != cudaSuccess)
+    if (cudaHostAlloc(&ctx->h_gather_params, pbytes,
+                      cudaHostAllocDefault) != cudaSuccess)
         return -1;
 
     ctx->gather_windows_cap = n_windows;
@@ -1797,8 +1800,19 @@ int gpu_fermat_gather_alloc(gpu_fermat_ctx *ctx, uint32_t n_windows,
 
 /* Gather one round's per-window slices into the contiguous staging buffer.
    h_dst_cum[i] is the host-computed destination prefix (sum of round sizes
-   for windows < i); the round total is returned in *total_out.  Synchronous. */
-int gpu_fermat_gather_run(gpu_fermat_ctx *ctx, const uint64_t *d_src,
+   for windows < i); the round total is returned in *total_out.
+
+   ASYNCHRONOUS on the caller's slot stream: the upload and the staging kernel
+   are enqueued on ctx->stream[slot], the same stream that the subsequent
+   gpu_fermat_submit_device() launches the MR kernel on, so plain stream order
+   is what makes d_gather_buf complete before it is read.  There is
+   deliberately NO cudaDeviceSynchronize() here (and nothing on the legacy
+   default stream): that barrier is device-wide, so with N workers it stalled
+   every other worker's in-flight mark/extract/MR kernels once per chain
+   round.  *total_out is derived from the host parameter vectors, so it is
+   valid without any device synchronization. */
+int gpu_fermat_gather_run(gpu_fermat_ctx *ctx, int slot,
+                          const uint64_t *d_src,
                           const uint32_t *h_src_cum,
                           const uint32_t *h_lo, const uint32_t *h_hi,
                           const uint32_t *h_dst_cum,
@@ -1808,32 +1822,37 @@ int gpu_fermat_gather_run(gpu_fermat_ctx *ctx, const uint64_t *d_src,
     if (!ctx || !d_src || !h_src_cum || !h_lo || !h_hi || !h_dst_cum ||
         !total_out || n_windows == 0)
         return -1;
-    if (!ctx->d_gather_buf || ctx->gather_windows_cap < n_windows)
+    if (slot < 0 || slot > 1)
+        return -1;
+    if (!ctx->d_gather_buf || !ctx->d_gather_params ||
+        !ctx->h_gather_params || ctx->gather_windows_cap < n_windows)
         return -1;
 
     cudaError_t err = ensure_device(ctx->device_id);
     if (err != cudaSuccess)
         return -1;
 
-    size_t bytes = (size_t)n_windows * sizeof(uint32_t);
-    err = cudaMemcpy(ctx->d_gather_lo, h_lo, bytes, cudaMemcpyHostToDevice);
-    if (err != cudaSuccess) return -1;
-    err = cudaMemcpy(ctx->d_gather_hi, h_hi, bytes, cudaMemcpyHostToDevice);
-    if (err != cudaSuccess) return -1;
-    err = cudaMemcpy(ctx->d_gather_src_cum, h_src_cum, bytes,
-                     cudaMemcpyHostToDevice);
-    if (err != cudaSuccess) return -1;
-    err = cudaMemcpy(ctx->d_gather_dst_cum, h_dst_cum, bytes,
-                     cudaMemcpyHostToDevice);
+    /* Pack the four vectors into the pinned block with plain host memcpys
+       (no CUDA call), then upload them with ONE async copy.  Reusing the
+       staging block is safe: the caller's previous round ended in
+       gpu_fermat_collect(), which synchronizes this stream, so no earlier
+       upload can still be pending. */
+    size_t vec = (size_t)n_windows * sizeof(uint32_t);
+    uint32_t *hp = ctx->h_gather_params;
+    memcpy(hp, h_lo, vec);
+    memcpy(hp + n_windows, h_hi, vec);
+    memcpy(hp + 2 * (size_t)n_windows, h_src_cum, vec);
+    memcpy(hp + 3 * (size_t)n_windows, h_dst_cum, vec);
+
+    err = cudaMemcpyAsync(ctx->d_gather_params, hp, 4 * vec,
+                          cudaMemcpyHostToDevice, ctx->stream[slot]);
     if (err != cudaSuccess) return -1;
 
-    gather_ranges_kernel_t<<<(unsigned)n_windows, 256>>>(
-        d_src, ctx->d_gather_buf, ctx->d_gather_src_cum,
-        ctx->d_gather_lo, ctx->d_gather_hi, ctx->d_gather_dst_cum,
-        (uint32_t)active_limbs);
+    gather_ranges_kernel_t<<<(unsigned)n_windows, 256, 0,
+                             ctx->stream[slot]>>>(
+        d_src, ctx->d_gather_buf, ctx->d_gather_params,
+        (uint32_t)n_windows, (uint32_t)active_limbs);
     err = cudaGetLastError();
-    if (err != cudaSuccess) return -1;
-    err = cudaDeviceSynchronize();
     if (err != cudaSuccess) return -1;
 
     *total_out = h_dst_cum[n_windows - 1] +
@@ -2046,9 +2065,7 @@ void gpu_fermat_destroy(gpu_fermat_ctx *ctx)
     if (ctx->d_jump_cums_in)    cudaFree(ctx->d_jump_cums_in);
     if (ctx->d_jump_thresh_in)  cudaFree(ctx->d_jump_thresh_in);
     if (ctx->d_gather_buf)      cudaFree(ctx->d_gather_buf);
-    if (ctx->d_gather_lo)       cudaFree(ctx->d_gather_lo);
-    if (ctx->d_gather_hi)       cudaFree(ctx->d_gather_hi);
-    if (ctx->d_gather_src_cum)  cudaFree(ctx->d_gather_src_cum);
-    if (ctx->d_gather_dst_cum)  cudaFree(ctx->d_gather_dst_cum);
+    if (ctx->d_gather_params)   cudaFree(ctx->d_gather_params);
+    if (ctx->h_gather_params)   cudaFreeHost(ctx->h_gather_params);
     free(ctx);
 }

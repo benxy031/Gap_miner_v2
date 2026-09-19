@@ -200,6 +200,53 @@ The plot path may point into a directory that does not exist yet — it is creat
 for you (a failed write is reported as one line, never a traceback after the
 report has already been printed).
 
+## Did the block reach the chain?
+
+A pool share is not a block. A block is the same solution *plus* the requirement
+that the template it was mined on is still current: its parent must still be the
+tip when the pool submits it. That is why the miner records the template identity
+of every submitted solution, at submit time, in the pool record log:
+
+```
+<ts> height=0 shift=509 header_nonce=516 nAdd=... gap=8452 merit=15.9410 \
+     status=submitted template_prevhash=babe18f8...8ff8 template_time=1789844329 \
+     template_ndiff=6731802059752503 template_merit=23.9162
+```
+
+* `template_prevhash` is the template's parent in **display order**, so it can be
+  compared byte for byte with `getblockhash` and with explorers;
+* `template_time` is the template's nTime (unix seconds);
+* `template_merit` is the template's own nDifficulty as a merit — a solution is a
+  block exactly when its merit is at or above this number.
+
+A verdict line cannot answer the block question: it says `accepted` for a share
+whose block may never exist. The template can only be captured at submit time,
+and this is what `scripts/pool_block_audit.py` uses. It needs a synced local node
+(read-only) and reports, per block-level find: **BUILT**, **LOST — stale
+template** (the chain had already moved past the template's parent, so no block
+could exist), or **LOST — fresh template** (a valid block existed and never
+reached the chain).
+
+```bash
+PATH=$HOME/Git/gapcoin-core/src:$PATH scripts/pool_block_audit.py
+PATH=$HOME/Git/gapcoin-core/src:$PATH scripts/pool_block_audit.py --selftest
+```
+
+First measured use (2026-09-19, 43 minutes, shift509 cover): seven finds above the
+network difficulty, all answered `accepted`; **four** became blocks that carry our
+solution bytes (2535146, 2535148, 2535150, 2535174) and **three did not**
+(17:54:52 merit 24.1652, 18:16:51 merit 24.8758, 18:23:39 merit 26.3074 — the two
+best finds of the session among them). Two of the three had more than a minute of
+clear lead and there is **no stale fork at any of their heights**, so a lost race
+does not explain them; the audit of those cases reports FRESH templates, i.e. a
+valid block existed and the pool did not land it. The record log's own accounting
+is clean (no block-level candidate was dropped locally as stale or duplicate).
+
+The full evidence package for the pool operator — every hash, timestamp, merit,
+`nAdd`, and the commands that reproduce all of it from the chain — is
+`docs/POOL_MISSING_BLOCKS_20260919.md`, with a short paste-ready summary in its
+section 0.
+
 ## Known limits
 
 * Port 2433 ("new stratum") is not implemented: it is suprnova's private

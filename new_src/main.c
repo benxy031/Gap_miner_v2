@@ -259,6 +259,41 @@ static int resolve_stratum_auth(const char *auth_file, const char *cli_user,
 }
 
 /* Hex (>=160 chars) -> 80 header bytes.  Returns 0 on malformed input. */
+/*
+ * Template identity of a pool solution (see record_log_write_submit_ctx).
+ *
+ * `hdr80` is the template the pool handed out.  Measured layout (2026-09-19,
+ * decoded against a live template and the chain):
+ *
+ *   0..3    version
+ *   4..35   prevhash  (internal little-endian order)
+ *   36..67  merkle root of the pool's template transactions
+ *   68..71  nTime     (unix seconds)
+ *   72..79  nDifficulty (8 bytes, merit = ndiff / 2^48)
+ *
+ * Note the order: nTime comes AFTER the merkle root, unlike a Bitcoin header.
+ * Reading it at offset 36 yields the first four bytes of the merkle root and a
+ * date a month off, which is exactly the mistake this comment exists to stop.
+ * Reversing the prevhash bytes gives the display order that `getblockhash` and
+ * explorers use, the only form that can be compared with the chain directly.
+ */
+static void template_prevhash_display(const uint8_t hdr80[80], char out[65])
+{
+    static const char hexd[] = "0123456789abcdef";
+    size_t p = 0;
+    for (int i = 35; i >= 4; i--) {
+        out[p++] = hexd[(hdr80[i] >> 4) & 0x0f];
+        out[p++] = hexd[hdr80[i] & 0x0f];
+    }
+    out[p] = '\0';
+}
+
+static uint32_t template_time_le(const uint8_t hdr80[80])
+{
+    return (uint32_t)hdr80[68] | ((uint32_t)hdr80[69] << 8) |
+           ((uint32_t)hdr80[70] << 16) | ((uint32_t)hdr80[71] << 24);
+}
+
 static int decode_hex80(const char *hex, uint8_t out[80])
 {
     if (!hex || strlen(hex) < 160)
@@ -1164,6 +1199,25 @@ int main(int argc, char *argv[]) {
                                              (uint16_t)entry.shift, nadd_ptr,
                                              nadd_sz, &meta)) {
                         g_pool_queued++;
+                        /* Which pool template this solution belongs to.  A
+                           block is valid only for its own template, so this is
+                           the field that tells a block the pool accepted but
+                           never put on chain apart from one it never submitted
+                           (see record_log.h).  The work generation cannot have
+                           changed since the find: a rotated header is "stale"
+                           above and is never submitted. */
+                        {
+                            char prevhash_hex[65];
+                            template_prevhash_display(active_work.header_prefix,
+                                                      prevhash_hex);
+                            record_log_write_submit_ctx(
+                                entry.height, entry.shift, entry.header_nonce,
+                                nadd_dec, entry.gap_length, entry.merit,
+                                prevhash_hex,
+                                template_time_le(active_work.header_prefix),
+                                stratum_net_ndiff_from_header(
+                                    active_work.header_prefix));
+                        }
                         printf("[Main] Share queued to pool: nAdd=%s gap=%u merit=%.2f "
                                "(share target %.4f, network %.4f)\n",
                                nadd_dec ? nadd_dec : "?", entry.gap_length,

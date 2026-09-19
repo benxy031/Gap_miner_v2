@@ -18,6 +18,33 @@
  * silently no-op rather than blocking mining). */
 int record_log_init(const char *path);
 
+/* Pool mode only: record WHICH pool template a submitted solution belongs to.
+ *
+ * A block is valid only for the template it was mined on -- its parent must
+ * still be the chain tip when the pool submits it -- so when a block-level
+ * solution is accepted by the pool (`result:true`) and yet never appears on the
+ * chain, there are exactly two explanations: the pool handed out a stale
+ * template, or the pool never submitted the block.  The template identity is
+ * what separates them, and it can only be captured AT SUBMIT TIME: the verdict
+ * arrives later and carries no template information at all.
+ *
+ * `template_prevhash_hex` is the header's 32-byte prevhash in DISPLAY order (the
+ * internal little-endian bytes reversed), so it compares byte for byte with
+ * `getblockhash` and with explorers.  `template_ndiff` is the header's 8-byte
+ * nDifficulty; the line also prints its merit (ndiff / 2^48) so it can be read
+ * next to the candidate's own merit.
+ *
+ * Writes, next to the usual candidate fields:
+ *   status=submitted template_prevhash=<64 hex> template_time=<unix>
+ *   template_ndiff=<n> template_merit=<m>
+ */
+void record_log_write_submit_ctx(uint32_t height, uint32_t shift,
+                                 uint32_t header_nonce, const char *nadd_dec,
+                                 uint32_t gap_length, double merit,
+                                 const char *template_prevhash_hex,
+                                 uint32_t template_time,
+                                 uint64_t template_ndiff);
+
 /* Append one line for a BPSW-verified candidate. `status` is a short word
  * such as "dry-run", "queued", "submission-queue-full", "accepted",
  * "rejected", "stale", or "assemble-failed" (the local block assembly

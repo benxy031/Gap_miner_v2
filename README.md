@@ -158,6 +158,17 @@ scripts/records_report.py --since 2026-09-19T12:00 --until 2026-09-19T18:00
 scripts/records_report.py --log old.log --share-target 15.772589 --top 10
 scripts/records_report.py --selftest   # verify the tool itself on a synthetic
                                      # log with a known distribution (sigma 1.2)
+
+# ── Did our block actually reach the chain? (pool mode) ─────────────
+# A block is valid only for the TEMPLATE it was mined on, so the miner logs the
+# template identity at submit time (`status=submitted template_prevhash=...
+# template_time=... template_merit=...`).  This audit reads that back and asks the
+# local node what happened: built, lost to a stale template, or lost with a fresh
+# template (i.e. the pool never landed a valid block).  Needs a synced node.
+PATH=$HOME/Git/gapcoin-core/src:$PATH scripts/pool_block_audit.py
+PATH=$HOME/Git/gapcoin-core/src:$PATH scripts/pool_block_audit.py --selftest
+                                     # replays the 2026-09-19 cases whose
+                                     # answers are known: 4 built, 3 lost
 ```
 
 ## GPU acceleration (CUDA)
@@ -589,6 +600,16 @@ Notes specific to pool work:
   and `height` is always 0 — so keeping one file per work source keeps each file's
   meaning intact. The startup line prints which file is in use:
   `[RecordLog] Logging BPSW candidates to gapminer_pool_records.log`.
+* **Every submitted share records which pool TEMPLATE it belonged to**
+  (`status=submitted template_prevhash=<64 hex, display order> template_time=<unix>
+  template_ndiff=<n> template_merit=<m>`). A block is valid only for its own
+  template — its parent must still be the tip when the pool submits it — so this
+  is the field that tells a block the pool accepted but never landed apart from
+  one it never submitted; `scripts/pool_block_audit.py` turns it into a verdict
+  against the chain. Added 2026-09-19, after a run in which **3 of 7 block-level
+  finds were accepted and never appeared on chain**, with no stale fork at their
+  heights (the audit of those cases says the templates were FRESH, i.e. a valid
+  block existed and the pool did not put it on chain).
 * `--gap-hunt` still takes precedence: it runs the standalone record walk and
   exits instead of joining a pool (it writes its own `--gap-hunt-out` file and
   never opens the record log).
@@ -836,7 +857,7 @@ data/prime_gap_merits.txt  Best-known-merit reference table (local only,
 scripts/          gen_crt_batch.sh, update_merits.sh, ab_shift_compare.sh,
                   watch_gap_hunt_records.py, gap_hunt_stats.py, analyze_n3.py,
                   tail_compare.py, tail_shape.py, record_rate_model.py,
-                  records_report.py
+                  records_report.py, pool_block_audit.py
 gen_crt.md        CRT covering-file generator guide
 docs/             Architecture references, GAP_HUNT plan, closed-fingerprints registry (dead routes and their reopen triggers)
 ```

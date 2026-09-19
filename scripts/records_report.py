@@ -37,6 +37,12 @@ What it reports (per file, then pooled):
     unresolved / stale ...), PER HOUR — for a pool this is the plot that shows
     a stale-work outage (a run that stops being accepted keeps finding
     candidates at the same rate, so only the verdict series reveals it);
+  * in pool mode, WHICH TEMPLATE each submitted solution belonged to
+    (`status=submitted template_prevhash=... template_time=...
+    template_merit=...`, added 2026-09-19).  A block is only valid for the
+    template it was mined on, so this is the field that tells a block the pool
+    accepted but never put on chain apart from one it never submitted —
+    `scripts/pool_block_audit.py` checks exactly that against the chain;
   * record proximity against `data/prime_gap_merits.txt` (same tables as
     `gap_hunt_stats.py`): the closest candidates to a first-known occurrence,
     any candidate that BEATS the table, and the exact
@@ -85,6 +91,11 @@ DISCOVERY_STATUSES = ("dry-run", "queued", "queue-full")
 # The work source (node or pool) then writes one of these for the same candidate.
 VERDICT_STATUSES = ("accepted", "rejected", "unresolved", "duplicate",
                     "send-failed", "assemble-failed", "stale")
+# Pool mode additionally records WHICH template a solution was submitted
+# against (prevhash/time/nDifficulty).  It is neither a discovery nor a verdict:
+# it is the context that makes a missing block explainable, so it is kept on the
+# candidate and never counted as an outcome of its own.
+SUBMIT_CTX_STATUS = "submitted"
 
 DEFAULT_NODE_LOG = "gapminer_records.log"
 DEFAULT_POOL_LOG = "gapminer_pool_records.log"
@@ -148,6 +159,14 @@ class Candidate:
     header_nonce: str | None
     nadd: str | None
     statuses: list[str] = field(default_factory=list)
+    # Pool mode only: the template the solution was submitted against.
+    template_prevhash: str | None = None   # display order, compares with getblockhash
+    template_time: int | None = None
+    template_merit: float | None = None
+
+    @property
+    def has_template(self) -> bool:
+        return bool(self.template_prevhash)
 
     @property
     def discovery_status(self) -> str:
@@ -256,9 +275,20 @@ def load_file(path: str, since=None, until=None):
 
 
 def build_candidates(entries):
-    """Collapse discovery + verdict lines into one Candidate per found gap."""
+    """Collapse discovery + verdict + submit-context lines into one Candidate."""
     by_key: dict[tuple, Candidate] = {}
     repeats = 0
+
+    def note_submit_ctx(cand, e):
+        """Attach the pool template fields carried by a `submitted` line."""
+        cand.template_prevhash = e.f("template_prevhash", cand.template_prevhash)
+        t = e.f("template_time")
+        if t is not None:
+            cand.template_time = _int(t)
+        m = e.fnum("template_merit")
+        if m is not None:
+            cand.template_merit = m
+
     for e in entries:
         if e.is_discovery:
             key = e.key
@@ -277,9 +307,11 @@ def build_candidates(entries):
                 repeats += 1
             cand.statuses.append(e.status)
         else:
-            # Verdict line: attach to its candidate; if the discovery line fell
-            # outside the --since/--until window or was never written, the
-            # verdict still counts (create the candidate from the verdict).
+            # Verdict or submit-context line: attach to its candidate; if the
+            # discovery line fell outside the --since/--until window or was
+            # never written, the line still counts (create the candidate from
+            # it).  A submit-context line is NOT a verdict: it is recorded on the
+            # candidate and never counted as an outcome.
             key = e.key
             cand = by_key.get(key)
             if cand is None:
@@ -289,7 +321,10 @@ def build_candidates(entries):
                     merit=e.fnum("merit"), start=None,
                     header_nonce=e.f("header_nonce"), nadd=e.f("nAdd"))
                 by_key[key] = cand
-            cand.statuses.append(e.status)
+            if e.status == SUBMIT_CTX_STATUS:
+                note_submit_ctx(cand, e)
+            else:
+                cand.statuses.append(e.status)
     return sorted(by_key.values(), key=lambda c: c.t), repeats
 
 
@@ -614,6 +649,26 @@ def report_group(title, cands, table, args, out=sys.stdout, comparable=True):
                       f"their rates are NOT comparable, and the single-sigma "
                       f"tail fit above is a mixture, not any one run",
                       file=out)
+
+    # ── template identity (pool mode, 2026-09-19 instrumentation) ───────────
+    with_tpl = [c for c in cands if c.has_template]
+    if with_tpl:
+        prevs = {}
+        for c in with_tpl:
+            prevs.setdefault(c.template_prevhash, []).append(c)
+        print(f"   templates      {len(prevs)} distinct template(s) over "
+              f"{len(with_tpl)} submitted candidate(s)", file=out)
+        for prev, group in sorted(prevs.items(), key=lambda kv: -len(kv[1]))[:5]:
+            tm = [c.template_merit for c in group if c.template_merit]
+            tt = [c.template_time for c in group if c.template_time]
+            desc = f"prevhash {prev[:16]}.. (parents {len(group)} candidate(s))"
+            if tm:
+                desc += f" net merit {min(tm):.3f}"
+            if tt:
+                from datetime import datetime, timezone
+                desc += (" time " + datetime.fromtimestamp(min(tt), timezone.utc)
+                         .strftime("%H:%M:%SZ"))
+            print(f"                    {desc}", file=out)
 
     # ── record proximity ─────────────────────────────────────────────────────
     if table:

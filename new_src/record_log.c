@@ -90,6 +90,38 @@ void record_log_write_big(uint32_t height, uint32_t shift, uint32_t header_nonce
     pthread_mutex_unlock(&g_record_log_lock);
 }
 
+/* See record_log.h for why the template identity is captured at submit time. */
+void record_log_write_submit_ctx(uint32_t height, uint32_t shift,
+                                 uint32_t header_nonce, const char *nadd_dec,
+                                 uint32_t gap_length, double merit,
+                                 const char *template_prevhash_hex,
+                                 uint32_t template_time,
+                                 uint64_t template_ndiff) {
+    pthread_mutex_lock(&g_record_log_lock);
+    if (!g_record_log) {
+        pthread_mutex_unlock(&g_record_log_lock);
+        return;
+    }
+
+    time_t now = time(NULL);
+    struct tm tm_utc;
+    gmtime_r(&now, &tm_utc);
+    char timestamp[32];
+    strftime(timestamp, sizeof(timestamp), "%Y-%m-%dT%H:%M:%SZ", &tm_utc);
+
+    fprintf(g_record_log,
+            "%s height=%u shift=%u header_nonce=%u nAdd=%s gap=%u merit=%.4f "
+            "status=submitted template_prevhash=%s template_time=%u "
+            "template_ndiff=%llu template_merit=%.4f\n",
+            timestamp, height, shift, header_nonce, nadd_dec ? nadd_dec : "?",
+            gap_length, merit,
+            template_prevhash_hex ? template_prevhash_hex : "?",
+            template_time, (unsigned long long)template_ndiff,
+            (double)template_ndiff / (double)(1ULL << 48));
+    fflush(g_record_log);
+    pthread_mutex_unlock(&g_record_log_lock);
+}
+
 void record_log_close(void) {
     pthread_mutex_lock(&g_record_log_lock);
     if (g_record_log) {

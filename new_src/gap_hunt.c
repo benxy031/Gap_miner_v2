@@ -1252,8 +1252,7 @@ int gap_hunt_run(const struct gap_hunt_config *cfg) {
             "jump2=%d "
             "jump2_chunk=%d "
             "kmax=%llu min_merit=%.6f "
-            "k0=%llu device=%d\n",
-            rt.shift, rt.n_primes,
+            "k0=%llu device=%d\n",            rt.shift, rt.n_primes,
             (double)mpz_sizeinbase(P, 2),
             (unsigned long long)rt.window, sieve_primes, g_batch,
             (unsigned long long)cap_real, (unsigned long long)cum_cap,

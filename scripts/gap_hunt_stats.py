@@ -27,16 +27,29 @@ are skipped) it reports:
   * the easiest recordable targets at this size.
 
 Usage:
-    scripts/gap_hunt_stats.py [records-file ...] [--table PATH]
+    scripts/gap_hunt_stats.py [records-file ...] [--table PATH] [--bin-half X]
 
 With no arguments it globs data/gap_hunt_records*.txt (excluding the
-watcher's *_found_* files).
+watcher's *_found_* files).  `--bin-half` exists only to reproduce pre-fix
+numbers deliberately; leave it alone for real estimates.
 """
 
 import sys
 import glob
 import math
 import os
+
+# Half-width, in GAP UNITS, of the merit bin a table entry occupies.  Gaps
+# between odd primes are EVEN, so a size g lives in the merit bin [g-1, g+1)
+# (width 2/L) and the next table entry g+2 starts exactly where it ends: the
+# entries tile the merit axis.  A half-width of 0.5 leaves half the axis
+# uncovered and makes p_record exactly 2x too small.  This is the same bug that
+# `record_rate_model.py` carried, found there by a Monte-Carlo on the real table
+# and documented in docs/RECORD_RATE_MODEL.md §10; it was still present here, so
+# the two tools disagreed by 2x.  Any lattice-bin kernel must be validated
+# against a Monte-Carlo on the real table before it is used to score anything.
+# `--bin-half 0.5` reproduces the pre-fix (pessimistic) numbers deliberately.
+BIN_HALF = 1.0
 
 
 def load_table(path):
@@ -116,8 +129,13 @@ def main():
     args = sys.argv[1:]
     table_path = "data/prime_gap_merits.txt"
     files = []
+    skip_next = False
     for a in args:
-        if a == "--table":
+        if skip_next:
+            skip_next = False
+            continue
+        if a in ("--table", "--bin-half"):
+            skip_next = True          # its value is not a file
             continue
         if a.startswith("--"):
             print(f"unknown: {a}", file=sys.stderr)
@@ -125,6 +143,12 @@ def main():
         files.append(a)
     if "--table" in args:
         table_path = args[args.index("--table") + 1]
+    if "--bin-half" in args:
+        global BIN_HALF
+        BIN_HALF = float(args[args.index("--bin-half") + 1])
+        print(f"NOTE: bin half-width overridden to {BIN_HALF:g} gap units "
+              f"(default 1.0; 0.5 reproduces the pre-2026-09-17 numbers, "
+              f"which are 2x pessimistic)", file=sys.stderr)
     if not files:
         files = sorted(
             f for f in glob.glob("data/gap_hunt_records*.txt")
@@ -190,13 +214,14 @@ def main():
         small = n < 30
         sig_fit = sig_me if sig_me > 0 else 1.29
         p_fit = math.exp(-(m_easy - m_min) / sig_fit) if m_easy else 0.0
-        unit = (1.0 - math.exp(-1.0 / (sig_fit * L))
+        unit = (1.0 - math.exp(-(2.0 * BIN_HALF) / (sig_fit * L))
                 if L > 0 and sig_fit > 0 else 0.0)
         p_sum_fit = (unit * sum(math.exp(-(m_t - m_min) / sig_fit)
                                 for m_t, _, _ in tgt_above)
                      if m_easy else 0.0)
         p_prior = math.exp(-(m_easy - m_min) / 1.29) if m_easy else 0.0
-        unit_p = 1.0 - math.exp(-1.0 / (1.29 * L)) if L > 0 else 0.0
+        unit_p = (1.0 - math.exp(-(2.0 * BIN_HALF) / (1.29 * L))
+                  if L > 0 else 0.0)
         p_sum_prior = (unit_p * sum(math.exp(-(m_t - m_min) / 1.29)
                                     for m_t, _, _ in tgt_above)
                        if m_easy else 0.0)

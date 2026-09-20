@@ -540,6 +540,33 @@ The `--mu-shift` grid and calibration solve added for the frontier audit are
 kept as diagnostics, but they are **no longer needed to explain the
 strong-cover surplus**: that surplus was this bug.
 
+### 10.1 The same bug was still live in `gap_hunt_stats.py` (2026-09-20)
+
+The sibling report used one gap unit as the bin width, so its quoted
+"expected reported gaps" was **2x pessimistic** and disagreed with this tool on
+the same files. Fixed to the 2/L bin here (with `--bin-half X` on both tools to
+reproduce pre-fix numbers deliberately). Post-fix agreement on the two local
+corpora, which is also the regression check:
+
+| file | `gap_hunt_stats.py` (fixed) | `record_rate_model.py --m0 8` |
+|---|---|---|
+| `gap_hunt_records_f1.txt` (shift507, L=528.2) | 1.086e7 | 1.075e7 |
+| `gap_hunt_records_f2.txt` (shift1017, L=881.7) | 1.382e6 | 1.361e6 |
+
+Anything that multiplies a lattice quantity into a bin must be Monte-Carlo
+checked against the real table — twice now this has been a factor-2 error in
+code, not in the physics.
+
+### 10.2 Record count is against a MOVING table (read §8.3 with this)
+
+§8.3's "13 observed records" was measured against the frontier table of
+2026-09-17. Against the table as of 2026-09-20 the same corpora contain **0
+records**: best margins are **-6.75** (f1) and **-3.97** (f2) — i.e. the closest
+approaches are still merit *below* what the table requires at their size. The
+table only improves over time, so any historical record count must be dated and
+re-derivable (`scripts/update_merits.sh`), and a "we were close" statement must
+name the table it was close to.
+
 ## 11. The fleet arithmetic closes
 
 Correcting the bin (x2) and using the independently measured tail shape per

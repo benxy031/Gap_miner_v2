@@ -1275,6 +1275,28 @@ int main(int argc, char *argv[]) {
                 }
 
                 g_submit_attempts++;
+                /* Which template this solution belongs to (see
+                   record_log_write_submit_ctx).  A block is valid only for its
+                   own template, so this separates "the node took it" from "we
+                   handed the node a block for a template it had already
+                   replaced" -- and a rejection is exactly when the template
+                   identity matters most, so the line is written for every
+                   ATTEMPTED submission, not only for accepted ones.  The
+                   header is the authority for the difficulty the candidate
+                   had to beat: gapcoin_work.c writes tmpl->difficulty into
+                   bytes 72..79 (raw nDifficulty), the same field the pool
+                   template carries, so both paths log the same quantity. */
+                {
+                    char prevhash_hex[65];
+                    template_prevhash_display(active_work.header_prefix,
+                                              prevhash_hex);
+                    record_log_write_submit_ctx(
+                        entry.height, entry.shift, entry.header_nonce,
+                        nadd_dec, entry.gap_length, entry.merit, prevhash_hex,
+                        template_time_le(active_work.header_prefix),
+                        stratum_net_ndiff_from_header(
+                            active_work.header_prefix));
+                }
                 /* Debug: print first 200 chars of block hex */
                 size_t hex_len = strlen(block_hex);
                 fprintf(stderr, "[Main] Submitting block (hex first 200 chars): %.200s...\n", block_hex);

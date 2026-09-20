@@ -600,16 +600,26 @@ Notes specific to pool work:
   and `height` is always 0 — so keeping one file per work source keeps each file's
   meaning intact. The startup line prints which file is in use:
   `[RecordLog] Logging BPSW candidates to gapminer_pool_records.log`.
-* **Every submitted share records which pool TEMPLATE it belonged to**
+* **Every submitted solution records which TEMPLATE it belonged to**
   (`status=submitted template_prevhash=<64 hex, display order> template_time=<unix>
   template_ndiff=<n> template_merit=<m>`). A block is valid only for its own
-  template — its parent must still be the tip when the pool submits it — so this
-  is the field that tells a block the pool accepted but never landed apart from
-  one it never submitted; `scripts/pool_block_audit.py` turns it into a verdict
-  against the chain. Added 2026-09-19, after a run in which **3 of 7 block-level
-  finds were accepted and never appeared on chain**, with no stale fork at their
-  heights (the audit of those cases says the templates were FRESH, i.e. a valid
-  block existed and the pool did not put it on chain).
+  template — its parent must still be the tip when the solution is submitted — so
+  this is the field that tells a block that was accepted but never landed apart
+  from one that was never submitted; `scripts/pool_block_audit.py` turns it into
+  a verdict against the chain. Added 2026-09-19, after a run in which **3 of 7
+  block-level finds were accepted and never appeared on chain**, with no stale
+  fork at their heights (the audit of those cases says the templates were FRESH,
+  i.e. a valid block existed and the pool did not put it on chain).
+  **Both work sources log it (2026-09-20):** the pool path at
+  `stratum_submit_share`, and the node path (`--enable-submission`) immediately
+  before `submitblock` — the node path writes it for every *attempted*
+  submission, accepted or rejected, because a rejection is exactly when the
+  template identity matters. `template_ndiff` is the header's raw nDifficulty
+  (bytes 72..79), which the node path fills from the GBT template's difficulty
+  (`gapcoin_work.c`) and the pool path from the pool's own header, so the same
+  quantity is logged on both. Reading old files: a node-mode log written before
+  2026-09-20 has no `template_*` fields even if its binary contains the code,
+  because the call lived inside the pool branch only.
 * `--gap-hunt` still takes precedence: it runs the standalone record walk and
   exits instead of joining a pool (it writes its own `--gap-hunt-out` file and
   never opens the record log).

@@ -18,21 +18,25 @@
  * silently no-op rather than blocking mining). */
 int record_log_init(const char *path);
 
-/* Pool mode only: record WHICH pool template a submitted solution belongs to.
+/* Record WHICH template a submitted solution belongs to.  Called from BOTH
+ * work sources: the pool path (`stratum_submit_share`) and the node path
+ * (`--enable-submission`, immediately before `submitblock`).
  *
  * A block is valid only for the template it was mined on -- its parent must
- * still be the chain tip when the pool submits it -- so when a block-level
- * solution is accepted by the pool (`result:true`) and yet never appears on the
- * chain, there are exactly two explanations: the pool handed out a stale
- * template, or the pool never submitted the block.  The template identity is
- * what separates them, and it can only be captured AT SUBMIT TIME: the verdict
+ * still be the chain tip when the solution is submitted -- so when a
+ * block-level solution is reported accepted and yet never appears on the chain,
+ * there are exactly two explanations: the work source handed out a stale
+ * template, or it never submitted the block.  The template identity is what
+ * separates them, and it can only be captured AT SUBMIT TIME: the verdict
  * arrives later and carries no template information at all.
  *
  * `template_prevhash_hex` is the header's 32-byte prevhash in DISPLAY order (the
  * internal little-endian bytes reversed), so it compares byte for byte with
  * `getblockhash` and with explorers.  `template_ndiff` is the header's 8-byte
- * nDifficulty; the line also prints its merit (ndiff / 2^48) so it can be read
- * next to the candidate's own merit.
+ * nDifficulty (bytes 72..79): the node path fills it from the GBT template's
+ * difficulty (`gapcoin_work.c`), the pool path from the pool's own header, so
+ * both paths log the same quantity.  The line also prints its merit
+ * (ndiff / 2^48) so it can be read next to the candidate's own merit.
  *
  * Writes, next to the usual candidate fields:
  *   status=submitted template_prevhash=<64 hex> template_time=<unix>

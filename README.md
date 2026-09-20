@@ -156,6 +156,21 @@ scripts/tail_compare.py --plot /tmp/tc   # + tc_cdf.png, tc_sigma.png, tc_panels
                                      # denominator (only finds are written, so
                                      # a finds-per-hour panel is impossible;
                                      # the merit sequence replaces it).
+                                     # tc_frontier.png puts the record table in
+                                     # the style of the forum FO plots: it maps
+                                     # every table row as a first occurrence
+                                     # (L = gap/merit_required) against our
+                                     # corpora (vertical bands - each corpus has
+                                     # ONE L - spanning the gap range it
+                                     # observed) and the certified m40 cover
+                                     # targets (stars, with the margin to the
+                                     # table), with a full-range inset and a
+                                     # provenance footer.  It also prints, per
+                                     # corpus, the easiest reachable gap and the
+                                     # strict "any margin" boundary: below that
+                                     # gap the table's merit exceeds what that L
+                                     # can produce at all, so no find of that
+                                     # length can ever be a record there.
 scripts/tail_shape.py --selftest    # verify the exp/stretched/GPD estimators first
 scripts/tail_shape.py gap_hunt_records_f1.txt --u-fit 16 --u-test 18,20,22
                                      # is the tail exponential at depth? (S9)

@@ -154,6 +154,37 @@ def local_sigma_bands(sorted_merits, edges):
     return rows
 
 
+def load_cover_targets(dirpath="data/crt/m23", pattern="*covermax_m40*.txt"):
+    """Certified cover design points as (L, gap_target, label).
+
+    A cover file states its own geometry: `shift S` (so L = (256+S)*ln 2) and
+    `gap_target G` (the gap length the covering was built for, whose merit at
+    that L is the design merit G/L).  Used to mark the aiming points on the
+    frontier figure; no matching files simply yields no points.
+    """
+    import glob
+    out = []
+    for path in sorted(glob.glob(os.path.join(dirpath, pattern))):
+        L = g = None
+        try:
+            with open(path, errors="ignore") as fh:
+                for line in fh:
+                    parts = line.split()
+                    if len(parts) != 2:
+                        continue
+                    if parts[0] == "shift":
+                        L = (256.0 + int(parts[1])) * math.log(2.0)
+                    elif parts[0] == "gap_target":
+                        g = int(parts[1])
+                    if L and g:
+                        break
+        except (OSError, ValueError):
+            continue
+        if L and g:
+            out.append((L, g, os.path.basename(path)))
+    return out
+
+
 # Record-merit grid for the sigma table: 16, 18, 19, 20, ..., 35.
 SWEEP = [16.0] + [float(t) for t in range(18, 36)]
 MIN_N = 5    # fewer records per file than this -> no meaningful exp-fit
@@ -576,6 +607,141 @@ def main():
         fig3.tight_layout(rect=(0, 0, 1, 0.97))
         fig3.savefig(f"{plot}_panels.png", dpi=120)
         print(f"wrote {plot}_panels.png")
+
+        # ── frontier figure, in the style of the forum FO plots
+        # ("FO Image Aug2026.png" / "TotalFO Aug2026.png" in the repo root):
+        # bold title + subtitle stating the axes and conventions, the frontier
+        # as data (not only as a model line), the observed range distinguished
+        # from the extrapolation, an inset zoom, annotated key points and a
+        # provenance footer.
+        #
+        # WHY this is the same object as those plots: the record table IS a
+        # first-occurrence frontier.  Each row is `<gap> <merit> <who>`, and
+        # merit = gap/ln(x) => ln(x) = gap/merit, so a row fixes the prime
+        # scale L = ln x at which that gap length was FIRST reached.  Our
+        # corpora sit at a single L each (L = gap/merit per line, constant by
+        # construction), so they appear as vertical bands, and the distance
+        # from a band to the grey frontier at the same gap is exactly the
+        # merit we still have to find for a record.
+        if table:
+            import hashlib
+            tpath = resolve("prime_gap_merits.txt")
+            try:
+                with open(tpath, "rb") as fh:
+                    tsha = hashlib.sha256(fh.read()).hexdigest()[:12]
+            except OSError:
+                tsha = "unavailable"
+            tg = sorted(g for g in table if 1 <= g <= 60000)
+            tl = [g / table[g] for g in tg]
+            fig4, axf = plt.subplots(figsize=(13, 7))
+            axf.scatter(tl, tg, s=3, c="0.6",
+                        label=f"record table frontier ({len(tg):,} gaps)")
+            L_ours = []
+            for name, gs, ms, sg, col in series:
+                Ls = sorted(g / m for g, m in zip(gs, ms) if m > 0)
+                if not Ls:
+                    continue
+                Lbar = sum(Ls) / len(Ls)
+                L_ours.append(Lbar)
+                axf.plot([Lbar, Lbar], [min(gs), max(gs)], lw=2.2, color=col,
+                         label=f"{name}: L={Lbar:.1f}, gaps "
+                               f"{min(gs)}..{max(gs)}")
+                gb = max(gs)
+                axf.scatter([Lbar], [gb], s=70, marker="o", color=col,
+                            edgecolor="k", zorder=5)
+                need = table.get(gb)
+                if need is None:      # odd length -> the even lattice
+                    need = table.get(gb - 1) if gb % 2 else table.get(gb + 1)
+                # The actionable number: the smallest gap length at which a
+                # merit we can plausibly reach at THIS L beats the table.  In
+                # the figure that is "our band sits LEFT of the frontier at
+                # that gap", and it is the size-exact landing condition.
+                reach = [g for g in sorted(table)
+                         if 1000 <= g <= 60000 and g / Lbar > table[g] + 1.0]
+                if need is not None:
+                    axf.annotate(f"max gap {gb} (merit {gb/Lbar:.2f}; table "
+                                 f"needs {need:.2f})",
+                                 xy=(Lbar, gb), xytext=(16, -24),
+                                 textcoords="offset points", fontsize=8,
+                                 color=col)
+                if reach:
+                    # `reach` demands a +1.0 merit margin; the margin-free
+                    # boundary is the STRICT structural limit: below it the
+                    # table's merit exceeds what this L can produce at all, so
+                    # no find of that length can ever be a record here.
+                    strict = [g for g in sorted(table)
+                              if 1000 <= g <= 60000 and g / Lbar > table[g]]
+                    print(f"{name}: easiest reachable gap at L={Lbar:.1f} = "
+                          f"{reach[0]} (table needs {table[reach[0]]:.3f}, "
+                          f"our L gives {reach[0]/Lbar:.3f} merit); strict "
+                          f"boundary (any margin) = "
+                          f"{strict[0] if strict else 'none'}")
+            cover_first = True
+            for Lc, gc, labname in load_cover_targets():
+                axf.scatter([Lc], [gc], s=170, marker="*", color="crimson",
+                            edgecolor="k", zorder=6,
+                            label="cover target (certified)" if cover_first
+                            else None)
+                cover_first = False
+                need = table.get(gc)
+                if need is None:   # odd target: the even lattice cannot gap
+                    need = table.get(gc - 1) if gc % 2 else table.get(gc + 1)
+                dsn = gc / Lc
+                txt = (f"{labname}: gap {gc}, design merit {dsn:.2f}"
+                       + (f"\ntable needs {need:.2f} -> {dsn - need:+.2f}"
+                          + (" (credited even length)" if gc % 2 else "")
+                          if need else "\n(gap length not in table)"))
+                # Keep the top-of-plot target (the 34,769 cover) from running
+                # into the title: aim its label down-left, the rest up-right.
+                if gc > 30000:
+                    axf.annotate(txt, xy=(Lc, gc), xytext=(-12, -40),
+                                 textcoords="offset points", fontsize=8,
+                                 color="crimson", ha="right")
+                else:
+                    axf.annotate(txt, xy=(Lc, gc), xytext=(8, 26),
+                                 textcoords="offset points", fontsize=8,
+                                 color="crimson")
+            axf.set_yscale("log")
+            axf.set_xlabel("prime scale L = ln(x)   [record rows: L = gap/merit]")
+            axf.set_ylabel("gap length")
+            axf.set_title("Record-table frontier vs our corpora\n"
+                          "grey = the world frontier (first occurrence per gap "
+                          "length, as L = gap/merit);\n"
+                          "coloured bars = our walkers (one L each, span = "
+                          "gap range observed); stars = certified cover targets",
+                          fontsize=11)
+            axf.legend(fontsize=8, loc="upper left")
+            axf.grid(alpha=0.3, which="both")
+            # Forum convention ("Observed gap range" inset): the zoomed main
+            # axes carry our range and the frontier crossing, the inset keeps
+            # the global picture (the frontier starts at L~0 for gap 1 and
+            # runs past L=3000 for the longest recorded gaps).
+            axf.set_ylim(1500.0, 45000.0)
+            axi = axf.inset_axes([0.615, 0.50, 0.36, 0.44])
+            axi.scatter(tl, tg, s=1.5, c="0.6")
+            for name, gs, ms, sg, col in series:
+                Ls = sorted(g / m for g, m in zip(gs, ms) if m > 0)
+                if Ls:
+                    axi.plot([sum(Ls) / len(Ls)] * 2, [min(gs), max(gs)],
+                             lw=1.5, color=col)
+            axi.set_yscale("log")
+            axi.set_title("full table range", fontsize=8)
+            axi.tick_params(labelsize=7)
+            axi.grid(alpha=0.25, which="both")
+            fig4.text(0.01, 0.015,
+                      f"Source: {tpath} sha256[:12]={tsha}; "
+                      f"{os.path.basename(fa)} (n={len(ma)}), "
+                      f"{os.path.basename(fb)} (n={len(mb)}). "
+                      "L per corpus is constant by construction (merit = "
+                      "gap/L), so a corpus is a vertical band, not a curve.",
+                      fontsize=8, color="0.35")
+            fig4.tight_layout(rect=(0, 0.03, 1, 0.93))
+            fig4.savefig(f"{plot}_frontier.png", dpi=130)
+            print(f"wrote {plot}_frontier.png")
+            if L_ours:
+                print(f"our prime scales: L = "
+                      f"{', '.join(f'{v:.1f}' for v in L_ours)} "
+                      f"(table frontier reaches L = {max(tl):.1f})")
     return 0
 
 

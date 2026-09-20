@@ -829,7 +829,11 @@ def main():
     ap.add_argument("files", nargs="*")
     ap.add_argument("--table", default=DEFAULT_TABLE)
     ap.add_argument("--m0", type=float, default=8.0,
-                    help="report threshold used when the data was collected")
+                    help="report threshold used when the data was collected"
+                         " (AUTO-CLAMPED up to the smallest merit in the data:"
+                         " a walker only reports gaps above its own"
+                         " --gap-hunt-min-merit, and fitting below it measures"
+                         " (threshold-M0)+sigma instead of sigma)")
     ap.add_argument("--holdout", type=float, default=0.5,
                     help="fraction reserved for prediction (0 disables)")
     ap.add_argument("--gph", action="append", default=None,
@@ -906,11 +910,33 @@ def main():
             return
 
     results = []
+    loaded = []
     for path in args.files:
         if not os.path.exists(path):
             print(f"missing: {path}", file=sys.stderr)
             continue
         rows = load_gaps(path)
+        if rows:
+            loaded.append((path, rows))
+
+    # A walker only reports gaps with merit >= its own --gap-hunt-min-merit, so
+    # the smallest merit in a file IS its report threshold.  Fitting below it
+    # measures (threshold - M0) + sigma: a diluted OFFSET that inflates sigma
+    # and E[records] and can make a healthy corpus look broken.  Seen live
+    # 2026-09-20 on the fleet's threshold-20 corpora: the old default M0=8 read
+    # sigma=13.3 and E[records]=66.9 with "P(observe 0)=0.000", while the SAME
+    # data fitted from its own threshold gives sigma=1.28 and E=0.97 (0 records
+    # observed, P=0.38).  Clamp to the highest per-file threshold - the same
+    # rule tail_compare.py applies - and say so.
+    data_thr = max(min(r[1] for r in rows) for _, rows in loaded) if loaded \
+        else 0.0
+    if loaded and args.m0 < data_thr - 1e-9:
+        print(f"NOTE: --m0 {args.m0:g} lies BELOW the data's own report"
+              f" threshold {data_thr:.4f}; using M0={data_thr:.4f} instead"
+              f" (a fit below it measures (threshold-M0)+sigma, not sigma)")
+        args.m0 = data_thr
+
+    for path, rows in loaded:
         res = analyse(path, rows, table, args.m0, args)
         res["m0_used"] = args.m0
         report(res)

@@ -7,7 +7,11 @@ vs lex).  If their tail sigmas differ significantly, the cover shapes the
 tail (a new hunt-quality lever); if they agree, the tail is size-driven.
 
 Usage:
-    tail_compare.py [FILE_A FILE_B] [M0] [--plot PREFIX]
+    tail_compare.py [FILE_A FILE_B] [M0] [--plot [PREFIX]]
+
+  --plot's PREFIX is optional (default `tail_compare`); the token after
+  `--plot` is used as the prefix ONLY when it resolves to no existing file, so
+  `--plot f1.txt f2.txt` cannot silently eat f1.txt as the output prefix.
 
   FILE_A/B   gap-hunt results files (`<gap> <merit> <startprime>` lines).
              Default: gap_hunt_records_f1.txt (763-bit) vs
@@ -54,6 +58,16 @@ def resolve(path):
         return path
     alt = os.path.join("data", os.path.basename(path))
     return alt if os.path.exists(alt) else path
+
+
+def exists_as_data(path):
+    """True when `path` resolves to a real file (directly or under data/).
+
+    The same two layouts `resolve()` accepts: the dev box keeps the corpora in
+    the repo root, the fleet keeps them in data/.  Used only to decide whether
+    the token after `--plot` is a prefix or a positional file.
+    """
+    return os.path.exists(resolve(path))
 
 
 def load(path):
@@ -196,8 +210,15 @@ def main():
     plot = None
     if "--plot" in args:
         i = args.index("--plot")
-        plot = args[i + 1] if i + 1 < len(args) else "tail_compare"
-        del args[i:i + 2]
+        plot = "tail_compare"
+        # Only treat the next token as a PREFIX when it cannot be a file:
+        # `--plot f1.txt f2.txt` must not eat f1.txt as the output prefix.
+        if i + 1 < len(args) and not args[i + 1].startswith("-") \
+                and not exists_as_data(args[i + 1]):
+            plot = args[i + 1]
+            del args[i:i + 2]
+        else:
+            del args[i]
     pos = [a for a in args if not a.startswith("--")]
     if len(pos) == 0:
         pos = ["gap_hunt_records_f1.txt", "gap_hunt_records_f2.txt"]
@@ -205,6 +226,13 @@ def main():
         pos.append("gap_hunt_records_f2.txt")
     fa, fb = resolve(pos[0]), resolve(pos[1])
     m0_req = float(pos[2]) if len(pos) > 2 else 10.0
+
+    for p in (fa, fb):
+        if not os.path.exists(p):
+            print(f"file not found: {p}", file=sys.stderr)
+            print("usage: tail_compare.py [FILE_A FILE_B] [M0] [--plot [PREFIX]]",
+                  file=sys.stderr)
+            return 2
 
     ma = load(fa)
     mb = load(fb)
@@ -247,12 +275,19 @@ def main():
     for t in SWEEP:
         a1, e1, n1 = fit(ma, t)
         a2, e2, n2 = fit(mb, t)
-        ok = n1 >= MIN_N and n2 >= MIN_N
+        ok = n1 >= MIN_N and n2 >= MIN_N and t >= thr_eff - 1e-9
         z = (a2 - a1) / math.sqrt(e1**2 + e2**2) if ok else None
         if ok:
             sweep_rows.append((t, a1, e1, a2, e2, z, n1, n2))
             print(f"{t:5.1f} {a1:8.4f} {e1:8.4f} {a2:8.4f} {e2:8.4f} "
                   f"{z:7.1f}   (nA={n1}, nB={n2})")
+        elif t < thr_eff - 1e-9 and n1 >= MIN_N and n2 >= MIN_N:
+            # Below the files' own report threshold every row is
+            # (threshold - t) + sigma, i.e. an OFFSET, not a sigma: it is also
+            # excluded from the sigma figure so a 5.2 cannot be read as one.
+            print(f"{t:5.1f} {a1:8.4f} {e1:8.4f} {a2:8.4f} {e2:8.4f} "
+                  f"{'--':>7}   (nA={n1}, nB={n2}) below report "
+                  f"threshold {thr_eff:.3f}: OFFSET artifact, not a sigma")
         else:
             print(f"{t:5.1f} {'--':>8} {'--':>8} {'--':>8} {'--':>8} "
                   f"{'--':>7}   (nA={n1}, nB={n2} <{MIN_N}: fit skipped)")
@@ -742,6 +777,42 @@ def main():
                 print(f"our prime scales: L = "
                       f"{', '.join(f'{v:.1f}' for v in L_ours)} "
                       f"(table frontier reaches L = {max(tl):.1f})")
+            # Did a corpus actually BEAT the table?  The panels mark stars,
+            # but the text has to say it: a hit here is the whole point of the
+            # run, and it is also what decides whether to walk longer.
+            for name, gs, ms, sg, col in series:
+                hits, nearest = [], None
+                for g, m in zip(gs, ms):
+                    shown = g
+                    need = table.get(g)
+                    if need is None:            # odd length -> even lattice
+                        shown = g - 1 if g % 2 else g + 1
+                        need = table.get(shown)
+                    if need is None:
+                        hits.append((float("inf"), g, m, None))
+                    elif m > need:
+                        hits.append((m - need, g, m, need))
+                cand = [(table[gg] - mm, gg, mm) for gg, mm in zip(gs, ms)
+                        if gg in table]
+                if cand:
+                    nearest = min(cand)
+                if hits:
+                    hits.sort(key=lambda h: -h[0])
+                    for d, g, m, need in hits[:3]:
+                        if need is None:
+                            print(f"{name}: *** gap {g} merit {m:.4f} - length "
+                                  f"ABSENT from the table (new length?)")
+                        else:
+                            print(f"{name}: *** ABOVE TABLE: gap {g} merit "
+                                  f"{m:.4f} vs needed {need:.4f} "
+                                  f"(margin {d:+.4f}) - verify before "
+                                  f"claiming")
+                    if len(hits) > 1:
+                        print(f"{name}:     ({len(hits)} hit(s) total)")
+                elif nearest is not None:
+                    print(f"{name}: no records; closest = gap {nearest[1]} "
+                          f"(merit {nearest[2]:.4f} vs needed "
+                          f"{table[nearest[1]]:.4f}, margin {nearest[0]:+.4f})")
     return 0
 
 

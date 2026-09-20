@@ -134,6 +134,28 @@ scripts/tail_compare.py data/gap_hunt_records_f1.txt data/gap_hunt_records_f2.tx
                                      # cover A/B tail comparison; the verdict M0
                                      # auto-clamps to the data's own report
                                      # threshold (docs/RECORD_RATE_MODEL.md §8)
+scripts/tail_compare.py --plot /tmp/tc   # + tc_cdf.png, tc_sigma.png, tc_panels.png
+                                     # tc_panels.png is the same 8-panel
+                                     # diagnostic set records_report.py draws
+                                     # for miner logs, adapted to hunt corpora:
+                                     # cumulative finds, merit vs order with a
+                                     # running min/mean (a STEP in the minimum =
+                                     # a mid-file --gap-hunt-min-merit change),
+                                     # histogram vs fit, tail vs fit ("falling
+                                     # faster than its dash line = fewer deep
+                                     # finds than the fit predicts"), sigma PER
+                                     # MERIT BAND with errors, gap vs the record
+                                     # table + closest approach, threshold-
+                                     # normalised tail superposition, and the
+                                     # CCDF ratio B/A with Poisson errors.  The
+                                     # text output also prints the band-sigma
+                                     # table.  Hunt caveats, printed on the
+                                     # figure: these logs carry NO timestamp
+                                     # (order axis = candidate index, drawn as
+                                     # a fraction of the file) and NO
+                                     # denominator (only finds are written, so
+                                     # a finds-per-hour panel is impossible;
+                                     # the merit sequence replaces it).
 scripts/tail_shape.py --selftest    # verify the exp/stretched/GPD estimators first
 scripts/tail_shape.py gap_hunt_records_f1.txt --u-fit 16 --u-test 18,20,22
                                      # is the tail exponential at depth? (S9)

@@ -24,15 +24,28 @@ Usage:
   The sigma table sweeps the fixed record-merit grid 16, 18, 19, 20, ..., 35;
   thresholds with fewer than MIN_N records in either file are printed as
   skipped (no fit).
-  --plot     also write PREFIX_cdf.png (empirical + exp-fit survival at M0)
-             and PREFIX_sigma.png (tail sigma vs threshold over the sweep);
-             requires numpy/matplotlib, skipped gracefully if unavailable
+  --plot     also write three figures (numpy/matplotlib required, skipped
+             gracefully if unavailable):
+               PREFIX_cdf.png    empirical vs exp-fit survival at M0
+               PREFIX_sigma.png  tail sigma vs threshold over the sweep
+               PREFIX_panels.png the 8-panel diagnostic set that
+                                 records_report.py draws for miner logs,
+                                 adapted to hunt logs
+             Hunt-specific caveats, printed on the figure: these logs carry NO
+             timestamp (so order-based panels use the candidate INDEX, drawn as
+             a fraction of the file) and NO denominator (only the finds are
+             written, so a finds-per-hour panel is impossible -- the merit
+             sequence replaces it, and a STEP in its running minimum is what a
+             mid-file --gap-hunt-min-merit change looks like).
+             A depth-resolved local-sigma table (per merit band, with Poisson
+             errors) is printed whether or not --plot is given.
 
 Runs without numpy/matplotlib for the text part (fleet boxes).
 """
 import sys
 import math
 import os
+import bisect
 
 
 def resolve(path):
@@ -65,6 +78,80 @@ def fit(merits, m0):
         return 0.0, 0.0, 0
     s = sum(excess) / len(excess)
     return s, s / math.sqrt(len(excess)), len(excess)
+
+
+def load_full(path):
+    """Like load(), but also keeps the gap and the DISCOVERY ORDER.
+
+    Hunt logs are `<gap> <merit> <startprime>` with NO timestamp, so file
+    order (the order the walker emitted the records) is the only time-like
+    axis a hunt log has.  Callers subsample for scatter panels rather than
+    shrinking this list: 755k-line corpora are normal.
+    """
+    gaps, merits = [], []
+    with open(path, errors="ignore") as f:
+        for line in f:
+            if line.startswith("#"):
+                continue
+            parts = line.split(None, 2)
+            if len(parts) < 2:
+                continue
+            try:
+                g = int(parts[0])
+                m = float(parts[1])
+            except ValueError:
+                continue
+            gaps.append(g)
+            merits.append(m)
+    return gaps, merits
+
+
+def load_table(path):
+    """Record table (`<gap> <merit> <name>`) -> {gap: merit}, or None."""
+    table = {}
+    try:
+        fh = open(path, "r")
+    except OSError:
+        return None
+    with fh:
+        for line in fh:
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            parts = line.split()
+            if len(parts) < 2:
+                continue
+            try:
+                table[int(parts[0])] = float(parts[1])
+            except ValueError:
+                continue
+    return table or None
+
+
+def local_sigma_bands(sorted_merits, edges):
+    """Depth-resolved local sigma from the CCDF ratio of the band edges.
+
+    P(merit >= m) ~ exp(-m/sigma) => sigma = (m2-m1) / ln(N1/N2) with
+    N = count(merit >= edge); Poisson errors give
+    err = sigma * sqrt(1/N1 + 1/N2) / ln(N1/N2).  This is the measurement
+    that exposes the DEPTH DEPENDENCE a single fit hides: on shift 507 the
+    local sigma falls 1.29 (merit 10-12) -> 1.03 (18-20) -> 0.75 (20-21),
+    which is why a threshold sigma must never be extrapolated to depth.
+    `sorted_merits` must be sorted ascending (bisect assumes it).
+    """
+    rows = []
+    n = len(sorted_merits)
+    for m1, m2 in zip(edges, edges[1:]):
+        n1 = n - bisect.bisect_left(sorted_merits, m1)
+        n2 = n - bisect.bisect_left(sorted_merits, m2)
+        if n1 < 2 or n2 < 1 or n1 == n2:
+            rows.append((m1, m2, n1, n2, None, None))
+            continue
+        d = math.log(n1 / n2)
+        s = (m2 - m1) / d
+        rows.append((m1, m2, n1, n2, s,
+                     s * math.sqrt(1.0 / n1 + 1.0 / n2) / d))
+    return rows
 
 
 # Record-merit grid for the sigma table: 16, 18, 19, 20, ..., 35.
@@ -168,6 +255,23 @@ def main():
                   " threshold and at the record depth — the threshold sigma is"
                   " NOT the record-rate sigma")
 
+    # Depth-resolved local sigma over a fixed merit grid.  The sweep above fits
+    # ONE exponent per threshold; this shows whether that exponent is stable
+    # with depth, and it is not (see local_sigma_bands' docstring).
+    sort_a, sort_b = sorted(ma), sorted(mb)
+    edges = [float(e) for e in range(
+        int(math.floor(min(min(ma), min(mb)))),
+        int(math.ceil(max(max(ma), max(mb)))) + 1)]
+    rows_a = local_sigma_bands(sort_a, edges)
+    rows_b = local_sigma_bands(sort_b, edges)
+    print("\nlocal sigma per merit band (from the CCDF ratio of its two edges):")
+    print(f"{'band':>11} {'nA>=':>9} {'sigA':>7} {'+/-':>7} "
+          f"{'nB>=':>9} {'sigB':>7} {'+/-':>7}")
+    for ra, rb in zip(rows_a, rows_b):
+        f_s = lambda v: f"{v:.3f}" if v is not None else "--"
+        print(f"{ra[0]:5.0f}-{ra[1]:<5.0f} {ra[2]:9d} {f_s(ra[4]):>7} "
+              f"{f_s(ra[5]):>7} {rb[2]:9d} {f_s(rb[4]):>7} {f_s(rb[5]):>7}")
+
     if plot:
         try:
             import numpy as np
@@ -177,13 +281,31 @@ def main():
         except ImportError:
             print("(numpy/matplotlib unavailable — skipping plot)")
             return 0
+
+        # CCDF through a sorted array + binary search: the SAME numbers as the
+        # previous `sum(1 for x in m if x >= v) / len(m)` loop, but one
+        # O(n log n) sort instead of O(len(xs) * n) per figure — on a 755k-line
+        # corpus that loop alone cost tens of seconds per panel.
+        def ccdf(sorted_arr, xs):
+            return 1.0 - np.searchsorted(sorted_arr, xs, side="left") / len(sorted_arr)
+
+        def subsample(seq, cap=20000):
+            """Stride a long series down to <= cap points for scatter panels."""
+            n = len(seq)
+            if n <= cap:
+                return np.asarray(seq), 1
+            k = int(math.ceil(n / float(cap)))
+            return np.asarray(seq[::k]), k
+
+        srt_a = np.sort(np.asarray(ma, dtype=float))
+        srt_b = np.sort(np.asarray(mb, dtype=float))
+
         fig, ax = plt.subplots(figsize=(10, 5.5))
-        for m, lab, c, s in ((ma, "A " + fa, "tab:blue", sa),
-                             (mb, "B " + fb, "tab:orange", sb)):
+        for m, srt, lab, c, s in ((ma, srt_a, "A " + fa, "tab:blue", sa),
+                                  (mb, srt_b, "B " + fb, "tab:orange", sb)):
             xs = np.arange(m0, max(m) + 0.5, 0.25)
-            surv = [float(sum(1 for x in m if x >= v) / len(m)) for v in xs]
-            ax.plot(xs, surv, color=c, label=f"{lab} (empirical)")
-            ax.plot(xs, [math.exp(-(v - m0) / s) for v in xs], "--",
+            ax.plot(xs, ccdf(srt, xs), color=c, label=f"{lab} (empirical)")
+            ax.plot(xs, np.exp(-(xs - m0) / s), "--",
                     color=c, label=f"fit exp(-(m-{m0:.0f})/{s:.3f})")
         ax.set_yscale("log")
         ax.set_xlabel("merit threshold m")
@@ -214,6 +336,246 @@ def main():
             fig2.tight_layout()
             fig2.savefig(f"{plot}_sigma.png", dpi=130)
             print(f"wrote {plot}_sigma.png")
+
+        # ── diagnostic panel set: the same panels the miner log gets in
+        # scripts/records_report.py, adapted to hunt corpora.  Two structural
+        # differences drive the adaptation:
+        #   * a hunt log carries NO timestamp (`<gap> <merit> <start>`), so
+        #     every order-based panel uses the CANDIDATE INDEX (file order =
+        #     discovery order), and a flat run = the walk was stopped;
+        #   * a hunt log carries no DENOMINATOR (only the finds are written),
+        #     so a "finds per hour" panel is impossible — the merit sequence
+        #     replaces it, whose running MINIMUM exposes a mid-file threshold
+        #     change (a step) exactly the way the rate panel does for miners.
+        gaps_a, ord_a = load_full(fa)
+        gaps_b, ord_b = load_full(fb)
+        series = [(os.path.basename(fa), gaps_a, ord_a, sa, "tab:blue"),
+                  (os.path.basename(fb), gaps_b, ord_b, sb, "tab:orange")]
+        # Both corpora are perfectly steady here, so the cumulative lines
+        # coincide exactly: draw the first one thick so both stay visible.
+        series_lw = [series[0] + (3.0,), series[1] + (1.2,)]
+        fig3, ax3 = plt.subplots(4, 2, figsize=(15, 16))
+        ax = ax3.ravel()
+
+        # (0) cumulative finds, normalized per file.
+        for name, gs, ms, sg, col, lw in series_lw:
+            x = np.arange(1, len(ms) + 1) / float(len(ms))
+            ax[0].step(x, x, where="post", color=col, lw=lw,
+                       label=f"{name} (n={len(ms)})")
+        ax[0].set_title("cumulative finds, normalized per file\n"
+                        "x = candidate order as a fraction of the file\n"
+                        "straight = steady walk; flat run = pause/restart; "
+                        "slope change = new session/cover")
+        ax[0].set_xlabel("candidate order (0 = first find, 1 = last)")
+        ax[0].set_ylabel("share of that file's finds")
+        ax[0].legend(fontsize=8)
+        ax[0].grid(alpha=0.3)
+
+        # (1) merit vs order, with running minimum and mean: the session /
+        # threshold-mixture detector (a STEP in the minimum is a different
+        # --gap-hunt-min-merit, a drift is load or a cover change).  The axis
+        # is the fraction of the file so two corpora of different length
+        # cannot be misread as a mid-file session boundary.
+        for name, gs, ms, sg, col in series:
+            ys, stride = subsample(ms)
+            ax[1].scatter(np.arange(0, len(ms), stride)[:len(ys)]
+                          / float(len(ms)), ys, s=4, alpha=0.35, color=col,
+                          label=f"{name} (every {stride})")
+            blk = max(1, len(ms) // 200)
+            rmin = [min(sl) for sl in
+                    (ms[i:i + blk] for i in range(0, len(ms), blk))]
+            rmean = [sum(sl) / float(len(sl)) for sl in
+                     (ms[i:i + blk] for i in range(0, len(ms), blk))]
+            xs_b = np.arange(0, len(ms), blk)[:len(rmin)] / float(len(ms))
+            ax[1].plot(xs_b, rmin, lw=1.6, color=col,
+                       label=f"{name} running min")
+            ax[1].plot(xs_b, rmean, lw=1.2, ls=":", color=col,
+                       label=f"{name} running mean")
+        ax[1].set_title("merit vs candidate order\n"
+                        "a STEP in the running minimum = the file mixes two "
+                        "--gap-hunt-min-merit sessions")
+        ax[1].set_xlabel("candidate order (0 = first find, 1 = last)")
+        ax[1].set_ylabel("merit")
+        ax[1].legend(fontsize=7)
+        ax[1].grid(alpha=0.3)
+
+        # (2) merit histogram vs the exponential fitted at that file's OWN
+        # report threshold (the smallest merit in it).  One file is drawn as an
+        # outline so the two shapes stay readable when they overlap.
+        for idx, (name, gs, ms, sg, col) in enumerate(series):
+            lo = math.floor(min(ms) * 2.0) / 2.0
+            hi = math.ceil(max(ms) * 2.0) / 2.0
+            ax[2].hist(ms, bins=np.arange(lo, hi + 0.5, 0.5),
+                       histtype="step" if idx == 0 else "stepfilled",
+                       alpha=0.5, lw=1.2 if idx == 0 else 1.0, color=col,
+                       label=f"{name} (n={len(ms)})")
+            own0 = min(ms)
+            s_own, _, _ = fit(ms, own0)
+            xs = np.arange(lo, hi, 0.05)
+            if s_own > 0:
+                ax[2].plot(xs, len(ms) * 0.5 / s_own
+                           * np.exp(-(xs - own0) / s_own), ls="--", lw=1.5,
+                           color=col,
+                           label=f"{name} fit sigma={s_own:.3f} (own threshold)")
+        ax[2].set_yscale("log")
+        ax[2].set_title("merit distribution vs the fitted exponential\n"
+                        "(each fit is anchored at that file's own "
+                        "report threshold)")
+        ax[2].set_xlabel("merit")
+        ax[2].set_ylabel("finds (log)")
+        ax[2].legend(fontsize=7)
+        ax[2].grid(alpha=0.3)
+
+        # (3) tail survival vs the fit — the records_report.py reading, with a
+        # hunt-specific addition in the title: a hunt file may legally
+        # concatenate several walk sessions, so a bend is not automatically a
+        # light tail (cross-check panel 1).
+        for name, gs, ms, sg, col in series:
+            srt = np.sort(np.asarray(ms, dtype=float))
+            own0 = min(ms)
+            s_own, _, _ = fit(ms, own0)
+            xs = np.arange(own0, max(ms) + 0.2, 0.05)
+            ax[3].step(xs, ccdf(srt, xs), where="post", color=col,
+                       label=f"{name} (n={len(ms)})")
+            if s_own > 0:
+                ax[3].plot(xs, np.exp(-(xs - own0) / s_own), "--", color=col,
+                           lw=1.2, label=f"{name} fit sigma={s_own:.3f}")
+        ax[3].set_yscale("log")
+        ax[3].set_title("tail: observed P(merit >= m) vs exponential fit\n"
+                        "falling FASTER than its dash line = fewer deep finds "
+                        "than the fit predicts:\nlight tail, mid-file "
+                        "threshold mix, or missing records")
+        ax[3].set_xlabel("merit")
+        ax[3].set_ylabel("P(merit >= m)")
+        ax[3].legend(fontsize=7)
+        ax[3].grid(alpha=0.3)
+
+        # (4) depth-resolved local sigma: the single exponent is a summary,
+        # this is the shape (and it is why the summary must not be
+        # extrapolated to the record depth).
+        for rows, name, col, sg in ((rows_a, os.path.basename(fa),
+                                     "tab:blue", sa),
+                                    (rows_b, os.path.basename(fb),
+                                     "tab:orange", sb)):
+            pts = [(r[0], r[4], r[5]) for r in rows if r[4] is not None]
+            if not pts:
+                continue
+            ax[4].errorbar([p[0] + 0.5 for p in pts], [p[1] for p in pts],
+                           yerr=[p[2] for p in pts], fmt="o-", ms=4, capsize=3,
+                           color=col, label=f"{name} local sigma")
+            ax[4].axhline(sg, ls="--", lw=1, color=col,
+                          label=f"{name} global fit {sg:.3f}")
+        ax[4].set_title("local sigma per merit band\n"
+                        "sigma falling with depth = lighter-than-exponential "
+                        "tail (do not extrapolate the global fit)")
+        ax[4].set_xlabel("merit band (band width 1.0)")
+        ax[4].set_ylabel("local sigma")
+        ax[4].legend(fontsize=7)
+        ax[4].grid(alpha=0.3)
+
+        # (5) record proximity: gap vs merit against the table's requirement
+        # (merit = gap/ln(start) is linear at a fixed size, so each file is a
+        # straight line and the table envelope is what decides a record).
+        table = load_table(resolve("prime_gap_merits.txt"))
+        gmin = min(min(gaps_a), min(gaps_b))
+        gmax = max(max(gaps_a), max(gaps_b))
+        if table:
+            pts = sorted((g, v) for g, v in table.items()
+                         if gmin * 0.9 <= g <= gmax * 1.1)
+            if pts:
+                ax[5].plot([p[0] for p in pts], [p[1] for p in pts], lw=1,
+                           color="k", alpha=0.5,
+                           label="needed for a record (table)")
+        for name, gs, ms, sg, col in series:
+            ys, stride = subsample(ms)
+            ax[5].scatter(np.asarray(gs[::stride])[:len(ys)], ys, s=5,
+                          alpha=0.35, color=col,
+                          label=f"{name} (every {stride})")
+            if table:
+                rec = [(g, m) for g, m in zip(gs, ms)
+                       if g in table and m > table[g]]
+                if rec:
+                    ax[5].scatter([p[0] for p in rec], [p[1] for p in rec],
+                                  s=90, marker="*", edgecolor="k", zorder=5,
+                                  color=col,
+                                  label=f"{name}: ABOVE known best ({len(rec)})")
+                # The table envelope sits far above every find here, so the
+                # zoom keeps the candidates readable and the CLOSEST APPROACH
+                # (the number that actually matters) is written on the axes.
+                near = [(table[g] - m, g, m) for g, m in zip(gs, ms)
+                        if g in table]
+                if near:
+                    d, gb, mb_ = min(near)
+                    ax[5].text(0.02, 0.04 + 0.05 * (name == series[-1][0]),
+                               f"{name}: closest {d:+.3f} merit "
+                               f"(gap {gb}: {mb_:.3f} vs needed {table[gb]:.3f})",
+                               transform=ax[5].transAxes, fontsize=7, color=col)
+        ax[5].set_title("gap vs merit against the merit a record needs there\n"
+                        "stars = above the table; y zoomed to the finds, "
+                        "closest approach printed on the axes")
+        ax[5].set_xlabel("gap length")
+        ax[5].set_ylabel("merit")
+        cand_merits = list(ma) + list(mb)
+        ax[5].set_ylim(min(cand_merits) - 1.0, max(cand_merits) + 2.0)
+        ax[5].legend(fontsize=7)
+        ax[5].grid(alpha=0.3)
+
+        # (6) the A/B comparison itself, laid on top: subtract each file's own
+        # report threshold so different shifts/covers are comparable — this is
+        # what the sigma verdict measures, drawn.
+        for name, gs, ms, sg, col in series:
+            srt = np.sort(np.asarray(ms, dtype=float))
+            own0 = min(ms)
+            xs = np.arange(0.0, max(ms) - own0, 0.05)
+            ax[6].plot(xs, ccdf(srt, xs + own0), color=col,
+                       label=f"{name} (threshold {own0:.3f}, n={len(ms)})")
+        ax[6].set_yscale("log")
+        ax[6].set_title("tails superposed: P(merit - own threshold >= x)\n"
+                        "the curve that stays higher at large x is the heavier "
+                        "tail")
+        ax[6].set_xlabel("merit excess over the file's own report threshold")
+        ax[6].set_ylabel("P(merit - threshold >= x)")
+        ax[6].legend(fontsize=8)
+        ax[6].grid(alpha=0.3)
+
+        # (7) the verdict as a curve: CCDF ratio B/A with Poisson errors.
+        # >1 = B keeps more of its records at that depth.  Curves heading in
+        # opposite directions = a tail CROSSING, the case in which one
+        # threshold sigma cannot rank the two files.
+        lo = max(min(ma), min(mb))
+        hi = min(max(ma), max(mb))
+        if hi > lo + 0.2:
+            xs = np.arange(lo, hi, 0.1)
+            pa = ccdf(srt_a, xs)
+            pb = ccdf(srt_b, xs)
+            na = np.round(pa * len(ma))
+            nb = np.round(pb * len(mb))
+            with np.errstate(divide="ignore", invalid="ignore"):
+                ratio = np.where((na > 0) & (nb > 0), pb / np.maximum(pa, 1e-12),
+                                 np.nan)
+                rel = np.sqrt(1.0 / np.maximum(na, 1) + 1.0 / np.maximum(nb, 1))
+            ax[7].errorbar(xs, ratio, yerr=ratio * rel, fmt="-", lw=1,
+                           color="tab:purple", ecolor="0.7", elinewidth=1,
+                           label="B/A (CCDF ratio)")
+            ax[7].axhline(1.0, color="k", lw=1, ls=":")
+        else:
+            ax[7].axis("off")
+        ax[7].set_yscale("log")
+        ax[7].set_title("CCDF ratio B/A (Poisson errors)\n"
+                        ">1 = B keeps more records at that depth", fontsize=11)
+        ax[7].set_xlabel("merit")
+        ax[7].set_ylabel("P_B(merit >= m) / P_A(merit >= m)")
+        ax[7].legend(fontsize=8)
+        ax[7].grid(alpha=0.3)
+
+        fig3.suptitle("gap_hunt corpus diagnostics — "
+                      f"A={os.path.basename(fa)}  B={os.path.basename(fb)}\n"
+                      "NOTE: hunt logs carry no timestamps, so order-based "
+                      "panels use the candidate index (discovery order)",
+                      fontsize=12)
+        fig3.tight_layout(rect=(0, 0, 1, 0.97))
+        fig3.savefig(f"{plot}_panels.png", dpi=120)
+        print(f"wrote {plot}_panels.png")
     return 0
 
 

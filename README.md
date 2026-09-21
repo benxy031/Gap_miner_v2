@@ -141,6 +141,26 @@ scripts/arith_ceiling.py             # paper model at our exact sizes (AL per
                                      # ceiling at 768 bits), not assumed
 scripts/arith_ceiling.py --json      # machine-readable
 scripts/arith_ceiling.py --realisation 1.0   # optimistic: no discount
+tools/convert_horizon_crt.py IN.txt OUT.txt --shift 512
+                                     # convert a Horizon/Golden "ChineseSet" CRT
+                                     # file into our text format so their covers
+                                     # can be driven by our miner and checked by
+                                     # our tools.  Their file is 4 lines
+                                     # (n_primes / size / n_candidates / offset X);
+                                     # the residues are o_p = (-X) mod p and their
+                                     # n_candidates counts uncovered positions over
+                                     # [0, size-1] (INCLUDING the anchor, ours
+                                     # excludes it), so counts may differ by +-1 at
+                                     # an identical cover.  The converter asserts a
+                                     # round-trip against their own n_candidates and
+                                     # exits 2 if the convention ever changes.
+                                     # Their `size` IS their gap_target: m22@512 =
+                                     # 11,703 vs our 11,712, and their
+                                     # "crt-22m-512s-761-verified.txt" is really a
+                                     # 11,319 window = merit 21.26, NOT an m22.
+                                     # Licence note: Horizon ships GPL-3.0/MIT
+                                     # notices - measuring their files locally is
+                                     # fine, redistributing them is not.
 # Measured on the devbox RTX 3070 (2026-09-21): 32-bit IMAD 4.8-5.3 T/s, 64-bit
 # mul 1.10 T/s (one limb mul = 4.59 IMAD slots), dp4a 22.3 T MAC/s, int8 MMA
 # 72.9 T MAC/s (89% of the card's INT8 peak).  Conclusion the model forces:

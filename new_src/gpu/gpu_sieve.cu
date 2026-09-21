@@ -67,6 +67,12 @@ static int gpu_mark_primes_ascending(const uint64_t *primes, size_t count) {
     return sorted;
 }
 
+/* Floor for the right-sized candidate-buffer capacity, in slots per window
+   (see gpu_sieve_ctx.cand_cap_per_window).  The measured survivor density is
+   ~1,000 per 17,916-slot window at shift507/2M sieve primes, so 4096 leaves a
+   4x margin before the buffer ever has to grow. */
+#define GPU_EXTRACT_CAND_CAP_MIN 4096U
+
 struct gpu_sieve_ctx {
     int device_id;
     size_t max_primes;
@@ -91,11 +97,31 @@ struct gpu_sieve_ctx {
     uint64_t *d_cands_aos[2];   /* [max_candidates * active_limbs] AoS limbs,
                                    ping-pong for the async fused pipeline */
     uint64_t *d_offsets;        /* [max_candidates] full adder offsets */
-    unsigned int *d_count;      /* survivor counter (written by the scan) */
+    unsigned int *d_count;      /* survivor counter (written by the scan);
+                                   its HIGH BIT is set when a survivor did
+                                   not fit the candidate-buffer capacity */
     size_t max_candidates;
     uint32_t extract_accum;     /* K: candidate buffers sized K× per window
                                    (MR batch accumulation across windows) */
     int active_limbs_capacity;
+
+    /* Candidate-buffer RIGHT-SIZING (see gpu_sieve_extract_pack_impl).  The
+       buffer only ever holds SURVIVORS, and the survivors are a small
+       fraction of the odd slots (measured 1,000 of 17,916 per window at
+       shift507 / 2M sieve primes), so allocating one slot per odd position
+       is a ~18x over-allocation that is what caps MINING_JUMP2_BATCH by
+       VRAM.  cand_cap_per_window is the real capacity: it starts small,
+       is right-sized after the first measured window, and grows (loudly)
+       if a later window ever needs more.  Growth is always prefered over
+       truncation: a dropped survivor would make two non-consecutive primes
+       look consecutive, i.e. a FALSE GAP. */
+    uint64_t cand_cap_per_window;      /* slots reserved per window */
+    uint64_t cand_cap_pending;         /* capacity to apply at the next
+                                          slot_base == 0 (never mid-flight) */
+    uint64_t cand_cap_measured;        /* max survivors seen in one window */
+    int cand_cap_calibrated;           /* first window already measured */
+    int cand_cap_env;                  /* GPU_EXTRACT_CAND_CAP: initial cap */
+    int cand_cap_reported;             /* one-shot stderr reporting */
 
     /* Row-batch mark (CRT row-walk): rows × max_bitmap_words bitmaps so one
        residues pass can mark a whole row batch; d_step_mod_p[i] = P mod p. */
@@ -306,6 +332,19 @@ gpu_sieve_ctx *gpu_sieve_init(int device_id,
     ctx->base_limbs_capacity = 0;
     ctx->primes_uploaded_count = 0;
     ctx->extract_accum = 1;
+    /* Candidate-buffer right-sizing: 0 = size it automatically from the
+       first measured window (4x headroom); a positive GPU_EXTRACT_CAND_CAP
+       pins the initial per-window capacity for experiments. */
+    ctx->cand_cap_per_window = 0;
+    ctx->cand_cap_pending = 0;
+    ctx->cand_cap_measured = 0;
+    ctx->cand_cap_calibrated = 0;
+    ctx->cand_cap_reported = 0;
+    {
+        const char *cc = getenv("GPU_EXTRACT_CAND_CAP");
+        long v = (cc && *cc) ? strtol(cc, NULL, 10) : 0;
+        ctx->cand_cap_env = (v > 0) ? (int)v : 0;
+    }
     (void)snprintf(ctx->dev_name, sizeof(ctx->dev_name), "cuda:%d", device_id);
 
     cudaError_t err = gpu_sieve_ensure_device(device_id);
@@ -1856,7 +1895,17 @@ __global__ static void gpu_sieve_extract_pack_kernel(
 
             uint32_t slot = sdata[tid] + rank + slot_base;
             rank++;
-            if (slot >= max_batch) continue; /* sized right -> unreachable */
+            /* max_batch is the candidate buffer capacity, NOT the range: a
+               survivor that does not fit must never be written (overrun)
+               and must never be dropped silently either (a dropped prime
+               makes two non-consecutive primes look consecutive = a false
+               gap).  Signal it in the HIGH BIT of the count word, which the
+               host already reads, so the check costs no extra CUDA call.
+               The count itself is < 2^31 (bounded by the bitmap range). */
+            if (slot >= max_batch) {
+                if (d_count) atomicOr(d_count, 0x80000000U);
+                continue;
+            }
 
             uint64_t offset = first_odd_offset + (odd_pos << 1);
             uint64_t *cand = cands_aos + (uint64_t)slot * (uint64_t)active_limbs;
@@ -1911,97 +1960,36 @@ static int gpu_sieve_extract_pack_impl(gpu_sieve_ctx *ctx,
     cudaError_t err = gpu_sieve_ensure_device(ctx->device_id);
     if (err != cudaSuccess) return 0;
 
-    /* (Re)allocate the extract buffers if capacity or limb width changed.
-       extract_accum > 1 sizes the candidate buffers for MR batch
-       accumulation across K windows (slot_base up to K×odd_interval_size).
-       Capacity is the ctx's max window size so the buffers are allocated
-       ONCE and never move while async MR kernels still read them (a
-       mid-run realloc would free buffers referenced by in-flight CGBN
-       kernels — the K>1 accumulation widened that race window). */
+    /* ---- Candidate-buffer RIGHT-SIZING ----------------------------------
+       The buffer holds SURVIVORS, a small fraction of the odd slots
+       (measured 1,000 of 17,916 per window at shift507 / 2M sieve primes),
+       so one slot per odd position - what this used to allocate - is a ~18x
+       VRAM over-allocation, and that over-allocation is what capped
+       MINING_JUMP2_BATCH (and therefore the MR batch that feeds the GPU).
+       Capacity is now: a small initial guess, right-sized after the first
+       measured window, and GROWN (never truncated) if a later window needs
+       more.  A dropped survivor would make two non-consecutive primes look
+       consecutive - i.e. a false gap - so overflow is a hard signal, not a
+       silent skip. */
     size_t accum = ctx->extract_accum ? (size_t)ctx->extract_accum : 1;
-    size_t cap = ((ctx->max_odd_interval > odd_interval_size)
-                      ? ctx->max_odd_interval
-                      : odd_interval_size) *
-                 accum;
-    if (ctx->max_candidates < cap ||
-        ctx->active_limbs_capacity != active_limbs ||
-        !ctx->d_cands_aos[0] || !ctx->d_cands_aos[1] ||
-        !ctx->d_offsets || !ctx->d_count) {
-        /* Defensive: never free buffers that in-flight kernels may read.
-           With the max-size preallocation this should be unreachable during
-           mining, but guard it anyway. */
-        cudaDeviceSynchronize();
-        if (ctx->d_cands_aos[0]) cudaFree(ctx->d_cands_aos[0]);
-        if (ctx->d_cands_aos[1]) cudaFree(ctx->d_cands_aos[1]);
-        if (ctx->d_offsets)   cudaFree(ctx->d_offsets);
-        if (ctx->d_count)     cudaFree(ctx->d_count);
-        ctx->d_cands_aos[0] = NULL;
-        ctx->d_cands_aos[1] = NULL;
-        ctx->d_offsets = NULL;
-        ctx->d_count = NULL;
-        ctx->max_candidates = 0;
-
-        err = cudaMalloc(&ctx->d_cands_aos[0],
-                         cap * (size_t)active_limbs * sizeof(uint64_t));
-        if (err != cudaSuccess) {
-            /* Fail-closed is correct here (the worker drops to the CPU
-               sieve), but a bare "out of memory" hides how much was needed
-               and why, and the CPU path is ~600x slower -- print the numbers
-               so an out-of-VRAM run cannot be mistaken for a slow GPU. */
-            size_t want = cap * (size_t)active_limbs * sizeof(uint64_t);
-            size_t vfree = 0, vtotal = 0;
-            cudaMemGetInfo(&vfree, &vtotal);
-            fprintf(stderr,
-                    "gpu_sieve: cands[0] alloc: %s\n"
-                    "gpu_sieve:   needs 2 x %.0f MiB candidate buffers "
-                    "(window %llu x K=%u x %d limbs); device free %.0f of %.0f MiB\n"
-                    "gpu_sieve:   lower MINING_JUMP2_BATCH (now %u) or free VRAM;\n"
-                    "gpu_sieve:   otherwise this worker falls back to the CPU "
-                    "sieve, which is ~600x slower (measured 19 vs 11751 win/s)\n",
-                    cudaGetErrorString(err), (double)want / (1024.0 * 1024.0),
-                    (unsigned long long)ctx->max_odd_interval,
-                    (unsigned)ctx->extract_accum, active_limbs,
-                    (double)vfree / (1024.0 * 1024.0),
-                    (double)vtotal / (1024.0 * 1024.0),
-                    (unsigned)ctx->extract_accum);
-            return 0;
-        }
-        err = cudaMalloc(&ctx->d_cands_aos[1],
-                         cap * (size_t)active_limbs * sizeof(uint64_t));
-        if (err != cudaSuccess) {
-            size_t want = cap * (size_t)active_limbs * sizeof(uint64_t);
-            size_t vfree = 0, vtotal = 0;
-            cudaMemGetInfo(&vfree, &vtotal);
-            fprintf(stderr,
-                    "gpu_sieve: cands[1] alloc: %s\n"
-                    "gpu_sieve:   needs 2 x %.0f MiB candidate buffers "
-                    "(window %llu x K=%u x %d limbs); device free %.0f of %.0f MiB\n"
-                    "gpu_sieve:   lower MINING_JUMP2_BATCH (now %u) or free VRAM;\n"
-                    "gpu_sieve:   otherwise this worker falls back to the CPU "
-                    "sieve, which is ~600x slower (measured 19 vs 11751 win/s)\n",
-                    cudaGetErrorString(err), (double)want / (1024.0 * 1024.0),
-                    (unsigned long long)ctx->max_odd_interval,
-                    (unsigned)ctx->extract_accum, active_limbs,
-                    (double)vfree / (1024.0 * 1024.0),
-                    (double)vtotal / (1024.0 * 1024.0),
-                    (unsigned)ctx->extract_accum);
-            return 0;
-        }
-        err = cudaMalloc(&ctx->d_offsets, cap * sizeof(uint64_t));
-        if (err != cudaSuccess) { fprintf(stderr, "gpu_sieve: offsets alloc: %s\n",
-                                          cudaGetErrorString(err)); return 0; }
-        err = cudaMalloc(&ctx->d_count, sizeof(unsigned int));
-        if (err != cudaSuccess) { fprintf(stderr, "gpu_sieve: count alloc: %s\n",
-                                          cudaGetErrorString(err)); return 0; }
-        ctx->max_candidates = cap;
-        ctx->active_limbs_capacity = active_limbs;
+    /* A pending change is only ever applied when nothing is accumulated
+       (slot_base == 0): mid-flight the accumulated layout would be
+       invalidated. */
+    if (slot_base == 0 && ctx->cand_cap_pending) {
+        ctx->cand_cap_per_window = ctx->cand_cap_pending;
+        ctx->cand_cap_pending = 0;
+        ctx->max_candidates = 0;            /* force the realloc below */
     }
-
-    /* Upload the base (independent of whether mark_from_base already did). */
-    err = cudaMemcpyAsync(ctx->d_base_limbs, base_limbs,
-                          (size_t)active_limbs * sizeof(*base_limbs),
-                          cudaMemcpyHostToDevice, ctx->stream);
-    if (err != cudaSuccess) return 0;
+    if (ctx->cand_cap_per_window == 0) {
+        ctx->cand_cap_per_window = ctx->cand_cap_env
+                                       ? (uint64_t)ctx->cand_cap_env
+                                       : gpu_sieve_cand_cap_estimate(
+                                             ctx->max_odd_interval);
+    }
+    if (ctx->cand_cap_per_window > ctx->max_odd_interval)
+        ctx->cand_cap_per_window = ctx->max_odd_interval;
+    size_t cap = (size_t)ctx->cand_cap_per_window * accum;
+    if (cap > (size_t)0xFFFFFFFFu) cap = (size_t)0xFFFFFFFFu;
 
     uint64_t w_lo = lo_odd >> 6;
     uint64_t w_hi = (hi_odd + 63U) >> 6;
@@ -2010,38 +1998,181 @@ static int gpu_sieve_extract_pack_impl(gpu_sieve_ctx *ctx,
 
     /* Single-block ordered compaction: one thread per bitmap word. */
     uint32_t half_filter = (class_mask60 != UINT64_MAX) ? 1U : 0U;
-    sieve_timing_begin(ctx, 2);
-    gpu_sieve_extract_pack_kernel<<<1, 1024, 0, ctx->stream>>>(
-        bitmap, (uint64_t)words, odd_interval_size,
-        first_odd_offset, ctx->d_base_limbs, active_limbs,
-        ctx->d_cands_aos[cand_buf & 1], ctx->d_offsets, ctx->d_count,
-        (uint32_t)(hi_odd - lo_odd + slot_base), lo_odd, hi_odd, half_filter,
-        base_mod60, class_mask60, region_start, slot_base);
-    sieve_timing_end(ctx);
-
-    err = cudaGetLastError();
-    if (err != cudaSuccess) {
-        fprintf(stderr, "gpu_sieve: extract_pack launch: %s\n",
-                cudaGetErrorString(err));
-        ctx->t_stage = 0;
-        return 0;
-    }
-
-    /* Read the survivor count first (async + stream sync), then copy only the
-       valid entries.  Using a full-buffer copy would transfer ~1 MB of dead
-       slots per window; using synchronous cudaMemcpy would insert DEVICE-WIDE
-       syncs that serialize concurrent workers' streams. */
     unsigned int cnt = 0;
-    err = cudaMemcpyAsync(&cnt, ctx->d_count, sizeof(cnt),
-                          cudaMemcpyDeviceToHost, ctx->stream);
-    if (err != cudaSuccess) return 0;
-    err = cudaStreamSynchronize(ctx->stream);
-    sieve_timing_drain(ctx);
-    if (err != cudaSuccess) {
-        fprintf(stderr, "gpu_sieve: extract_pack count sync: %s\n",
-                cudaGetErrorString(err));
-        return 0;
+    unsigned int ovf = 0;
+    int attempt = 0;
+
+    for (;;) {
+        /* (Re)allocate the extract buffers if the capacity or the limb width
+           changed.  Allocating the right size ONCE and never moving it is what
+           keeps async MR kernels safe: a mid-run realloc would free buffers
+           referenced by in-flight CGBN kernels, hence the device sync. */
+        if (ctx->max_candidates != cap ||
+            ctx->active_limbs_capacity != active_limbs ||
+            !ctx->d_cands_aos[0] || !ctx->d_cands_aos[1] ||
+            !ctx->d_offsets || !ctx->d_count) {
+            cudaDeviceSynchronize();
+            if (ctx->d_cands_aos[0]) cudaFree(ctx->d_cands_aos[0]);
+            if (ctx->d_cands_aos[1]) cudaFree(ctx->d_cands_aos[1]);
+            if (ctx->d_offsets)   cudaFree(ctx->d_offsets);
+            if (ctx->d_count)     cudaFree(ctx->d_count);
+            ctx->d_cands_aos[0] = NULL;
+            ctx->d_cands_aos[1] = NULL;
+            ctx->d_offsets = NULL;
+            ctx->d_count = NULL;
+            ctx->max_candidates = 0;
+
+            err = cudaMalloc(&ctx->d_cands_aos[0],
+                             cap * (size_t)active_limbs * sizeof(uint64_t));
+            if (err != cudaSuccess) {
+                /* Fail-closed is correct here (the worker drops to the CPU
+                   sieve), but a bare "out of memory" hides how much was needed
+                   and why, and the CPU path is ~600x slower -- print the
+                   numbers so an out-of-VRAM run cannot be mistaken for a slow
+                   GPU. */
+                size_t want = cap * (size_t)active_limbs * sizeof(uint64_t);
+                size_t vfree = 0, vtotal = 0;
+                cudaMemGetInfo(&vfree, &vtotal);
+                fprintf(stderr,
+                        "gpu_sieve: cands[0] alloc: %s\n"
+                        "gpu_sieve:   needs 2 x %.0f MiB candidate buffers "
+                        "(window %llu odd slots, capacity %llu slots/window "
+                        "x K=%u x %d limbs); device free %.0f of %.0f MiB\n"
+                        "gpu_sieve:   lower MINING_JUMP2_BATCH (now %u) or free VRAM;\n"
+                        "gpu_sieve:   otherwise this worker falls back to the CPU "
+                        "sieve, which is ~600x slower (measured 19 vs 11751 win/s)\n",
+                        cudaGetErrorString(err), (double)want / (1024.0 * 1024.0),
+                        (unsigned long long)ctx->max_odd_interval,
+                        (unsigned long long)ctx->cand_cap_per_window,
+                        (unsigned)ctx->extract_accum, active_limbs,
+                        (double)vfree / (1024.0 * 1024.0),
+                        (double)vtotal / (1024.0 * 1024.0),
+                        (unsigned)ctx->extract_accum);
+                return 0;
+            }
+            err = cudaMalloc(&ctx->d_cands_aos[1],
+                             cap * (size_t)active_limbs * sizeof(uint64_t));
+            if (err != cudaSuccess) {
+                size_t want = cap * (size_t)active_limbs * sizeof(uint64_t);
+                size_t vfree = 0, vtotal = 0;
+                cudaMemGetInfo(&vfree, &vtotal);
+                fprintf(stderr,
+                        "gpu_sieve: cands[1] alloc: %s\n"
+                        "gpu_sieve:   needs 2 x %.0f MiB candidate buffers "
+                        "(window %llu odd slots, capacity %llu slots/window "
+                        "x K=%u x %d limbs); device free %.0f of %.0f MiB\n"
+                        "gpu_sieve:   lower MINING_JUMP2_BATCH (now %u) or free VRAM;\n"
+                        "gpu_sieve:   otherwise this worker falls back to the CPU "
+                        "sieve, which is ~600x slower (measured 19 vs 11751 win/s)\n",
+                        cudaGetErrorString(err), (double)want / (1024.0 * 1024.0),
+                        (unsigned long long)ctx->max_odd_interval,
+                        (unsigned long long)ctx->cand_cap_per_window,
+                        (unsigned)ctx->extract_accum, active_limbs,
+                        (double)vfree / (1024.0 * 1024.0),
+                        (double)vtotal / (1024.0 * 1024.0),
+                        (unsigned)ctx->extract_accum);
+                return 0;
+            }
+            err = cudaMalloc(&ctx->d_offsets, cap * sizeof(uint64_t));
+            if (err != cudaSuccess) { fprintf(stderr, "gpu_sieve: offsets alloc: %s\n",
+                                              cudaGetErrorString(err)); return 0; }
+            err = cudaMalloc(&ctx->d_count, sizeof(unsigned int));
+            if (err != cudaSuccess) { fprintf(stderr, "gpu_sieve: count alloc: %s\n",
+                                              cudaGetErrorString(err)); return 0; }
+            ctx->max_candidates = cap;
+            ctx->active_limbs_capacity = active_limbs;
+        }
+
+        /* Upload the base (independent of whether mark_from_base already did). */
+        err = cudaMemcpyAsync(ctx->d_base_limbs, base_limbs,
+                              (size_t)active_limbs * sizeof(*base_limbs),
+                              cudaMemcpyHostToDevice, ctx->stream);
+        if (err != cudaSuccess) return 0;
+
+        sieve_timing_begin(ctx, 2);
+        gpu_sieve_extract_pack_kernel<<<1, 1024, 0, ctx->stream>>>(
+            bitmap, (uint64_t)words, odd_interval_size,
+            first_odd_offset, ctx->d_base_limbs, active_limbs,
+            ctx->d_cands_aos[cand_buf & 1], ctx->d_offsets, ctx->d_count,
+            (uint32_t)ctx->max_candidates, lo_odd, hi_odd, half_filter,
+            base_mod60, class_mask60, region_start, slot_base);
+        sieve_timing_end(ctx);
+
+        err = cudaGetLastError();
+        if (err != cudaSuccess) {
+            fprintf(stderr, "gpu_sieve: extract_pack launch: %s\n",
+                    cudaGetErrorString(err));
+            ctx->t_stage = 0;
+            return 0;
+        }
+
+        /* Read the survivor count first (async + stream sync), then copy only
+           the valid entries.  Using a full-buffer copy would transfer ~1 MB of
+           dead slots per window; using synchronous cudaMemcpy would insert
+           DEVICE-WIDE syncs that serialize concurrent workers' streams.  The
+           count's high bit is the capacity-overflow flag (see the kernel). */
+        cnt = 0;
+        ovf = 0;
+        err = cudaMemcpyAsync(&cnt, ctx->d_count, sizeof(cnt),
+                              cudaMemcpyDeviceToHost, ctx->stream);
+        if (err != cudaSuccess) return 0;
+        err = cudaStreamSynchronize(ctx->stream);
+        sieve_timing_drain(ctx);
+        if (err != cudaSuccess) {
+            fprintf(stderr, "gpu_sieve: extract_pack count sync: %s\n",
+                    cudaGetErrorString(err));
+            return 0;
+        }
+        if (cnt & 0x80000000U) {
+            ovf = 1;
+            cnt &= 0x7FFFFFFFU;
+        }
+
+        if (!ovf) break;
+
+        /* Denser window than the reserved capacity: grow, never truncate. */
+        uint64_t need = (uint64_t)cnt + 64U;
+        uint64_t by_slot =
+            ((uint64_t)slot_base + (uint64_t)cnt + 64U + accum - 1U) / accum;
+        if (by_slot > need) need = by_slot;
+        uint64_t grown = ctx->cand_cap_per_window * 2U;
+        if (grown < need) grown = need;
+        if (grown > ctx->max_odd_interval) grown = ctx->max_odd_interval;
+        if (!ctx->cand_cap_reported) {
+            ctx->cand_cap_reported = 1;
+            fprintf(stderr,
+                    "gpu_sieve: candidate buffer too small: %u survivors do not "
+                    "fit in %llu slots/window x K=%u; raising to %llu "
+                    "slots/window (this is the survivor density, not a bug)\n",
+                    cnt, (unsigned long long)ctx->cand_cap_per_window,
+                    (unsigned)ctx->extract_accum, (unsigned long long)grown);
+        }
+        if (grown <= ctx->cand_cap_per_window || attempt >= 3) {
+            fprintf(stderr,
+                    "gpu_sieve: candidate buffer cannot grow further "
+                    "(%llu slots/window x K=%u already); failing this "
+                    "extraction closed rather than dropping survivors\n",
+                    (unsigned long long)ctx->cand_cap_per_window,
+                    (unsigned)ctx->extract_accum);
+            ctx->cand_cap_pending = 0;
+            ctx->max_candidates = 0;
+            return 0;
+        }
+        if (slot_base != 0) {
+            /* The accumulated layout of this flight is invalid (a window was
+               truncated); apply the new capacity at the next flight boundary
+               and fail this call so the caller falls back for this window. */
+            ctx->cand_cap_pending = grown;
+            ctx->max_candidates = 0;
+            return 0;
+        }
+        ctx->cand_cap_per_window = grown;
+        cap = (size_t)ctx->cand_cap_per_window * accum;
+        if (cap > (size_t)0xFFFFFFFFu) cap = (size_t)0xFFFFFFFFu;
+        ctx->max_candidates = 0;    /* force the realloc in the next round */
+        attempt++;
     }
+
     if ((uint64_t)cnt > (hi_odd - lo_odd)) cnt = (unsigned int)(hi_odd - lo_odd);
     *host_count = cnt;
 
@@ -2064,6 +2195,33 @@ static int gpu_sieve_extract_pack_impl(gpu_sieve_ctx *ctx,
             fprintf(stderr, "gpu_sieve: extract_pack sync: %s\n",
                     cudaGetErrorString(err));
             return 0;
+        }
+    }
+
+    /* Right-size after the FIRST measured window: 4x the observed survivors
+       plus slack.  The survivor density is a property of the cover and the
+       sieve depth, so it is near-constant across windows (measured 1,000.2 +
+       -0.3 per window over 380k windows), which makes 4x a wide margin.  The
+       change is *pending*: it is applied at the next slot_base == 0 call, so
+       the flight being accumulated now is untouched. */
+    if (slot_base == 0 && !ctx->cand_cap_calibrated) {
+        ctx->cand_cap_calibrated = 1;
+        if ((uint64_t)cnt > ctx->cand_cap_measured)
+            ctx->cand_cap_measured = cnt;
+        uint64_t want = (uint64_t)cnt * 4U + 1024U;
+        if (want < (uint64_t)GPU_EXTRACT_CAND_CAP_MIN)
+            want = (uint64_t)GPU_EXTRACT_CAND_CAP_MIN;
+        if (want < ctx->cand_cap_per_window) {
+            ctx->cand_cap_pending = want;
+            if (!ctx->cand_cap_reported) {
+                ctx->cand_cap_reported = 1;
+                fprintf(stderr,
+                        "gpu_sieve: candidate buffer right-sized to %llu "
+                        "slots/window (%u survivors measured in the first "
+                        "window; was %llu = one slot per odd position)\n",
+                        (unsigned long long)want, cnt,
+                        (unsigned long long)ctx->cand_cap_per_window);
+            }
         }
     }
     return 1;
@@ -2239,6 +2397,29 @@ uint64_t *gpu_sieve_row_bitmap(gpu_sieve_ctx *ctx, uint32_t row) {
 void gpu_sieve_set_extract_accum(gpu_sieve_ctx *ctx, uint32_t k) {
     if (!ctx) return;
     ctx->extract_accum = k ? k : 1;
+}
+
+/* The capacity the candidate buffers will START with for a given window
+   geometry: the same rule gpu_sieve_extract_pack_impl applies at its first
+   extract (max(floor, odd_interval/8), never more than the odd interval
+   itself).  Used by callers that need to report or budget VRAM up front. */
+uint64_t gpu_sieve_cand_cap_estimate(uint64_t max_odd_interval) {
+    uint64_t init = max_odd_interval / 8U;
+    if (init < (uint64_t)GPU_EXTRACT_CAND_CAP_MIN)
+        init = (uint64_t)GPU_EXTRACT_CAND_CAP_MIN;
+    if (init > max_odd_interval) init = max_odd_interval;
+    return init;
+}
+
+int gpu_sieve_mem_info(gpu_sieve_ctx *ctx, size_t *free_bytes,
+                       size_t *total_bytes) {
+    if (!ctx) return -1;
+    if (gpu_sieve_ensure_device(ctx->device_id) != cudaSuccess) return -1;
+    size_t vfree = 0, vtotal = 0;
+    if (cudaMemGetInfo(&vfree, &vtotal) != cudaSuccess) return -1;
+    if (free_bytes) *free_bytes = vfree;
+    if (total_bytes) *total_bytes = vtotal;
+    return 0;
 }
 
 /* Device AoS candidate buffer of ping-pong buf (0/1). */

@@ -1631,7 +1631,17 @@ static int crt_gpu_batch_test(struct gpu_adapter *gpu, int limbs,
    fires on those runs.  The chain's own submits are K x chunk (256 x 32 =
    8192), three orders of magnitude below the cap, so the chain path itself is
    unaffected.  The verifier now replays in cap-sized slices. */
-#define MINING_JUMP2_BATCH_MAX 512
+/* Raised 512 -> 1024 (2026-09-19) and 1024 -> 4096 (2026-09-21, together with
+the candidate-buffer right-sizing in gpu_sieve.cu).  NOT a new local default:
+at the time of the first raise, K=1024 with 2 workers failed the candidate-
+buffer cudaMalloc on the 8 GB dev card (2 x ~3.2 GB with one slot per odd
+position).  With the buffer now sized from the MEASURED survivor density
+(~1,000 of 17,916 slots per window) the same K costs ~8x less VRAM, which is
+what makes K in the thousands reachable at all -- that is the point of the
+4096 cap.  Keep MINING_JUMP2_BATCH at 512 on 8 GB cards until the larger K has
+been measured there; the host-side flight arrays also scale as
+candidate_capacity x K (see the loud alloc-failure message below). */
+#define MINING_JUMP2_BATCH_MAX 4096
 /* Per-window chain chunk.  DEFAULT 12 (was 32 until 2026-09-19).
 
    The chain tests a whole C-wide survivor slice and keeps only ONE prime
@@ -3119,10 +3129,18 @@ void *worker_thread_run_crt(void *arg) {
     struct gpu_fermat_ctx *fused_fermat = NULL;
     uint64_t *fused_slot_offsets = NULL;
     uint64_t *fused_sorted_offsets = NULL;
-    struct fused_flight fused_fl[2];
+    /* Heap, not stack: at MINING_JUMP2_BATCH_MAX = 4096 this is ~1.8 MB of
+       per-flight state (2 windows x 4096 windows x 2 mpz_t + limbs), which is
+       too much to put on a worker thread's stack. */
+    struct fused_flight *fused_fl =
+        (struct fused_flight *)calloc(2, sizeof(*fused_fl));
     uint8_t *fused_is_prime[2] = { NULL, NULL };
     uint64_t *fused_offsets[2] = { NULL, NULL };
-    memset(fused_fl, 0, sizeof(fused_fl));
+    if (!fused_fl) {
+        fprintf(stderr, "[Worker %u] fused flight state alloc failed\n",
+                worker_id);
+        return NULL;
+    }
     for (int f = 0; f < 2; f++) {
         for (int w = 0; w < MINING_JUMP2_BATCH_MAX; w++) {
             mpz_init(fused_fl[f].wins[w].window_base);
@@ -3161,17 +3179,31 @@ void *worker_thread_run_crt(void *arg) {
     /* Default 512 (was 128 until 2026-09-18; 128 was raised from 64 on
        2026-09-17).  Measured on the quiet dev GPU, 1 thread, fused chain,
        chunk 32, 45 s runs: shift512 5264 (K=128) -> 6113 (K=256) -> 6725
-       win/s (K=512); shift1017 1498 -> 1788 -> 2014 win/s.  Each step is
-       parity-verified with the sliced verifier (K=256: 214/67 flights;
-       K=512: 123 flights at shift512; all bad_windows=0 bad_pairs=0).
+       win/s (K=512); shift1017 1498 -> 1788 -> 2014 win/s.  Re-measured
+       2026-09-19 at the current chunk 12, shift507 p74_lex_m30, 2 workers,
+       100 s arms: 7053 (K=128) -> 9773 (K=256) -> 11192 win/s (K=512) at an
+       UNCHANGED 79.6 MR tests/window -- K grows the MR batch at no extra MR
+       cost, and batch fullness (not the per-round latency) is what feeds the
+       GPU: 1 worker at K=1024 (8434) beats 2 workers at K=128 (7053).  Each
+       step is parity-verified with the sliced verifier (K=256: 214/67
+       flights; K=512: 123 flights at shift512; all bad_windows=0
+       bad_pairs=0).
        VRAM: the sieve sizes its candidate buffers as 2 x odd_interval_size x K
        x limbs x 8 B, so the flight batch costs device memory linearly --
        shift512 K=512 ~1.6 GB, shift1017 K=512 ~4.6 GB (measured 5.6/8 GB used
-       with the adapter).  Lower MINING_JUMP2_BATCH (256 -> ~2.3 GB at
-       shift1017) on cards without that much free memory; if an allocation
-       fails the extract fails closed and the worker drops to the slow CPU
-       path, so an oversize K is never a correctness risk. */
-    int mining_jump2_batch = 512;
+       with the adapter), shift509 K=512 with 2 workers 4.9 GB.  K=1024 with 2
+       workers therefore fails cudaMalloc even at shift507 on an 8 GB card and
+       the worker fails closed to the CPU sieve (~19 win/s), which is why the
+       cap below is only raised for 12 GB cards; lower MINING_JUMP2_BATCH
+       (256 -> ~2.3 GB at shift1017) on cards without that much free memory.
+       An oversize K is never a correctness risk, only a throughput one.
+
+       DEFAULT 2048 since 2026-09-21 (was 512): with the candidate buffers
+       right-sized to the measured survivor density (GPU_EXTRACT_CAND_CAP)
+       K=2048 measured **+7.9%** over K=512 (12,398 vs 11,490 win/s, ABBA,
+       shift507 p74_lex_m30, 2 workers, chunk 12) and K=4096 is saturated
+       (11,963/11,623).  The clamp below then sizes it down to the card. */
+    int mining_jump2_batch = 2048;
     {
         const char *mb = getenv("MINING_JUMP2_BATCH");
         if (mb && *mb) {
@@ -3196,6 +3228,57 @@ void *worker_thread_run_crt(void *arg) {
     if (gpu && gpu_sieve && worker_env_enabled(fused_env)) {
         fused_fermat = gpu_adapter_get_fermat_ctx(gpu);
         if (fused_fermat) {
+            /* Size K to the CARD, not to a constant.  The candidate buffers
+               dominate VRAM and their need is known exactly before the first
+               allocation: 2 x cap x K x limbs x 8 B (AoS ping-pong) +
+               cap x K x 8 B (offsets), with cap from the same density rule
+               the sieve will apply.  An oversize K is not a correctness risk
+               but a throughput one (cudaMalloc fails and the worker falls
+               closed to the CPU sieve, ~600x slower), so halve until it fits
+               and say so instead of letting the default break on a smaller
+               card or a higher shift. */
+            if (mining_jump2 && gpu_limbs > 0) {
+                uint64_t mj2_oi = ((uint64_t)max_interval + 1U) >> 1;
+                uint64_t cap_est = gpu_sieve_cand_cap_estimate(mj2_oi);
+                uint64_t per_k = cap_est *
+                                 (2U * (uint64_t)gpu_limbs * 8U + 8U);
+                size_t vfree = 0;
+                size_t reserve = (size_t)256U << 20;
+                if (per_k > 0 &&
+                    gpu_sieve_mem_info(gpu_sieve, &vfree, NULL) == 0 &&
+                    vfree > reserve) {
+                    /* Each worker plans for its SHARE of the card: the big
+                       allocations happen later (at the first extract), so
+                       every peer sees the same free number at init and would
+                       otherwise each plan for all of it.  Round-robin device
+                       assignment (worker i -> device i % gpu_count) makes the
+                       peer count ceil(nthreads / gpu_count). */
+                    int ndev = gpu_adapter_device_count();
+                    if (ndev < 1) ndev = 1;
+                    uint32_t peers = (config->nthreads + (uint32_t)ndev - 1) /
+                                     (uint32_t)ndev;
+                    if (peers < 1) peers = 1;
+                    size_t avail = (vfree - reserve) / (size_t)peers;
+                    int fit = mining_jump2_batch;
+                    while (fit > 256 && (uint64_t)fit > avail / per_k)
+                        fit /= 2;
+                    if (fit != mining_jump2_batch) {
+                        fprintf(stderr,
+                                "[Worker %u] MINING_JUMP2_BATCH %d -> %d "
+                                "(candidate buffers need %.0f MiB at K=%d "
+                                "but only %.0f MiB is free); free VRAM or "
+                                "use a card with more memory for the larger "
+                                "batch\n",
+                                worker_id, mining_jump2_batch, fit,
+                                (double)(per_k *
+                                         (uint64_t)mining_jump2_batch) /
+                                    (1024.0 * 1024.0),
+                                mining_jump2_batch,
+                                (double)vfree / (1024.0 * 1024.0));
+                        mining_jump2_batch = fit;
+                    }
+                }
+            }
             if (mining_jump2 &&
                 gpu_fermat_gather_alloc(
                     fused_fermat, (uint32_t)mining_jump2_batch,
@@ -3275,6 +3358,16 @@ void *worker_thread_run_crt(void *arg) {
                             mining_jump2_verify ? "on" : "off");
                 }
             } else {
+                fprintf(stderr,
+                        "[Worker %u] Fused GPU pipeline disabled: host flight "
+                        "arrays for K=%d windows need %.0f MiB (candidate "
+                        "capacity %llu x K); lower MINING_JUMP2_BATCH or free "
+                        "RAM.  Falling back to the non-fused path (much "
+                        "slower)\n",
+                        worker_id, flight_batch,
+                        (double)(cap * (sizeof(uint64_t) * 2 + 2)) /
+                            (1024.0 * 1024.0),
+                        (unsigned long long)sieve.candidate_capacity);
                 free(fused_slot_offsets);
                 free(fused_sorted_offsets);
                 free(fused_is_prime[0]);
@@ -4001,6 +4094,7 @@ void *worker_thread_run_crt(void *arg) {
             mpz_clear(fused_fl[f].wins[w].nadd0);
         }
     }
+    free(fused_fl);
     if (gpu) gpu_adapter_free(gpu);
 #endif
     mpz_clears(base, nadd0, candidate, p1, p2, nadd_full, window_base,

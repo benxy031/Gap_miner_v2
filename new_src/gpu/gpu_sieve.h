@@ -213,6 +213,19 @@ uint64_t *gpu_sieve_pingpong_bitmap(gpu_sieve_ctx *ctx, int buf);
 /* Size the extract candidate buffers for K-window MR batch accumulation. */
 void gpu_sieve_set_extract_accum(gpu_sieve_ctx *ctx, uint32_t k);
 
+/* Per-window candidate capacity the extract buffers start with for a given
+   window geometry (max(4096, odd_interval/8), capped at the odd interval).
+   The buffers hold SURVIVORS, not one slot per odd position, and the capacity
+   is right-sized/grown at run time - use this only to budget or report VRAM
+   up front.  Overridable with GPU_EXTRACT_CAND_CAP. */
+uint64_t gpu_sieve_cand_cap_estimate(uint64_t max_odd_interval);
+
+/* Free/total device memory in bytes on the context's device (0 on success,
+   -1 on failure).  Used to size GPU_MR_BATCH/MINING_JUMP2_BATCH/GAP_HUNT_BATCH
+   to the card at start-up instead of trusting a constant. */
+int gpu_sieve_mem_info(gpu_sieve_ctx *ctx, size_t *free_bytes,
+                       size_t *total_bytes);
+
 /* Device AoS candidate buffer of ping-pong buf (0/1). */
 uint64_t *gpu_sieve_candidate_buffer(gpu_sieve_ctx *ctx, int buf);
 

@@ -160,9 +160,12 @@ static int load_state(const char *path, uint64_t *k, mpz_t last_prime,
    lever left on this walk -- GAP_HUNT_TIMING shows MR = 85% of the window at
    shift998/AL=20 and the MR rate TRACKS the per-round batch, so more windows per
    round means a fuller batch and a faster MR stage.  The cap is what limited it:
-   VRAM at shift998 is 14.4 MiB per window (both buffers), so an 8 GB card is
-   already at its edge with K=512 (7.4 GB) while a 12 GB card fits K=640 (~9.2 GB)
-   comfortably and K=768 (~11.1 GB) tightly.  K<=512 behaves exactly as before. */
+   VRAM was 14.4 MiB per window (both buffers) while the buffers were sized for
+   the pathological "every odd slot is a survivor" case -- MEASURED 2026-09-21
+   with the candidate buffers right-sized (see GPU_EXTRACT_CAND_CAP): the same
+   K=512 at shift998 now costs ~0.7 GB instead of ~7.4 GB, the walk runs at
+   **1010 win/s vs 773 at K=128 (+30.7%, ABBA 40 s arms, dev 3070)** and it is no
+   longer refused by an 8 GB card at all.  K<=512 behaves exactly as before. */
 #define GAP_HUNT_BATCH_MAX 1024
 /* Default 512 (was 64; the ~4 ms per-LAUNCH floor of a chain round is amortized
    over the windows sharing it).  Doubling history: 32 -> 64 was +21% (shift1017
@@ -171,15 +174,16 @@ static int load_state(const char *path, uint64_t *k, mpz_t last_prime,
    min-merit 19, fixed k range, emitted sets identical): shift507 2452 (K=64)
    -> 3156 (128) -> 3601 (256) -> **3824 win/s (512) = +56%**; shift1017 881
    (128) -> 1001 (256) -> **1172 win/s (512) = +33%**.
-   Device cost is `2 x odd_interval_size x K x limbs x 8 B` -- the walk banner
-   prints `vram_est=<MB>` for the configured K: shift507 K=512 ~2.4 GB, shift1017
-   K=512 **6407 MB** by the banner and ~7.3/8 GB actually used (sieve contexts +
-   adapter + display on top), i.e. at high shift K=512 is at the edge of an 8 GB
-   card.  Check `vram_est` against nvidia-smi and set GAP_HUNT_BATCH=256 (~half)
-   where it does not fit; a 12 GB card takes K=512 with room to spare.  An
-   allocation failure is visible ("gpu_sieve: cands[0] alloc: out of memory") and
-   stops the walk; it never falls back silently to a slower path. */
-static int g_batch = 512;      /* GAP_HUNT_BATCH env, clamped 1..MAX */
+   Device cost is now `2 x cand_cap_per_window x K x limbs x 8 B` where the
+   capacity is the MEASURED survivor density (max(4096, odd_interval/8) at the
+   first window, then 4x the measured count), i.e. ~0.7 GB at shift998 K=512 and
+   ~1.4 GB at K=1024 -- the walk banner prints `vram_est=<MB>` with this rule.
+   Before the 2026-09-21 right-sizing it was one slot per odd position, which is
+   why the old banner reported 6.4-7.7 GB at K=512 and why K>512 was refused on
+   8 GB cards.  An allocation failure is still visible ("gpu_sieve: cands[0]
+   alloc: out of memory") and stops the walk; it never falls back silently to a
+   slower path. */
+static int g_batch = 1024;     /* GAP_HUNT_BATCH env, clamped 1..MAX */
 static int g_quarter = 0;      /* GAP_HUNT_QUARTER env: 4-visible-class scan */
 static uint64_t g_kmax = 0;    /* GAP_HUNT_KMAX env: stop hook (tests/bench) */
 /* Per-window chain-pair capacity in jump/jump2 mode. RAISED 16 -> 64 -> 128 on
@@ -1138,6 +1142,39 @@ int gap_hunt_run(const struct gap_hunt_config *cfg) {
         crt_runtime_free(&rt);
         return 1;
     }
+    /* Size the batch to the CARD (same policy as the mining chain): the
+       candidate buffers cost 2 x cap x K x limbs x 8 B + cap x K x 8 B with
+       cap from the measured-density rule, and the old one-slot-per-odd-position
+       sizing is what used to refuse K=512 on an 8 GB card.  Halving to fit
+       beats a cudaMalloc failure, which stops the walk (and beats the old
+       "lower GAP_HUNT_BATCH by hand" advice).  DEFAULT 1024 since 2026-09-21
+       (was 512): measured on the dev 3070 at shift998 p128_covermax_m40,
+       min-merit 20, ABBA 40 s arms: K=128 773 win/s -> K=512 971-1019 ->
+       **K=1024 1025 win/s (+32.5%)**. */
+    if (gpu_limbs > 0) {
+        uint64_t cap_est = gpu_sieve_cand_cap_estimate(odd_interval_size);
+        uint64_t per_k = cap_est * (2U * (uint64_t)gpu_limbs * 8U + 8U);
+        size_t vfree = 0;
+        size_t reserve = (size_t)256U << 20;
+        if (per_k > 0 && gpu_sieve_mem_info(gpu_sieve, &vfree, NULL) == 0 &&
+            vfree > reserve) {
+            size_t avail = vfree - reserve;
+            int fit = g_batch;
+            while (fit > 128 && (uint64_t)fit > avail / per_k)
+                fit /= 2;
+            if (fit != g_batch) {
+                fprintf(stderr,
+                        "[GAP_HUNT] GAP_HUNT_BATCH %d -> %d (candidate "
+                        "buffers need %.0f MiB at K=%d but only %.0f MiB is "
+                        "free)\n",
+                        g_batch, fit,
+                        (double)(per_k * (uint64_t)g_batch) /
+                            (1024.0 * 1024.0),
+                        g_batch, (double)vfree / (1024.0 * 1024.0));
+                g_batch = fit;
+            }
+        }
+    }
     gpu_sieve_set_extract_accum(gpu_sieve, (uint32_t)g_batch);
     if (g_jump) {
         if (gpu_fermat_jump_alloc(fermat, (uint32_t)g_batch,
@@ -1268,7 +1305,15 @@ int gap_hunt_run(const struct gap_hunt_config *cfg) {
             (double)mpz_sizeinbase(P, 2),
             (unsigned long long)rt.window, sieve_primes, g_batch,
             (unsigned long long)cap_real, (unsigned long long)cum_cap,
-            (unsigned long long)(2U * odd_interval_size * (uint64_t)g_batch *
+            /* Real candidate-buffer cost: the buffers hold SURVIVORS, and the
+               sieve sizes them from the measured density (max(4096,
+               odd_interval/8) at the first window, then 4x the measured
+               count), not one slot per odd position.  The old formula here
+               over-estimated by ~8x, which mattered operationally: it is what
+               told the fleet not to stack a second walker. */
+            (unsigned long long)(2U *
+                                 gpu_sieve_cand_cap_estimate(odd_interval_size) *
+                                 (uint64_t)g_batch *
                                  (uint64_t)gpu_fermat_get_limbs(fermat) * 8U /
                                  1000000U),
             g_quarter,

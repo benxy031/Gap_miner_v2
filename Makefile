@@ -114,6 +114,7 @@ TEST_GAP_HUNT = $(BIN_DIR)/test_gap_hunt
 TEST_STRATUM = $(BIN_DIR)/test_stratum
 BENCH_FERMAT = $(BIN_DIR)/bench_fermat
 BENCH_MARK = $(BIN_DIR)/bench_mark
+CUDA_INT = $(BIN_DIR)/cuda_int_throughput
 COVER_MAX = $(BIN_DIR)/cover_max
 
 # Phony targets
@@ -211,6 +212,14 @@ $(BENCH_FERMAT): $(OBJECTS) $(BUILD_DIR)/tools/bench_fermat.o | $(BIN_DIR)
 # Standalone TU (does not link the miner objects); needs nvcc.
 $(BENCH_MARK): $(BUILD_DIR)/tools/bench_mark.o | $(BIN_DIR)
 	$(NVCC) $(BUILD_DIR)/tools/bench_mark.o -L$(CUDA_LIBDIR) -lcudart -lm -o $@
+	@echo "✓ Built: $@"
+
+# GPU integer-arithmetic ceiling microbenchmark (dev tool, CUDA only): the
+# retire rates of IMAD / 64-bit mul / mul64hi / __dp4a / int8 m16n8k16, each
+# cross-checked against wall clock and (by hand) against the device limits.
+# Feeds scripts/arith_ceiling.py.  Build: make bin/cuda_int_throughput WITH_CUDA=1
+$(CUDA_INT): $(BUILD_DIR)/tools/cuda_int_throughput.o | $(BIN_DIR)
+	$(NVCC) $(BUILD_DIR)/tools/cuda_int_throughput.o -L$(CUDA_LIBDIR) -lcudart -lm -o $@
 	@echo "✓ Built: $@"
 
 $(BUILD_DIR)/tools/%.o: tools/%.cu | $(BUILD_DIR)

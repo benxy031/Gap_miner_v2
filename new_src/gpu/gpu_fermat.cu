@@ -857,6 +857,31 @@ static __host__ __forceinline__ int gpu_fermat_cgbn_soa_enabled()
     return enabled;
 }
 
+/* Measurement hook (documented in the README env table): GPU_FERMAT_NO_CGBN=1
+   forces the SCALAR Montgomery path even where CGBN is available, so the two
+   arithmetic backends can be A/B'd at the same size from the same binary.
+   They are not comparable by limb count alone: the CGBN path runs TPI threads
+   per candidate (8 at AL=12..20, i.e. 1-3 limbs per thread plus inter-thread
+   carries) while the scalar path keeps all AL limbs in one thread's registers.
+   This is the only way to settle "is CGBN the right backend" with a number
+   instead of an assumption.  Default off. */
+static __host__ __forceinline__ int gpu_fermat_no_cgbn(void)
+{
+    static int initialized = 0;
+    static int disabled = 0;
+    if (!initialized) {
+        const char *env = getenv("GPU_FERMAT_NO_CGBN");
+        if (env && *env && *env != '0' && *env != 'n' && *env != 'N' &&
+            *env != 'f' && *env != 'F') {
+            disabled = 1;
+            fprintf(stderr, "GPU Fermat: CGBN DISABLED by GPU_FERMAT_NO_CGBN "
+                            "-> scalar Montgomery path (measurement only)\n");
+        }
+        initialized = 1;
+    }
+    return disabled;
+}
+
 /* ── Kernel dispatch: launch the narrowest specialization that fits ──
    Candidates are stored at active_limbs stride, and the kernel
    operates on AL limbs.  Speedup ≈ (NL/AL)² from Montgomery mul.
@@ -966,6 +991,7 @@ static cudaError_t launch_fermat(int al, cudaStream_t stream,
         static int cgbn_logged = 0;
         static int tpi_override = -2;  /* -2 unparsed, -1 none, else 4/8/16/32 */
 
+        if (!gpu_fermat_no_cgbn()) {
         if (tpi_override == -2) {
             const char *env = getenv("GPU_FERMAT_TPI");
             tpi_override = -1;
@@ -1036,6 +1062,7 @@ static cudaError_t launch_fermat(int al, cudaStream_t stream,
         }
         #undef CGBN_DISP_WIDE
         #undef CGBN_LAUNCH
+        }   /* end if (!gpu_fermat_no_cgbn()) */
     }
 #endif
 
@@ -1349,7 +1376,7 @@ static int gpu_fermat_submit_locked(gpu_fermat_ctx *ctx, int slot,
     if (err != cudaSuccess) return -1;
 
     int active_limbs = __atomic_load_n(&ctx->active_limbs, __ATOMIC_RELAXED);
-    int cgbn_path = cgbn_supports_al(active_limbs);
+    int cgbn_path = gpu_fermat_no_cgbn() ? 0 : cgbn_supports_al(active_limbs);
     int use_soa_scalar = !cgbn_path;
     int use_soa_cgbn = cgbn_path && gpu_fermat_cgbn_soa_enabled();
     int use_soa_layout = use_soa_scalar || use_soa_cgbn;

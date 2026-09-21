@@ -154,8 +154,16 @@ static int load_state(const char *path, uint64_t *k, mpz_t last_prime,
    mode-aware cum bound (see the guard in gap_hunt_run) the chain path -- the
    fleet default -- is no longer limited by the MR context cap, because it
    never submits the window-major head batch (it gathers K x chunk candidates
-   per round).  The plain path keeps the MR-cap bound and is auto-reduced. */
-#define GAP_HUNT_BATCH_MAX 512
+   per round).  The plain path keeps the MR-cap bound and is auto-reduced.
+   Cap raised 512 -> 1024 (2026-09-21): the measured K scaling had NOT flattened
+   at 512 (shift1017 881 (128) -> 1001 (256) -> 1172 (512), +33%), and K is the one
+   lever left on this walk -- GAP_HUNT_TIMING shows MR = 85% of the window at
+   shift998/AL=20 and the MR rate TRACKS the per-round batch, so more windows per
+   round means a fuller batch and a faster MR stage.  The cap is what limited it:
+   VRAM at shift998 is 14.4 MiB per window (both buffers), so an 8 GB card is
+   already at its edge with K=512 (7.4 GB) while a 12 GB card fits K=640 (~9.2 GB)
+   comfortably and K=768 (~11.1 GB) tightly.  K<=512 behaves exactly as before. */
+#define GAP_HUNT_BATCH_MAX 1024
 /* Default 512 (was 64; the ~4 ms per-LAUNCH floor of a chain round is amortized
    over the windows sharing it).  Doubling history: 32 -> 64 was +21% (shift1017
    559 -> 679 win/s) and +28% (shift507 1876 -> 2406 win/s); re-measured

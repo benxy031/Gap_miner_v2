@@ -520,6 +520,252 @@ __global__ void fermat_kernel_soa_t(const uint64_t * __restrict__ cands_soa,
 }
 
 /* ═══════════════════════════════════════════════════════════════════
+ *  CIOS 32-bit-limb Miller-Rabin kernel — GPU_MR_KERNEL=cios
+ *
+ *  Shape: ONE THREAD PER CANDIDATE, all limbs in registers, no shuffles, no
+ *  barriers, no shared memory.  A warp therefore carries 32 independent
+ *  candidates in lockstep instead of CGBN TPI=8's 4, and occupancy (registers
+ *  only) sets how many chains are in flight.
+ *
+ *  Measured on the RTX 3070 (standalone harness tools/bench_cios_mr.cu,
+ *  GMP-validated on primes, composites and top-bit-clear 762-bit candidates):
+ *  1.73M cand/s at 768-bit vs CGBN TPI=8's 1.39M (~1.25x), and CGBN loses more
+ *  at the small batches the chain actually uses (0.96M at a 2048 batch).
+ *
+ *  Registered widths: 2*AL for AL in {5,6,12}; 24 x 32-bit limbs is the
+ *  practical register limit at the 8-blocks/SM target set by __launch_bounds__.
+ *
+ *  CORRECTNESS TRAP (the one real one): Mont(1) = R mod n = 2^(32*N32) mod n
+ *  must NOT be computed as 2^(32*N32) - n.  That shortcut only holds when
+ *  n >= 2^(32*N32 - 1); production candidates at shift 507 are 763-bit inside
+ *  a 768-bit stride (top limb partly zero), where it is simply wrong.  Exact
+ *  route: b = bitlength(n); R0 = 2^b - n (limb-wise subtract, no borrow
+ *  ambiguity); then (32*N32 - b) doublings -> 5 doublings in production.
+ * ═══════════════════════════════════════════════════════════════════ */
+
+/* r = a * b * R^-1 mod n  (CIOS, Coarsely Integrated Operand Scanning).
+   r may alias a and/or b: it is written only at the end. */
+template<int N32>
+__device__ static __forceinline__
+void cios_mont_mul(uint32_t *__restrict__ r, const uint32_t *__restrict__ a,
+                   const uint32_t *__restrict__ b,
+                   const uint32_t *__restrict__ n, uint32_t n0inv)
+{
+    uint32_t t[N32 + 2];
+#pragma unroll
+    for (int i = 0; i < N32 + 2; i++) t[i] = 0U;
+
+#pragma unroll
+    for (int i = 0; i < N32; i++) {
+        uint64_t c = 0;
+        const uint64_t bi = (uint64_t)b[i];
+#pragma unroll
+        for (int j = 0; j < N32; j++) {
+            uint64_t p = (uint64_t)a[j] * bi + (uint64_t)t[j] + c;
+            t[j] = (uint32_t)p;
+            c = p >> 32;
+        }
+        uint64_t s  = (uint64_t)t[N32] + c;
+        uint64_t s2 = (uint64_t)t[N32 + 1] + (s >> 32);
+        t[N32]     = (uint32_t)s;
+        t[N32 + 1] = (uint32_t)s2;
+
+        uint32_t m = t[0] * n0inv;                 /* mod 2^32 by truncation */
+        c = ((uint64_t)t[0] + (uint64_t)m * (uint64_t)n[0]) >> 32;
+#pragma unroll
+        for (int j = 1; j < N32; j++) {
+            uint64_t p = (uint64_t)m * (uint64_t)n[j] + (uint64_t)t[j] + c;
+            t[j - 1] = (uint32_t)p;
+            c = p >> 32;
+        }
+        uint64_t s3 = (uint64_t)t[N32] + c;
+        t[N32 - 1] = (uint32_t)s3;
+        t[N32]     = (uint32_t)((uint64_t)t[N32 + 1] + (s3 >> 32));
+        t[N32 + 1] = 0U;
+    }
+
+    /* result may be in [n, 2n): one conditional subtraction */
+    uint32_t borrow = 0;
+    uint32_t sub[N32];
+#pragma unroll
+    for (int j = 0; j < N32; j++) {
+        uint64_t d = (uint64_t)t[j] - (uint64_t)n[j] - (uint64_t)borrow;
+        sub[j] = (uint32_t)d;
+        borrow = (uint32_t)((d >> 32) & 1ULL);
+    }
+    const int need = (t[N32] != 0U) | (borrow == 0U);
+#pragma unroll
+    for (int j = 0; j < N32; j++) r[j] = need ? sub[j] : t[j];
+}
+
+/* r = 2*a mod n (one add + one conditional subtract) */
+template<int N32>
+__device__ static __forceinline__
+void cios_dbl_mod(uint32_t *__restrict__ r, const uint32_t *__restrict__ a,
+                  const uint32_t *__restrict__ n)
+{
+    uint32_t c = 0, t[N32];
+#pragma unroll
+    for (int j = 0; j < N32; j++) {
+        uint64_t s = (uint64_t)a[j] * 2ULL + (uint64_t)c;
+        t[j] = (uint32_t)s;
+        c = (uint32_t)(s >> 32);
+    }
+    uint32_t borrow = 0, sub[N32];
+#pragma unroll
+    for (int j = 0; j < N32; j++) {
+        uint64_t d = (uint64_t)t[j] - (uint64_t)n[j] - (uint64_t)borrow;
+        sub[j] = (uint32_t)d;
+        borrow = (uint32_t)((d >> 32) & 1ULL);
+    }
+    const int need = (c != 0U) | (borrow == 0U);
+#pragma unroll
+    for (int j = 0; j < N32; j++) r[j] = need ? sub[j] : t[j];
+}
+
+/* Base-2 strong probable-prime test.  1 = probable prime, 0 = composite.
+   n-1 = 2^s * d; y = 2^d in Montgomery form; then up to s-1 squarings looking
+   for -1.  Multiplication by the base 2 is a doubling in Montgomery form, so
+   the set exponent bits cost an add instead of a full Montgomery multiply. */
+template<int N32>
+__device__ static __forceinline__
+int cios_mr_base2(const uint32_t *__restrict__ nin)
+{
+    uint32_t n[N32], one[N32], neg[N32], y[N32], dsh[N32], nm1[N32];
+    uint32_t n0inv = 1U;
+#pragma unroll
+    for (int k = 0; k < 5; k++) n0inv = n0inv * (2U - nin[0] * n0inv);
+    n0inv = (uint32_t)(0U - n0inv);              /* n0inv = -n^-1 mod 2^32 */
+#pragma unroll
+    for (int j = 0; j < N32; j++) n[j] = nin[j];
+
+    /* ONE = R mod n, exact for every n < 2^(32*N32) (see the trap note above) */
+    int b = 0;
+#pragma unroll
+    for (int j = N32 - 1; j >= 0; j--) {
+        if (b == 0 && n[j] != 0U) b = j * 32 + (32 - __clz(n[j]));
+    }
+    {
+        uint32_t borrow = 0;
+#pragma unroll
+        for (int j = 0; j < N32; j++) {
+            uint32_t v = (b < N32 * 32 && j == (b >> 5)) ? (1U << (b & 31)) : 0U;
+            uint64_t d = (uint64_t)v - (uint64_t)n[j] - (uint64_t)borrow;
+            one[j] = (uint32_t)d;
+            borrow = (uint32_t)((d >> 32) & 1ULL);
+        }
+    }
+#pragma unroll 1
+    for (int i = b; i < N32 * 32; i++) cios_dbl_mod<N32>(one, one, n);
+
+    /* neg = n - one = Mont(n-1) */
+    {
+        uint32_t borrow = 0;
+#pragma unroll
+        for (int j = 0; j < N32; j++) {
+            uint64_t d = (uint64_t)n[j] - (uint64_t)one[j] - (uint64_t)borrow;
+            neg[j] = (uint32_t)d;
+            borrow = (uint32_t)((d >> 32) & 1ULL);
+        }
+    }
+
+    /* d = (n-1) >> s */
+    {
+        uint32_t borrow = 0;
+        uint64_t d0 = (uint64_t)n[0] - 1ULL;
+        nm1[0] = (uint32_t)d0;
+        borrow = (uint32_t)((d0 >> 32) & 1ULL);
+#pragma unroll
+        for (int j = 1; j < N32; j++) {
+            uint64_t dd = (uint64_t)n[j] - (uint64_t)borrow;
+            nm1[j] = (uint32_t)dd;
+            borrow = (uint32_t)((dd >> 32) & 1ULL);
+        }
+    }
+    int s = 0;
+    {
+        int j = 0;
+        while (j < N32 && nm1[j] == 0U) { s += 32; j++; }
+        if (j < N32) {
+            uint32_t w = nm1[j];
+            while ((w & 1U) == 0U) { w >>= 1; s++; }
+        }
+    }
+    {
+        const int sh = s & 31, wi = s >> 5;
+#pragma unroll
+        for (int j = 0; j < N32; j++) {
+            uint32_t lo = (j + wi     < N32) ? nm1[j + wi]     : 0U;
+            uint32_t hi = (j + wi + 1 < N32) ? nm1[j + wi + 1] : 0U;
+            dsh[j] = (sh == 0) ? lo : (uint32_t)((lo >> sh) | (hi << (32 - sh)));
+        }
+    }
+    int dbits = N32 * 32 - s;
+    while (dbits > 0 &&
+           ((dsh[(dbits - 1) >> 5] >> ((dbits - 1) & 31)) & 1U) == 0U)
+        dbits--;
+
+    cios_dbl_mod<N32>(y, one, n);                /* y = Mont(2) */
+    for (int bit = dbits - 2; bit >= 0; bit--) {
+        cios_mont_mul<N32>(y, y, y, n, n0inv);   /* square (in place) */
+        if ((dsh[bit >> 5] >> (bit & 31)) & 1U)
+            cios_dbl_mod<N32>(y, y, n);          /* x Mont(2) == x*2 */
+    }
+    int is_one = 1, is_neg = 1;
+#pragma unroll
+    for (int j = 0; j < N32; j++) {
+        if (y[j] != one[j]) is_one = 0;
+        if (y[j] != neg[j]) is_neg = 0;
+    }
+    if (is_one || is_neg) return 1;
+    for (int i = 1; i < s; i++) {
+        cios_mont_mul<N32>(y, y, y, n, n0inv);
+        int got_neg = 1;
+#pragma unroll
+        for (int j = 0; j < N32; j++)
+            if (y[j] != neg[j]) got_neg = 0;
+        if (got_neg) return 1;
+        int got_one = 1;
+#pragma unroll
+        for (int j = 0; j < N32; j++)
+            if (y[j] != one[j]) got_one = 0;
+        if (got_one) return 0;
+    }
+    return 0;
+}
+
+/* SOA: cands_soa[(word * count) + idx]; AoS: cands[idx * words + word].
+   64-bit words hold two little-endian 32-bit limbs. */
+template<int N32, bool SOA>
+__global__ void __launch_bounds__(64, 8)
+cios_fermat_kernel(const uint64_t *__restrict__ cands,
+                   const uint64_t *__restrict__ cands_soa,
+                   uint8_t *__restrict__ results,
+                   uint32_t count)
+{
+    const uint32_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= count) return;
+    const int words = N32 / 2;
+    uint32_t n[N32];
+    if (SOA) {
+        for (int i = 0; i < words; i++) {
+            uint64_t w = __ldg(&cands_soa[(size_t)i * (size_t)count + idx]);
+            n[2 * i]     = (uint32_t)w;
+            n[2 * i + 1] = (uint32_t)(w >> 32);
+        }
+    } else {
+        const uint64_t *src = &cands[(size_t)idx * (size_t)words];
+        for (int i = 0; i < words; i++) {
+            uint64_t w = __ldg(&src[i]);
+            n[2 * i]     = (uint32_t)w;
+            n[2 * i + 1] = (uint32_t)(w >> 32);
+        }
+    }
+    if ((n[0] & 1U) == 0U) { results[idx] = 0; return; }
+    results[idx] = (uint8_t)cios_mr_base2<N32>(n);
+}
+
+/* ═══════════════════════════════════════════════════════════════════
  *  CGBN-based Fermat kernel: template<BITS, TPI> covers all even AL.
  *
  *  Enabled with: make WITH_CGBN_FERMAT=1 ...
@@ -974,6 +1220,40 @@ static __host__ __forceinline__ int cgbn_supports_al(int al)
 #endif
 }
 
+/* Measurement hook (documented in the README env table): GPU_MR_KERNEL=cios
+   selects the 32-bit CIOS single-thread-per-candidate MR kernel for the AL
+   values it has instantiations for.  Anything else (unset, "cgbn", typos)
+   keeps the CGBN/scalar default, so rollback is just unsetting the variable. */
+enum { GPU_MR_KERNEL_DEFAULT = 0, GPU_MR_KERNEL_CIOS = 1 };
+
+static __host__ __forceinline__ int gpu_fermat_mr_kernel(void)
+{
+    static int cached = -1;
+    if (cached >= 0) return cached;
+    int v = GPU_MR_KERNEL_DEFAULT;
+    const char *env = getenv("GPU_MR_KERNEL");
+    if (env && (env[0] == 'c' || env[0] == 'C') &&
+        (env[1] == 'i' || env[1] == 'I'))
+        v = GPU_MR_KERNEL_CIOS;
+    cached = v;
+    return v;
+}
+
+/* AL values with a cios_fermat_kernel instantiation (N32 = 2*AL limbs of
+   32 bits).  AL=20 (1280-bit) needs 40 limbs and does not fit the register
+   budget, so it stays on CGBN. */
+static __host__ __forceinline__ int cios_supports_al(int al)
+{
+    switch (al) {
+    case 5:  /* 320-bit -> 10 x 32-bit limbs  */
+    case 6:  /* 384-bit -> 12 x 32-bit limbs  */
+    case 12: /* 768-bit -> 24 x 32-bit limbs  */
+        return 1;
+    default:
+        return 0;
+    }
+}
+
 static cudaError_t launch_fermat(int al, cudaStream_t stream,
                                  const uint64_t *d_cands,
                                  const uint64_t *d_cands_soa,
@@ -981,6 +1261,36 @@ static cudaError_t launch_fermat(int al, cudaStream_t stream,
                                  uint32_t count,
                                  int use_soa_layout)
 {
+    /* CIOS 32-bit kernel (opt-in, AL 5/6/12): one thread per candidate, no
+       shuffles/barriers.  Any other AL falls through to CGBN/scalar below,
+       so this cannot regress shifts whose width has no instantiation. */
+    if (gpu_fermat_mr_kernel() == GPU_MR_KERNEL_CIOS && cios_supports_al(al)) {
+        static int cios_logged = 0;
+        #define CIOS_LAUNCH(N32_VAL) \
+            do { \
+                const int tpb = 64; \
+                int grid = (int)((count + (uint32_t)tpb - 1u) / (uint32_t)tpb); \
+                if (!__atomic_exchange_n(&cios_logged, 1, __ATOMIC_RELAXED)) \
+                    fprintf(stderr, "GPU Fermat: CIOS kernel active " \
+                            "(AL=%d, %d-bit, %d x 32-bit limbs, " \
+                            "1 thread/candidate)\n", \
+                            (al), (al) * 64, (N32_VAL)); \
+                if (use_soa_layout) \
+                    cios_fermat_kernel<(N32_VAL), true><<<grid, tpb, 0, stream>>>( \
+                        NULL, d_cands_soa, d_results, count); \
+                else \
+                    cios_fermat_kernel<(N32_VAL), false><<<grid, tpb, 0, stream>>>( \
+                        d_cands, NULL, d_results, count); \
+                return cudaPeekAtLastError(); \
+            } while (0)
+        switch (al) {
+        case 5:  CIOS_LAUNCH(10); break;
+        case 6:  CIOS_LAUNCH(12); break;
+        case 12: CIOS_LAUNCH(24); break;
+        default: break;   /* unreachable: guarded by cios_supports_al */
+        }
+        #undef CIOS_LAUNCH
+    }
 #if defined(CGBN_FERMAT_AVAILABLE)
     /* CGBN dispatch for even AL values.
        TPI=8 for AL%4==0, TPI=4 for AL%2==0 (largest power-of-2 ≤ 8 dividing 2×AL).
@@ -1725,6 +2035,13 @@ int gpu_fermat_cgbn_supports_limbs(int limbs)
 const char *gpu_fermat_kernel_label(int limbs)
 {
     if (limbs < 1 || limbs > NL) return "";
+    if (gpu_fermat_mr_kernel() == GPU_MR_KERNEL_CIOS && cios_supports_al(limbs)) {
+        static char cios_buf[96];
+        snprintf(cios_buf, sizeof(cios_buf),
+                 "CIOS 32-bit (%d-bit, %d x 32-bit limbs, 1 thread/cand)",
+                 limbs * 64, limbs * 2);
+        return cios_buf;
+    }
     if (cgbn_supports_al(limbs)) {
         int tpi = ((limbs % 4) == 0) ? 8 : 4;
         switch (limbs) {

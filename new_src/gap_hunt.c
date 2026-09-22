@@ -1374,8 +1374,11 @@ int gap_hunt_run(const struct gap_hunt_config *cfg) {
         acc_mr_prev = gpu_fermat_accounted_us(fermat);
     }
 
-    /* Two alternating flights (fermat slots 0/1). */
-    struct gh_batch A, B;
+    /* Two alternating flights (fermat slots 0/1).  STATIC, not stack: with
+       GAP_HUNT_BATCH_MAX=4096 each struct is ~12 MB (jump_s/jump_e/jump_gaps
+       are [MAX][GAP_HUNT_JUMP_CAP]) and the default 8 MB thread stack would
+       overflow.  One walker per process, so static is safe. */
+    static struct gh_batch A, B;
     gh_batch_init(&A);
     gh_batch_init(&B);
     struct gh_ctx g;

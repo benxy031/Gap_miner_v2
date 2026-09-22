@@ -1204,7 +1204,12 @@ int gap_hunt_run(const struct gap_hunt_config *cfg) {
         }
     }
     base_limbs = (uint64_t *)calloc((size_t)gpu_limbs, sizeof(uint64_t));
-    size_t win_cap = (size_t)sieve.candidate_capacity;
+    /* Host candidate arrays: the SAME survivor-density rule the device
+       buffers use.  This used to be `sieve.candidate_capacity` = one entry per
+       ADDER in the window (69,538 at shift998) where a window has ~4,300
+       survivors -> ~16x over-allocation, i.e. 1.2 GB of host RAM per walker at
+       K=1024, which was the real limit on stacking walkers. */
+    size_t win_cap = (size_t)gpu_sieve_cand_cap_estimate(odd_interval_size);
     /* Batch/round guard: one chain round submits up to g_batch x survivors
        candidates and the MR context must hold them -- the fill fails closed
        otherwise.  The bound comes from the CONTEXT (gpu_fermat_max_batch),
@@ -1248,6 +1253,8 @@ int gap_hunt_run(const struct gap_hunt_config *cfg) {
         }
         cum_cap = head_batch ? cap_real
                              : (uint64_t)g_batch * (uint64_t)win_cap;
+        /* Pin the sieve to the allocation above (see the note on win_cap). */
+        gpu_sieve_set_cand_cap_limit(gpu_sieve, cum_cap);
     }
     uint64_t *offsets = (uint64_t *)malloc(
         2U * (size_t)g_batch * win_cap * sizeof(uint64_t));

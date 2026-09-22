@@ -3228,6 +3228,16 @@ void *worker_thread_run_crt(void *arg) {
     if (gpu && gpu_sieve && worker_env_enabled(fused_env)) {
         fused_fermat = gpu_adapter_get_fermat_ctx(gpu);
         if (fused_fermat) {
+            /* Per-window capacity for the HOST candidate arrays: the same
+               survivor-density rule the device buffers use.  They used to be
+               sized `candidate_capacity x K` = one entry per ADDER per window,
+               ~36x more than the ~1,000 survivors a window actually has at
+               shift507 (1.3 GB/worker at K=2048 where ~40 MB is needed).  The
+               sieve's capacity is pinned to this allocation below, so host and
+               device cannot disagree: an extraction that does not fit fails
+               closed instead of overrunning the host array. */
+            uint64_t fused_host_per_win = gpu_sieve_cand_cap_estimate(
+                ((uint64_t)max_interval + 1U) >> 1);
             /* Size K to the CARD, not to a constant.  The candidate buffers
                dominate VRAM and their need is known exactly before the first
                allocation: 2 x cap x K x limbs x 8 B (AoS ping-pong) +
@@ -3297,7 +3307,7 @@ void *worker_thread_run_crt(void *arg) {
                             worker_id);
                 } else {
                     chain_cs->flags_cap =
-                        (size_t)sieve.candidate_capacity *
+                        (size_t)fused_host_per_win *
                         (size_t)mining_jump2_batch;
                     chain_cs->flags =
                         (uint8_t *)malloc(chain_cs->flags_cap);
@@ -3325,8 +3335,9 @@ void *worker_thread_run_crt(void *arg) {
                     }
                 }
             }
-            size_t cap = (size_t)sieve.candidate_capacity *
+            size_t cap = (size_t)fused_host_per_win *
                          (size_t)flight_batch;
+            gpu_sieve_set_cand_cap_limit(gpu_sieve, (uint64_t)cap);
             fused_slot_offsets = (uint64_t *)malloc(cap * sizeof(uint64_t));
             fused_sorted_offsets = (uint64_t *)malloc(cap * sizeof(uint64_t));
             fused_is_prime[0] = (uint8_t *)malloc(cap * sizeof(uint8_t));

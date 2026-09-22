@@ -213,6 +213,13 @@ uint64_t *gpu_sieve_pingpong_bitmap(gpu_sieve_ctx *ctx, int buf);
 /* Size the extract candidate buffers for K-window MR batch accumulation. */
 void gpu_sieve_set_extract_accum(gpu_sieve_ctx *ctx, uint32_t k);
 
+/* Pin the candidate capacity to the caller's host-side allocation (total
+   slots, i.e. per-window capacity x K; 0 = no limit).  The host candidate
+   arrays are written by the same dense layout the device buffers use, so
+   sizing both from one rule and pinning the device side to it makes an
+   oversize extraction fail closed instead of overrunning the host array. */
+void gpu_sieve_set_cand_cap_limit(gpu_sieve_ctx *ctx, uint64_t slots);
+
 /* Per-window candidate capacity the extract buffers start with for a given
    window geometry (max(4096, odd_interval/8), capped at the odd interval).
    The buffers hold SURVIVORS, not one slot per odd position, and the capacity

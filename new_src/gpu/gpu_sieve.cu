@@ -116,6 +116,8 @@ struct gpu_sieve_ctx {
        truncation: a dropped survivor would make two non-consecutive primes
        look consecutive, i.e. a FALSE GAP. */
     uint64_t cand_cap_per_window;      /* slots reserved per window */
+    uint64_t cand_cap_limit;           /* caller's host allocation (slots,
+                                          0 = no limit; see the setter) */
     uint64_t cand_cap_pending;         /* capacity to apply at the next
                                           slot_base == 0 (never mid-flight) */
     uint64_t cand_cap_measured;        /* max survivors seen in one window */
@@ -336,6 +338,7 @@ gpu_sieve_ctx *gpu_sieve_init(int device_id,
        first measured window (4x headroom); a positive GPU_EXTRACT_CAND_CAP
        pins the initial per-window capacity for experiments. */
     ctx->cand_cap_per_window = 0;
+    ctx->cand_cap_limit = 0;
     ctx->cand_cap_pending = 0;
     ctx->cand_cap_measured = 0;
     ctx->cand_cap_calibrated = 0;
@@ -1988,7 +1991,24 @@ static int gpu_sieve_extract_pack_impl(gpu_sieve_ctx *ctx,
     }
     if (ctx->cand_cap_per_window > ctx->max_odd_interval)
         ctx->cand_cap_per_window = ctx->max_odd_interval;
+    /* Honour the caller's host allocation: the host arrays hold the same
+       dense layout, so the device must never be able to hold more. */
+    if (ctx->cand_cap_limit) {
+        uint64_t max_per_win = ctx->cand_cap_limit / accum;
+        if (max_per_win == 0) {
+            fprintf(stderr,
+                    "gpu_sieve: host candidate capacity %llu slots is smaller "
+                    "than one window (K=%u)\n",
+                    (unsigned long long)ctx->cand_cap_limit,
+                    (unsigned)ctx->extract_accum);
+            return 0;
+        }
+        if (ctx->cand_cap_per_window > max_per_win)
+            ctx->cand_cap_per_window = max_per_win;
+    }
     size_t cap = (size_t)ctx->cand_cap_per_window * accum;
+    if (ctx->cand_cap_limit && cap > (size_t)ctx->cand_cap_limit)
+        cap = (size_t)ctx->cand_cap_limit;
     if (cap > (size_t)0xFFFFFFFFu) cap = (size_t)0xFFFFFFFFu;
 
     uint64_t w_lo = lo_odd >> 6;
@@ -2138,6 +2158,10 @@ static int gpu_sieve_extract_pack_impl(gpu_sieve_ctx *ctx,
         uint64_t grown = ctx->cand_cap_per_window * 2U;
         if (grown < need) grown = need;
         if (grown > ctx->max_odd_interval) grown = ctx->max_odd_interval;
+        if (ctx->cand_cap_limit) {
+            uint64_t max_per_win = ctx->cand_cap_limit / accum;
+            if (grown > max_per_win) grown = max_per_win;
+        }
         if (!ctx->cand_cap_reported) {
             ctx->cand_cap_reported = 1;
             fprintf(stderr,
@@ -2397,6 +2421,11 @@ uint64_t *gpu_sieve_row_bitmap(gpu_sieve_ctx *ctx, uint32_t row) {
 void gpu_sieve_set_extract_accum(gpu_sieve_ctx *ctx, uint32_t k) {
     if (!ctx) return;
     ctx->extract_accum = k ? k : 1;
+}
+
+void gpu_sieve_set_cand_cap_limit(gpu_sieve_ctx *ctx, uint64_t slots) {
+    if (!ctx) return;
+    ctx->cand_cap_limit = slots;
 }
 
 /* The capacity the candidate buffers will START with for a given window

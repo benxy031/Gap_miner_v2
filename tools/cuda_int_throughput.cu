@@ -164,6 +164,49 @@ __global__ void bench_mma_int8(uint32_t seed, unsigned long long *out, int iter)
     atomicAdd(out, r);
 }
 
+/* ---- RNS-16 shaped stream: the layout tax -------------------------------
+   An RNS Montgomery step keeps K 16-bit residues per element and must repack
+   them into m16n8k16 int8 fragments before every MMA (a thread's A/B fragment
+   is a byte pair, not two packed residues).  This kernel is bench_mma_int8 plus
+   that repack - 3 PRMT per MMA, the OPTIMISTIC end of a real
+   residue->fragment conversion - so its MAC/s already carries the tax and the
+   difference between the two rows IS the tax. */
+__global__ void bench_mma_pack(uint32_t seed, unsigned long long *out,
+                               int iter) {
+    unsigned src[NCHAIN][2], a[NCHAIN][2], b[NCHAIN];
+    int c[NCHAIN][4];
+#pragma unroll
+    for (int s = 0; s < NCHAIN; s++) {
+        src[s][0] = seed * 2654435761u + (unsigned)s;
+        src[s][1] = seed * 40503u + (unsigned)s + 7u;
+        a[s][0] = src[s][0];
+        a[s][1] = src[s][1];
+        b[s] = src[s][0] ^ src[s][1];
+#pragma unroll
+        for (int j = 0; j < 4; j++) c[s][j] = (int)(seed + s * 7 + j);
+    }
+    int n = iter / NCHAIN;
+    for (int it = 0; it < n; it++) {
+#pragma unroll
+        for (int s = 0; s < NCHAIN; s++) {
+            /* residues from the accumulator's own bits => loop carried, so
+               nvcc cannot hoist the repack out of the loop. */
+            unsigned x = src[s][0] ^ (unsigned)c[s][0];
+            unsigned y = src[s][1] ^ (unsigned)c[s][2];
+            a[s][0] = __byte_perm(x, y, 0x6420);
+            a[s][1] = __byte_perm(x, y, 0x7531);
+            b[s] = __byte_perm(x, y, 0x1054);
+            mma_int8(a[s][0], a[s][1], b[s], c[s][0], c[s][1], c[s][2], c[s][3]);
+        }
+    }
+    unsigned long long r = 0;
+#pragma unroll
+    for (int s = 0; s < NCHAIN; s++)
+#pragma unroll
+        for (int j = 0; j < 4; j++) r += (unsigned)c[s][j];
+    atomicAdd(out, r);
+}
+
 /* ------------------------------------------------------------------- host  */
 typedef void (*kfn)(uint32_t, unsigned long long *, int);
 
@@ -228,8 +271,9 @@ int main(int argc, char **argv) {
         {"mul64hi", bench_mul64hi, 1, "1 x 64x64 high half"},
         {"dp4a", bench_dp4a, 4, "4 x int8 MAC"},
         {"mma_int8", bench_mma_int8, 2048, "2048 x int8 MAC"},
+        {"mma_pack", bench_mma_pack, 2048, "2048 x int8 MAC + repack"},
     };
-    const int NROWS = 5;
+    const int NROWS = 6;
 
     double ginstr[8], gunit[8];
     for (int i = 0; i < NROWS; i++) {
@@ -245,7 +289,7 @@ int main(int argc, char **argv) {
            Verified against the device: 72 T MAC/s measured below = ~88% of the
            RTX 3070 dense INT8 tensor peak. */
         double instrs;
-        if (rows[i].k == bench_mma_int8)
+        if (rows[i].k == bench_mma_int8 || rows[i].k == bench_mma_pack)
             instrs = (double)blocks * (double)threads / 32.0 * (double)h_iter;
         else
             instrs = (double)blocks * (double)threads * (double)h_iter *
@@ -271,6 +315,44 @@ int main(int argc, char **argv) {
            gunit[3], gunit[3] / gunit[0]);
     printf("  mma8    : %9.2f GMAC/s  (%.2fx the scalar 32-bit MAC rate)\n",
            gunit[4], gunit[4] / gunit[0]);
+    printf("  mma8+pk : %9.2f GMAC/s  (%.2fx scalar; %.2fx of the register-\n"
+           "                                   resident mma8 => the repack tax)\n",
+           gunit[5], gunit[5] / gunit[0], gunit[5] / gunit[4]);
+
+    /* RNS-16 Montgomery model.  One 768-bit step in the 2-extension
+       Bajard-Imbert-Jullien form costs 3K + 2K' 16-bit products (K = 50
+       moduli of ~15.9 bits cover 768 bits with margin; K' ~ 10 for the
+       extension base), and each 16-bit product is 4 int8 MACs (two 8-bit
+       halves squared).  This is an UPPER BOUND: it does not charge the
+       modular reductions, the conditional subtracts, or any memory traffic. */
+    const double PROD = 3.0 * 50.0 + 2.0 * 10.0;      /* 170 products */
+    const double MACS = PROD * 4.0;                    /* 680 int8 MACs */
+    const double cgbn_ns = 1102.0;   /* measured on THIS box: gpu_fermat CGBN
+                                        AL=12 (768-bit) 907k montmul/s */
+    double steps_packed = gunit[5] * 1e9 / MACS;
+    double steps_reg = gunit[4] * 1e9 / MACS;
+    double ps_ns = 1e9 / steps_packed;
+    printf("\nRNS-16 768-bit Montgomery: MULTIPLY-STREAM BOUND only "
+           "(3K+2K' = %.0f products = %.0f int8 MACs/step)\n", PROD, MACS);
+    printf("  with the repack tax : %8.4f ns of multiply stream per step "
+           "(%6.0f M steps/s device-wide)\n", ps_ns, steps_packed / 1e6);
+    printf("  register-resident   : %8.4f ns of multiply stream per step "
+           "(%6.0f M steps/s device-wide)\n", 1e9 / steps_reg,
+           steps_reg / 1e6);
+    printf("  reference           : CGBN AL=12 measured %.0f ns/montmul "
+           "(907k/s, gpu_fermat, same box)\n", cgbn_ns);
+    printf("  => the multiplies are %.5f%% of CGBN's measured step cost, so "
+           "this bound says almost\n     NOTHING about a real RNS step: the "
+           "modular reductions, the base extensions and the\n     serial "
+           "dependency chains are the whole question and are NOT charged "
+           "here.\n", 100.0 * ps_ns / cgbn_ns);
+    printf("  DECISION RULE: build ONE real RNS-16 768-bit Montgomery step and "
+           "compare it with the\n     measured %.0f ns; only that ratio is "
+           "meaningful.  Prior from our own history:\n     CGBN reaches only "
+           "15-23%% of its own multiply ceiling, and our scalar "
+           "register-resident\n     kernel is 4.2-7.4x slower than CGBN - i.e. "
+           "non-multiply work has eaten 85-99%%\n     of every bignum path "
+           "tried in this repo.\n", cgbn_ns);
     printf("\nNOTE: these are pure ALU / tensor retire rates for the kernel\n"
            "      shape above.  They say nothing about conversion overhead,\n"
            "      register pressure, memory traffic, or -- crucially for\n"

@@ -40,3 +40,50 @@ gapminer_pool_records.log*
 data/gap_hunt_records.txt
 data/gap_hunt_state.txt
 data/gap_hunt_records.old
+# Large-L (shift 1784) hunt: raw output + resumable state are live files that
+# grow while the hunt runs; the record log (gap_hunt_records_found_1784.txt) stays tracked.
+data/gap_hunt_records_1784.txt
+data/gap_hunt_state_1784.txt
+gapminer_pool_records.old
+gapminer_records.old
+gapminer_records.old1
+s507a.png
+s507b.png
+sl2.png
+TotalFO Aug2026.png
+analysis/p20_long_table.md
+docs/BUILD_HYGIENE_INCIDENT.md
+docs/GPU_SCREEN_ANALYSIS.md
+docs/HORIZON_COMPARISON.md
+docs/MARK_SPLIT_RESULT.md
+docs/POOL_MISSING_BLOCKS_20260919.md
+forum/actual_vs_calculated_histogram_exact_e32.png
+forum/derive_hl_gap_4param_exact_90090.py
+forum/HL_4Parameter_Consecutive_Prime_Gap_Model_Rev2.pdf
+forum/hl_gap_3param_exact_parameters_with_first_occurrence.csv
+forum/hl_gap_4param_exact_parameters_with_first_occurrence.csv
+forum/hl_gap_4param_first_occurrences.png
+forum/hl_gap_histogram_exact_10pow25.png
+forum/hl_gap_histogram_exact_e32.png
+forum/hl_gap_histogram_exact_e62.png
+forum/hl_gap_jumping_champions_all_mod6_0.png
+forum/hl_gap_jumping_champions_selected.png
+forum/The complete prime gap.txt
+out/s509_pool.png
+scripts/p20_long_monitor.py
+.gitignore
+scripts/__pycache__/analyze_n3.cpython-314.pyc
+scripts/__pycache__/gap_hunt_stats.cpython-314.pyc
+scripts/__pycache__/hl_natural.cpython-314.pyc
+scripts/__pycache__/mech_sieve_analyze.cpython-314.pyc
+scripts/__pycache__/pool_block_audit.cpython-314.pyc
+scripts/__pycache__/record_rate_model.cpython-314.pyc
+scripts/__pycache__/records_report.cpython-314.pyc
+scripts/__pycache__/tail_compare.cpython-314.pyc
+scripts/__pycache__/tail_shape.cpython-314.pyc
+scripts/__pycache__/verify_gap_candidate.cpython-314.pyc
+scripts/__pycache__/watch_gap_hunt_records.cpython-314.pyc
+tools/cover_variants.py
+tools/poly_gap_box
+tools/poly_gap_six
+tools/__pycache__/poly_gap_search.cpython-314.pyc

@@ -1,0 +1,1 @@
+# snapshot table=data/prime_gap_merits.txt sha256[:12]=b2bebffea359 gaps=123388 date=2026-09-23T19:30:08Z

@@ -128,6 +128,53 @@ proxy. Reopen trigger: the dual-3060 same-size cover test currently running
 sigma is cover-driven or size-driven; if cover-driven, the cover and the tail
 are the same lever and this becomes the main one.
 
+### 3.1 Where the cover-vs-size question stands (measured 2026-09-23)
+
+The same-size cover A/B has now been measured on two size pairs, and it does
+**not** settle the question in favour of the cover:
+
+| pair (same size, different design) | sigma lex | sigma covermax | difference |
+|---|---|---|---|
+| shift 998, m40 target | 1.3560 (n=3902) | 1.3217 (n=3934) | −2.5 % |
+| shift 1017, m30 target | 1.3904 (n=4407) | 1.4679 (n=5480) | **+5.6 %** |
+
+The sign FLIPS between the two pairs, so "covermax is heavier" is not a law; at
+4-5k gaps per arm the cover contribution is a few percent at most and unsigned.
+That matters because the 8.70 % difference between the f1/f2 anchors this
+document interpolates is then explained by neither factor alone:
+
+* **size** cannot do it: the natural Hardy-Littlewood tail (forum/ coefficient
+  tables, read by `scripts/hl_natural.py`) moves only **−0.15 %** between
+  L=528 and L=882;
+* **cover** is unsigned at this sample size (table above).
+
+Two measurements narrow it further:
+
+* **band-resolved local sigma** (`scripts/tail_compare.py --plot` →
+  `_bands.png`, `scripts/analyze_n3.py` → `n3_bands.png`) shows f1 STEEPENING
+  with depth (1.29 at merit 8-9 → ~1.10 at 18-19 → 0.96 at 19-20) while f2
+  stays flat near 1.36-1.39.  A single sigma per file is thus an average over a
+  drifting profile, and for f1 it OVERSTATES deep-tail rates — exactly the
+  depth where records live.  f1's `E[records]` is therefore biased high and its
+  gaps/record optimistic; the stretched/GPD option in `tail_shape.py` exists
+  for this case and should be preferred for f1-like corpora.
+* **every corpus sits 31-45 % above the natural line**, i.e. the covering gain
+  is real in aggregate (×7-13 at merit 28, ×150-650 at merit 40) even though
+  the cover DESIGN is not distinguishable at this sample size.
+
+Consequence for this model: keep the anchors (they reproduce §2), keep reading
+`sigma(L)` between them as HYPOTHESIS, and prefer `--sigma-fixed` whenever a
+ranking must not lean on the attribution.  What would close the question is a
+longer same-size A/B (≥ 50k gaps per arm at one size) or a
+same-cover/different-size pair, both producible from the covering files already
+in `data/crt/m23`.
+
+Fixed in the same change set: `--shift-scan` raised
+`NameError: name 'SIGMA_ANCHORS' is not defined` — the anchor constant was
+referenced but never defined, so the documented example in README did not run.
+It is now defined with the §2 values and the scan prints the natural reference
+alongside the interpolated sigma.
+
 ## 4. Negative result: report-threshold tuning is a no-op
 
 The sweep (`--sweep-max`) shows E[records] for a fixed walk time **flat at
@@ -606,3 +653,46 @@ Consequences worth stating plainly:
 * Not a cover result: nothing here was walked; no cover was regenerated.
 * Not a shift recommendation to move the fleet: the measured 1017 is already
   at the optimum within model error.
+
+## 13. Cover-optimizer strength is a 2.06x lever — controlled A/B (2026-09-23)
+
+§8.1 established that the near-threshold tail is cover-driven, but every earlier
+comparison changed two things at once (shift and cover generation).  This run
+held the geometry fixed and moved ONLY the optimizer budget.
+
+| file | n | shift | bits | gap_target | n_cand | u | gaps>=m10 / 1000 windows |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| `shift1017_p130_covermax_m30.txt` (strength 19000, ivs 6000, evolution, 3 attempts) | 130 | 1017 | 8 | 26472 | 1544 | 5.83% | **29.07** (42,760 / 1.470M) |
+| `/tmp/q1017_quick.txt` (strength 200, ivs 50, no evolution) | 130 | 1017 | 8 | 26472 | 1677 | 6.33% | **14.08** (1,399 / 99,328) |
+| `/tmp/shift1018_p131_m30_quick.txt` (same weak budget) | 131 | 1019 | 0 | 26513 | 1698 | 6.40% | 10.52 (1,045 / 99,328) |
+| `/tmp/shift1786_p208_m30_quick.txt` (same weak budget) | 208 | 1786 | 0 | 42463 | 2426 | 5.71% | 12.30 (441 / 35,840) |
+
+* The first two rows differ ONLY in optimizer strength (same n, shift, bits,
+  gap_target, `--sieve-primes 2000000`, `--gap-hunt-min-merit 10`, same binary,
+  same machine, win/s 617 both) and differ by **2.06x** in the reported
+  merit-10 rate.  Survivor count cannot explain it (5.83% vs 6.33%).
+* `cover_max --file ... --seconds 120` improved the weak file by 66 survivors
+  (93.60% -> 93.84% coverage) and would not close a 2x gap, so the driving
+  property is structural and longer-evolution-only, not the min-survivor count.
+  This is consistent with the older run-objective measurement (rate@m10
+  1.17/s vs 0.28/s between cover structures) and it means the historical
+  "density drives the tail, run length does not" conclusion needs a controlled
+  re-test too.
+* **Process rule (learned the hard way):** the per-window merit-10 rate is
+  cover-dominated, so a shift-to-shift comparison of it is worthless unless both
+  files come from the SAME optimizer budget.  Reading the weak 1786 file's
+  12.30 against the production 29.07 first looked like a 2.36x L-penalty and
+  nearly reverted the whole large-L plan; the 1019 control (10.52) shows it was
+  the cover.
+* What IS size-driven: windows/s and adders/s (the MR cost).  `bench_fermat`
+  cand/s at batch 2000/40000: AL=20 282k/407k, AL=24 203k/252k, AL=28 137k/165k,
+  AL=32 95k/115k, i.e. a penalty of 3.0x (small batch) to 3.5x (large batch)
+  from AL=20 to AL=32 - a steeper-than-quadratic ~AL^2.3..2.7.
+  In the live hunt at shift 1786 (AL=32, TPI=8, window 84,926, vram_est 4029MB):
+  285.3 win/s = 2.42e7 adders/s vs 1269.8 win/s = 6.72e7 adders/s at shift 1017
+  (AL=20) = 2.77x, matching the bench curve.
+* Consequence for the size decision: the aggregate-rate comparison across L must
+  use a SAME-BUDGET cover at each L.  The strong shift-1784 file
+  (`gen_crt_batch.sh --only 207 --merit 30`, full strength) is the missing
+  measurement; n=207 + `--bits 8` gives shift 1784 = 2040 bits = AL=32, the last
+  width CGBN runs at its measured-optimal TPI=8.

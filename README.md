@@ -185,11 +185,38 @@ scripts/record_rate_model.py gap_hunt_records_f1.txt gap_hunt_records_f2.txt
                                      # and inflate sigma and E[records]
 scripts/record_rate_model.py --targets 6 gap_hunt_records_f2.txt   # nearest record targets
 scripts/record_rate_model.py --shift-scan 900,1000,1017,1050       # shift/size alignment
+                                     # sigma(L) interpolates the two measured
+                                     # anchors (528->1.2618, 882->1.3716).  That
+                                     # is a walk-to-walk trend, NOT a measured
+                                     # size law: the natural HL tail moves only
+                                     # -0.15 % between those sizes and the
+                                     # same-size cover A/B changes sign.  The
+                                     # scan header prints the natural reference
+                                     # (scripts/hl_natural.py) next to the
+                                     # anchors so the difference is visible.
 scripts/tail_compare.py data/gap_hunt_records_f1.txt data/gap_hunt_records_f2.txt
                                      # cover A/B tail comparison; the verdict M0
                                      # auto-clamps to the data's own report
                                      # threshold (docs/RECORD_RATE_MODEL.md §8)
-scripts/tail_compare.py --plot /tmp/tc   # + tc_cdf.png, tc_sigma.png, tc_panels.png
+                                     # and the text output ends with the HL
+                                     # natural baseline per corpus (sigma_nat
+                                     # and the covering's cumulative gain).
+scripts/tail_compare.py --plot /tmp/tc   # + tc_cdf.png, tc_sigma.png,
+                                     # tc_bands.png, tc_panels.png
+                                     # tc_cdf/tc_sigma/tc_bands draw the HL
+                                     # natural curve (dotted) at that corpus's
+                                     # own L = mean(gap/merit), so the distance
+                                     # between an empirical curve and its
+                                     # dotted line IS the covering's gain;
+                                     # tc_sigma gained a second panel with
+                                     # sigmaB-sigmaA and its errors, and flags
+                                     # a SIGN FLIP (a flipped sign means no
+                                     # single threshold can rank the two
+                                     # files); tc_bands shows the local sigma
+                                     # per merit band with errors, the single
+                                     # number it averages, and the natural
+                                     # line, so a depth-drift cannot be
+                                     # mistaken for a size effect.
                                      # tc_panels.png is the same 8-panel
                                      # diagnostic set records_report.py draws
                                      # for miner logs, adapted to hunt corpora:
@@ -226,8 +253,28 @@ scripts/tail_compare.py --plot /tmp/tc   # + tc_cdf.png, tc_sigma.png, tc_panels
                                      # gap the table's merit exceeds what that L
                                      # can produce at all, so no find of that
                                      # length can ever be a record there.
-scripts/tail_shape.py --selftest    # verify the exp/stretched/GPD estimators first
-scripts/tail_shape.py gap_hunt_records_f1.txt --u-fit 16 --u-test 18,20,22
+scripts/analyze_n3.py               # f1 vs f2 N3 report + analysis/n3_*.png
+                                     # (merit hist, tail cdf, sigma convergence,
+                                     # best progression, gap hist, sigma vs
+                                     # threshold, bands).  The cdf, threshold
+                                     # and bands figures carry the HL natural
+                                     # reference, and the captions state the
+                                     # attribution the data supports: the two
+                                     # corpora differ in size AND cover, the
+                                     # natural tail is size-flat to 0.15 %
+                                     # between them, and the same-size cover
+                                     # A/B changes sign - so the separation is
+                                     # a fact about those two WALKS, not a
+                                     # measured size law.
+scripts/hl_natural.py               # the natural (no-cover) HL merit law at
+                                     # any L, read from the forum/ coefficient
+                                     # tables: dE/dm, sigma_nat, and the
+                                     # covering's cumulative gain (x10 at
+                                     # merit 28, x335 at merit 40 for a
+                                     # sigma_eff of 1.327); flags every use
+                                     # beyond g=9990 as an extrapolation.
+scripts/hl_natural.py 528.9 881.7   # same, as a table for given L values
+scripts/tail_shape.py --selftest    # verify the exp/stretched/GPD estimators firstscripts/tail_shape.py gap_hunt_records_f1.txt --u-fit 16 --u-test 18,20,22
                                      # is the tail exponential at depth? (S9)
 scripts/tail_shape.py FILE ... --pool --u-fit 21
                                      # merge same-config files (same L, and fit
@@ -973,6 +1020,7 @@ data/prime_gap_merits.txt  Best-known-merit reference table (local only,
 scripts/          gen_crt_batch.sh, update_merits.sh, ab_shift_compare.sh,
                   watch_gap_hunt_records.py, gap_hunt_stats.py, analyze_n3.py,
                   tail_compare.py, tail_shape.py, record_rate_model.py,
+                  hl_natural.py (HL natural baseline; reads forum/*.csv),
                   records_report.py, pool_block_audit.py, arith_ceiling.py
 tools/            cuda_int_throughput.cu (GPU integer rate benchmark; build with
                   nvcc -O3 -arch=sm_86 -o bin/cuda_int_throughput ...)

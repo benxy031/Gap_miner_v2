@@ -82,6 +82,18 @@ DEFAULT_TABLE = "data/prime_gap_merits.txt"
 #   half-width 1.0 -> bin/MC = 1.00
 BIN_HALF = 1.0
 
+# Measured tail-scale anchors, as (L, sigma) with L = (255+shift)*ln2:
+#   shift 507  -> L = 528.18, sigma = 1.2618  (gap_hunt_records_f1.txt)
+#   shift 1017 -> L = 881.68, sigma = 1.3716  (gap_hunt_records_f2.txt)
+# These are the reference numbers of docs/RECORD_RATE_MODEL.md §2 and are what
+# sigma_of_L() interpolates between.  They were previously referenced without
+# being defined, which made --shift-scan raise NameError (fixed 2026-09-23).
+# CAVEAT: the two anchors are two different WALKS (size AND cover differ), so
+# the interpolation is a walk-to-walk trend, not a measured size law - the
+# natural HL tail moves only -0.15 % between these sizes and the same-size
+# cover A/B changes sign.  See sigma_of_L()'s docstring.
+SIGMA_ANCHORS = ((528.18, 1.2618), (881.68, 1.3716))
+
 # Tail-shape machinery lives in tail_shape.py (same directory).  It is only
 # needed for --tail / --u-rec; without it the tool still runs exponential-only.
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -636,6 +648,15 @@ def sigma_of_L(L, anchors=None, fixed=None):
     fit; anything outside is an extrapolation and must be labelled as such.
     A caller-supplied `fixed` value removes the extrapolation entirely, which
     is how the model-free part of the ranking is separated out.
+
+    ATTRIBUTION CAVEAT (2026-09-23).  The two anchors are two different WALKS:
+    they differ in size AND in cover, and in how much of their data sits just
+    above the report threshold.  The natural HL tail moves only -0.15 % between
+    these two sizes (scripts/hl_natural.py) and the same-size cover A/B changes
+    sign (-2.5 % at shift 998, +5.6 % at 1017), so the linear interpolation is a
+    walk-to-walk trend, NOT a measured size law.  Treat sigma(L) between the
+    anchors as HYPOTHESIS and prefer --sigma-fixed when the ranking must be
+    model-free on the tail.
     """
     if fixed is not None:
         return fixed
@@ -895,6 +916,26 @@ def main():
               " sigma(L) from the two measured anchors"
               f" {SIGMA_ANCHORS[0][0]:.0f}->{SIGMA_ANCHORS[0][1]:.4f},"
               f" {SIGMA_ANCHORS[1][0]:.0f}->{SIGMA_ANCHORS[1][1]:.4f}")
+        # Natural reference: how much of sigma(L) is a size effect at all.
+        # The HL law moves ~0.15 % between these sizes, so the interpolated
+        # trend above is a walk-to-walk difference (size AND cover), not a
+        # measured size law - see sigma_of_L's caveat.
+        try:
+            sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+            import hl_natural
+            nat = hl_natural.load()
+        except ImportError:                      # pragma: no cover
+            nat = None
+        if nat is not None:
+            nat_lines = ", ".join(
+                "L=%.0f sigma_nat=%.3f" % (L, nat.sigma(L))
+                for L, _ in SIGMA_ANCHORS)
+            print("  natural (no cover) HL reference: %s" % nat_lines)
+            print("  -> the anchors differ by %.2f %% in sigma while the natural "
+                  "law moves %.2f %%: the trend is walk-specific"
+                  % (100.0 * (SIGMA_ANCHORS[1][1] / SIGMA_ANCHORS[0][1] - 1.0),
+                     100.0 * (nat.sigma(SIGMA_ANCHORS[1][0])
+                              / nat.sigma(SIGMA_ANCHORS[0][0]) - 1.0)))
         print(f"  {'shift':>5} {'L':>8} {'sigma*':>7} {'easiest size':>13}"
               f" {'needs merit':>12} {'gaps/record':>12}")
         for r in sorted(scan, key=lambda x: x["gaps_per_record"]):

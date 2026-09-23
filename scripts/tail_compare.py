@@ -51,6 +51,15 @@ import math
 import os
 import bisect
 
+# The HL natural baseline (scripts/hl_natural.py, reading forum/ coefficient
+# tables) is OPTIONAL: a fleet box without forum/ loses one reference curve and
+# one text block, nothing else.  Imported here, loaded in main().
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+try:
+    import hl_natural
+except ImportError:                      # pragma: no cover - fleet boxes
+    hl_natural = None
+
 
 def resolve(path):
     """Fall back to data/<path> so fleet boxes (results in data/) work."""
@@ -84,6 +93,19 @@ def load(path):
             if m > 0:
                 merits.append(m)
     return merits
+
+
+def corpus_L(gaps, merits):
+    """L = ln x of a hunt corpus: mean(gap/merit), constant by construction.
+
+    A walk holds its base size fixed, so every line satisfies merit = g/L to
+    within the intra-window offset; the mean is the size the HL baseline must
+    be evaluated at.  Returns 0.0 when the corpus is empty.
+    """
+    pairs = [(g, m) for g, m in zip(gaps, merits) if g > 0 and m > 0]
+    if not pairs:
+        return 0.0
+    return sum(g / m for g, m in pairs) / len(pairs)
 
 
 def fit(merits, m0):
@@ -243,6 +265,14 @@ def main():
     print(f"A: {fa}  n={len(ma)}  best={max(ma):.4f}")
     print(f"B: {fb}  n={len(mb)}  best={max(mb):.4f}")
 
+    # Read each corpus once: the gap lists give L (the size the HL baseline is
+    # evaluated at) and the plot panels need them later anyway.
+    gaps_a, ma_full = load_full(fa)
+    gaps_b, mb_full = load_full(fb)
+    L_a = corpus_L(gaps_a, ma_full)
+    L_b = corpus_L(gaps_b, mb_full)
+    natural = hl_natural.load() if hl_natural is not None else None
+
     # A walker only writes gaps with merit >= its --gap-hunt-min-merit, so the
     # smallest merit in a file IS the report threshold.  Fitting below it does
     # not measure a tail: mean(m - M0 | m >= M0) becomes
@@ -321,6 +351,33 @@ def main():
                   " threshold and at the record depth — the threshold sigma is"
                   " NOT the record-rate sigma")
 
+    # ── HL natural baseline: what sigma would be with NO cover ────────────
+    # Every sigma above is cover-assisted.  The natural reference (forum/
+    # coefficient tables, scripts/hl_natural.py) makes the covering gain
+    # explicit and, just as importantly, states how much of a size difference
+    # the natural law EXPECTS between the two corpora: dE/dm moves only ~0.2 %
+    # per 350 units of L, so "sigma differs with size" is a claim that needs
+    # the cover held fixed before it can be attributed.
+    if natural is not None:
+        print("\nHL natural baseline (forum/ coefficient tables, extrapolated "
+              "beyond g=%d):" % natural.max_g)
+        for lab, L, s_eff in ((os.path.basename(fa), L_a, sa),
+                              (os.path.basename(fb), L_b, sb)):
+            if L > 0:
+                print("  %s: %s" % (lab, natural.describe(L, s_eff)))
+        if L_a > 0 and L_b > 0:
+            print("  natural size effect between the two corpora: %+.2f %% "
+                  "(measured %+.2f %%) -> %s"
+                  % (100.0 * (natural.sigma(L_b) / natural.sigma(L_a) - 1.0),
+                     100.0 * (sb / sa - 1.0),
+                     "size alone cannot explain the gap"
+                     if abs(sb / sa - 1.0) > 3.0 * abs(
+                         natural.sigma(L_b) / natural.sigma(L_a) - 1.0)
+                     else "within what the natural law predicts"))
+    else:
+        print("\n(no HL baseline: forum/ coefficient CSVs not found; "
+              "scripts/hl_natural.py documents the expected values)")
+
     # Depth-resolved local sigma over a fixed merit grid.  The sweep above fits
     # ONE exponent per threshold; this shows whether that exponent is stable
     # with depth, and it is not (see local_sigma_bands' docstring).
@@ -367,24 +424,32 @@ def main():
         srt_b = np.sort(np.asarray(mb, dtype=float))
 
         fig, ax = plt.subplots(figsize=(10, 5.5))
-        for m, srt, lab, c, s in ((ma, srt_a, "A " + fa, "tab:blue", sa),
-                                  (mb, srt_b, "B " + fb, "tab:orange", sb)):
+        for m, srt, lab, c, s, L in ((ma, srt_a, "A " + fa, "tab:blue", sa, L_a),
+                                     (mb, srt_b, "B " + fb, "tab:orange", sb,
+                                      L_b)):
             xs = np.arange(m0, max(m) + 0.5, 0.25)
             ax.plot(xs, ccdf(srt, xs), color=c, label=f"{lab} (empirical)")
             ax.plot(xs, np.exp(-(xs - m0) / s), "--",
                     color=c, label=f"fit exp(-(m-{m0:.0f})/{s:.3f})")
+            if natural is not None and L > 0:
+                ax.plot(xs, np.asarray(natural.survival(L, m0, xs)), ":",
+                        lw=1.6, color=c,
+                        label=f"HL natural, L={L:.0f} "
+                              f"(sigma_nat={natural.sigma(L):.3f})")
         ax.set_yscale("log")
         ax.set_xlabel("merit threshold m")
         ax.set_ylabel("P(merit >= m)")
         ax.set_title(f"cover A/B at the same size: "
-                     f"sigmaA={sa:.4f} sigmaB={sb:.4f} ({z_main:.1f} sigma)")
+                     f"sigmaA={sa:.4f} sigmaB={sb:.4f} ({z_main:.1f} sigma)\n"
+                     "dashed = exponential fit, dotted = HL natural (no cover): "
+                     "the gap between the two is the covering's gain")
         ax.legend(fontsize=8)
         fig.tight_layout()
         fig.savefig(f"{plot}_cdf.png", dpi=130)
         print(f"wrote {plot}_cdf.png")
 
         if sweep_rows:
-            fig2, ax2 = plt.subplots(figsize=(10, 5.5))
+            fig2, (ax2, ax2d) = plt.subplots(2, 1, figsize=(10, 9), sharex=True)
             xs2 = [r[0] for r in sweep_rows]
             ya = [r[1] for r in sweep_rows]
             ea = [r[2] for r in sweep_rows]
@@ -394,14 +459,89 @@ def main():
                          capsize=3, markersize=4, label="A " + fa)
             ax2.errorbar(xs2, yb, yerr=eb, fmt="o-", color="tab:orange",
                          capsize=3, markersize=4, label="B " + fb)
+            # Natural references: sigma is naturally almost L-independent, so a
+            # measured separation is a statement about the covers unless it
+            # dwarfs the distance to these lines.
+            if natural is not None:
+                for L, c in ((L_a, "tab:blue"), (L_b, "tab:orange")):
+                    if L > 0:
+                        ax2.axhline(natural.sigma(L), ls=":", lw=1.6, color=c,
+                                    label=f"HL natural at L={L:.0f} "
+                                          f"({natural.sigma(L):.3f})")
             ax2.set_xlabel("merit threshold m")
             ax2.set_ylabel("tail sigma (mean excess)")
-            ax2.set_title("tail sigma vs threshold (sweep 16..35)")
+            ax2.set_title("tail sigma vs threshold (sweep 16..35)\n"
+                          "dotted = HL natural (no cover) at each corpus size")
             ax2.legend(fontsize=8)
             ax2.grid(alpha=0.3)
+
+            # The separation itself, with its error: a curve that CROSSES zero
+            # means no single threshold can rank the two files, which is the
+            # trap the text verdict warns about.
+            dz = [r[3] - r[1] for r in sweep_rows]
+            dez = [math.sqrt(r[2] ** 2 + r[4] ** 2) for r in sweep_rows]
+            ax2d.errorbar(xs2, dz, yerr=dez, fmt="s-", color="tab:purple",
+                          capsize=3, markersize=4,
+                          label="sigmaB - sigmaA (+/- 1 sigma)")
+            ax2d.axhline(0.0, color="k", lw=1, ls=":")
+            ax2d.set_xlabel("merit threshold m")
+            ax2d.set_ylabel("sigmaB - sigmaA")
+            signs = set(1 if d > 0 else -1 for d in dz)
+            ax2d.set_title("separation per threshold: "
+                           + ("SIGN FLIPS with depth - the two covers do not "
+                              "have an order" if len(signs) > 1 else
+                              "one sign across the sweep"))
+            ax2d.legend(fontsize=8)
+            ax2d.grid(alpha=0.3)
             fig2.tight_layout()
             fig2.savefig(f"{plot}_sigma.png", dpi=130)
             print(f"wrote {plot}_sigma.png")
+
+        # ── band-resolved sigma: the depth profile, not one number ────────
+        # A single sigma is a weighted average over the whole depth range, and
+        # its value moves with the fit threshold (floor) as much as with the
+        # corpus: the same file measured at its own report threshold and at the
+        # deepest threshold with n>=100 can differ by ~10 %.  This panel shows
+        # the profile with Poisson errors, the single-number summary, and the
+        # natural reference, so a reader can see which of the three the two
+        # corpora actually differ in.
+        if rows_a or rows_b:
+            fig5, axb = plt.subplots(figsize=(11, 6))
+            for rows, lab, col, s_glob, L in (
+                    (rows_a, os.path.basename(fa), "tab:blue", sa, L_a),
+                    (rows_b, os.path.basename(fb), "tab:orange", sb, L_b)):
+                pts = [(r[0] + 0.5, r[4], r[5]) for r in rows if r[4] is not None]
+                if not pts:
+                    continue
+                axb.errorbar([p[0] for p in pts], [p[1] for p in pts],
+                             yerr=[p[2] for p in pts], fmt="o-", ms=4,
+                             capsize=3, color=col,
+                             label=f"{lab} local sigma (n>="
+                                   f"{min(r[2] for r in rows if r[4] is not None)})")
+                axb.axhline(s_glob, ls="--", lw=1, color=col, alpha=0.8,
+                            label=f"{lab} single sigma {s_glob:.3f}")
+                if natural is not None and L > 0:
+                    axb.axhline(natural.sigma(L), ls=":", lw=1.6, color=col,
+                                label=f"{lab} HL natural {natural.sigma(L):.3f}")
+            axb.set_xlabel("merit band (edges on the integer grid)")
+            axb.set_ylabel("local sigma")
+            # Focus the frame on the informative region: at depth the bands hold
+            # a handful of finds, so their error bars run off any sane scale and
+            # would compress everything that carries information.  Bands whose
+            # bar leaves the frame are thin data, not a detection.
+            top = max([s for s in (sa, sb)] +
+                      ([natural.sigma(L_a), natural.sigma(L_b)]
+                       if natural is not None else []))
+            axb.set_ylim(0.0, max(2.0, 1.5 * top))
+            axb.set_title("band-resolved local sigma vs the single-number fit\n"
+                          "a slope that drifts with depth, or a value that "
+                          "sits just above the natural line, is not a size "
+                          "effect (bars leaving the frame = thin bands)")
+            axb.legend(fontsize=8, ncol=2)
+            axb.grid(alpha=0.3)
+            fig5.tight_layout()
+            fig5.savefig(f"{plot}_bands.png", dpi=130)
+            print(f"wrote {plot}_bands.png")
 
         # ── diagnostic panel set: the same panels the miner log gets in
         # scripts/records_report.py, adapted to hunt corpora.  Two structural
@@ -413,8 +553,8 @@ def main():
         #     so a "finds per hour" panel is impossible — the merit sequence
         #     replaces it, whose running MINIMUM exposes a mid-file threshold
         #     change (a step) exactly the way the rate panel does for miners.
-        gaps_a, ord_a = load_full(fa)
-        gaps_b, ord_b = load_full(fb)
+        gaps_a, ord_a = gaps_a, ma_full
+        gaps_b, ord_b = gaps_b, mb_full
         series = [(os.path.basename(fa), gaps_a, ord_a, sa, "tab:blue"),
                   (os.path.basename(fb), gaps_b, ord_b, sb, "tab:orange")]
         # Both corpora are perfectly steady here, so the cumulative lines
@@ -519,10 +659,10 @@ def main():
         # (4) depth-resolved local sigma: the single exponent is a summary,
         # this is the shape (and it is why the summary must not be
         # extrapolated to the record depth).
-        for rows, name, col, sg in ((rows_a, os.path.basename(fa),
-                                     "tab:blue", sa),
-                                    (rows_b, os.path.basename(fb),
-                                     "tab:orange", sb)):
+        for rows, name, col, sg, L in ((rows_a, os.path.basename(fa),
+                                        "tab:blue", sa, L_a),
+                                       (rows_b, os.path.basename(fb),
+                                        "tab:orange", sb, L_b)):
             pts = [(r[0], r[4], r[5]) for r in rows if r[4] is not None]
             if not pts:
                 continue
@@ -531,6 +671,10 @@ def main():
                            color=col, label=f"{name} local sigma")
             ax[4].axhline(sg, ls="--", lw=1, color=col,
                           label=f"{name} global fit {sg:.3f}")
+            if natural is not None and L > 0:
+                ax[4].axhline(natural.sigma(L), ls=":", lw=1.4, color=col,
+                              alpha=0.8,
+                              label=f"{name} HL natural {natural.sigma(L):.3f}")
         ax[4].set_title("local sigma per merit band\n"
                         "sigma falling with depth = lighter-than-exponential "
                         "tail (do not extrapolate the global fit)")

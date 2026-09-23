@@ -291,6 +291,17 @@ scripts/records_report.py --source pool --plot
                                      # pool only -> records_report.png
                                      # (the output directory is created if it
                                      # does not exist yet)
+                                     # panels 2-3 carry the HL natural curve
+                                     # (dotted, no cover, at the run's own
+                                     # L = mean ln(start), from
+                                     # scripts/hl_natural.py) next to the
+                                     # self-referential exponential fit, and
+                                     # the text report prints sigma_nat, the
+                                     # covering gain (xG at merit 28/40) and a
+                                     # "vs nature" threshold table: the
+                                     # observed tail should sit ABOVE the
+                                     # natural line, and matching it means the
+                                     # cover adds nothing at that size.
 scripts/records_report.py --since 2026-09-19T12:00 --until 2026-09-19T18:00
                                      # a window; ALSO turns "nothing found"
                                      # into a 95% rate upper bound (3.0/span)

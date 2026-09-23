@@ -28,11 +28,20 @@ What it reports (per file, then pooled):
   * the merit distribution: min / median / max, the best gap, and the window
     size scale L = ln(start);
   * whether the observed merit tail matches the geometric/Poisson expectation
-    it must follow (a fitted shifted exponential): a threshold table and a
-    Kolmogorov-Smirnov distance.  A tail that is shorter than the fit means
-    candidates near the threshold are being MISSED; a longer one means the
-    threshold or the reporting is wrong.  This is the "is it finding what it
-    should" instrument, not a record hunt;
+    (a fitted shifted exponential): a threshold table and a Kolmogorov-Smirnov
+    distance.  A tail that is shorter than the fit means candidates near the
+    threshold are being MISSED; a longer one means the threshold or the
+    reporting is wrong.  This is the "is it finding what it should" instrument,
+    not a record hunt;
+  * how that tail compares with NATURE: the same depths are also measured
+    against the Hardy-Littlewood natural law (no cover) at this run's own
+    L = ln(start), read from the forum/ coefficient tables by
+    scripts/hl_natural.py.  The exponential fit above is SELF-REFERENTIAL - it
+    is fitted to the very data it is compared with - so it can only detect a
+    shape mismatch; the natural line is the external reference.  A tailed cover
+    should sit ABOVE that line by its covering gain (sigma_eff/sigma_nat,
+    printed as xG at merit 28/40).  A tail that MATCHES the natural law means
+    the cover is adding nothing at this size, which is a finding, not a pass;
   * how the work source ruled on each candidate (accepted / rejected /
     unresolved / stale ...), PER HOUR — for a pool this is the plot that shows
     a stale-work outage (a run that stops being accepted keeps finding
@@ -80,6 +89,17 @@ import os
 import re
 import sys
 from dataclasses import dataclass, field
+
+# The HL natural baseline (scripts/hl_natural.py) is OPTIONAL: without the
+# forum/ coefficient tables the report loses the "vs nature" block and the
+# dotted curves, and nothing else.  See the docstring bullet on the tail.
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+try:
+    import hl_natural
+except ImportError:                      # pragma: no cover - fleet boxes
+    hl_natural = None
+
+_NATURAL = None      # cached: Natural object, or False when unavailable
 
 # ── record-log line grammar ──────────────────────────────────────────────────
 
@@ -365,6 +385,28 @@ def quantile(sorted_vals, q):
     return sorted_vals[lo] * (1 - frac) + sorted_vals[hi] * frac
 
 
+def natural_law():
+    """The HL natural baseline (no cover), or None when forum/ is absent.
+
+    Loaded once and cached: the coefficient CSVs are small but this runs per
+    file group, and a fleet box without forum/ must not retry every time.
+    """
+    global _NATURAL
+    if _NATURAL is None:
+        _NATURAL = (hl_natural.load() if hl_natural is not None else None) or False
+    return _NATURAL or None
+
+
+def group_L(cands):
+    """Mean L = ln(start) of a group: the size the baseline is evaluated at.
+
+    A miner run can span more than one shift, so this is the run's effective
+    size; the report prints it next to the number so a mixed run is visible.
+    """
+    ls = [c.ln_start for c in cands if c.ln_start is not None]
+    return (sum(ls) / len(ls)) if ls else 0.0
+
+
 def fit_sigma(merits, m0=None):
     """Mean-excess (maximum-likelihood) scale of a shifted exponential.
 
@@ -517,6 +559,11 @@ def report_group(title, cands, table, args, out=sys.stdout, comparable=True):
         print("   rate           n/a (all candidates carry the same timestamp)",
               file=out)
 
+    # L is needed by the natural baseline below as well as by the window-scale
+    # line, so it is derived once here rather than inside the window-scale
+    # branch (which is skipped when no candidate carries a parseable start).
+    starts = [c.ln_start for c in cands if c.ln_start is not None]
+    L_nat = (sum(starts) / len(starts)) if starts else 0.0
     if merits:
         print(f"   merit          min {merits[0]:.4f}  "
               f"median {quantile(merits, 0.5):.4f}  max {merits[-1]:.4f}",
@@ -524,12 +571,35 @@ def report_group(title, cands, table, args, out=sys.stdout, comparable=True):
         print(f"   best gap       {best.gap}  merit {best.merit:.4f}  "
               f"at {best.iso}  (shift {best.shift}, "
               f"header_nonce {best.header_nonce})", file=out)
-        starts = [c.ln_start for c in cands if c.ln_start is not None]
         if starts:
-            L = sum(starts) / len(starts)
-            print(f"   window scale   L=ln(start) mean {L:.1f}   "
-                  f"mean bits {L / math.log(2):.0f}   (n={len(starts)})",
+            print(f"   window scale   L=ln(start) mean {L_nat:.1f}   "
+                  f"mean bits {L_nat / math.log(2):.0f}   (n={len(starts)})",
                   file=out)
+
+    # ── vs nature: the only non-self-referential reference we have ──────
+    # Everything in the fit block below is measured against an exponential
+    # fitted to these same candidates; this block measures the SAME observed
+    # counts against the Hardy-Littlewood natural law (no cover) at the run's
+    # own L, so a ratio here says whether the cover concentrates the search at
+    # all.  Reported before the fit so the reader sees the external reference
+    # first, and skipped silently when forum/ is not available.
+    nat = natural_law()
+    if nat is not None and L_nat > 0 and merits:
+        s_nat = nat.sigma(L_nat)
+        # fit_sigma is called here as well as below: the natural block is
+        # printed first, so it cannot rely on the tail block having run.
+        s_eff, _m0_eff = fit_sigma(merits)
+        print(f"   natural tail   sigma_nat={s_nat:.3f} at L={L_nat:.1f} "
+              "(HL, no cover"
+              + ("; extrapolated beyond g=%d" % nat.max_g
+                 if nat.is_extrapolated(L_nat) else "") + ")", file=out)
+        if s_eff:
+            print(f"                  sigma_eff={s_eff:.3f} -> cover gain "
+                  f"x{nat.gain(28.0, s_eff, L_nat):.1f} at merit 28, "
+                  f"x{nat.gain(40.0, s_eff, L_nat):.0f} at merit 40",
+                  file=out)
+        print("                  a tail that MATCHES this line means the cover "
+              "adds nothing at this size", file=out)
 
     # ── status accounting ────────────────────────────────────────────────────
     disc, verd = {}, {}
@@ -585,6 +655,28 @@ def report_group(title, cands, table, args, out=sys.stdout, comparable=True):
                 note = f"   [beyond noise: 2 sigma = {2.0 * sd:.2f}]"
             print(f"                    {thr:10.4f} {obs:8d} {exp:9.1f} {shown}"
                   f"{note}", file=out)
+        # The same depths against NATURE.  The expected column above comes from
+        # a fit to these very data, so only this comparison can say whether the
+        # cover is doing anything: a ratio above 1 means the observed tail is
+        # flatter than nature at that depth, which is what a cover is for.
+        if nat is not None and L_nat > 0:
+            e0 = nat.E(L_nat, m0)
+            print(f"                    vs nature (HL, no cover, L={L_nat:.1f}):",
+                  file=out)
+            print("                    m>=" + " " * 8
+                  + "observed    nat_exp  obs/nat", file=out)
+            for thr, obs, _exp, _ratio, _sd in rows:
+                en = len(merits) * math.exp(-(nat.E(L_nat, thr) - e0))
+                if en < 5:
+                    shown, note = "      -", "   [nat expected <5: ratio weak]"
+                else:
+                    r = obs / en
+                    shown = f"{r:7.2f}"
+                    note = ("   [flatter than nature = cover working]"
+                            if r > 1 else
+                            "   [steeper than nature = cover adds little]")
+                print(f"                    {thr:10.4f} {obs:8d} {en:9.1f} {shown}"
+                      f"{note}", file=out)
         # A ratio only means something if it is larger than the Poisson error of
         # the count behind it: at 6 expected events a ratio of 0.70 is pure
         # noise (2 sigma = 0.84), and letting that drive the verdict would
@@ -808,11 +900,29 @@ def make_plot(all_cands, groups, table, args, outpath):
                    for x in xs]
             ax[2].plot(xs, pdf, color=color, ls="--", lw=1.5,
                        label=f"exp fit sigma={sigma:.2f}")
+        # Dotted: the SAME axes against nature instead of against the data.
+        # The dashed curve is fitted to these candidates, so it can only reveal
+        # a shape mismatch; this one shows how far the run sits above what NO
+        # cover would give, i.e. the covering gain at this size.
+        nat = natural_law()
+        Lg = group_L(cands)
+        if nat is not None and Lg > 0 and merits[0] > 0:
+            m0n = merits[0]
+            width_n = max(1e-9, (merits[-1] - m0n)
+                          / max(8, min(40, len(merits) // 2)))
+            xs_n = [m0n + i * (merits[-1] - m0n) / 200.0 for i in range(201)]
+            pdf_n = [len(merits) * width_n * nat.slope(Lg, m0n)
+                     * math.exp(-(nat.E(Lg, x) - nat.E(Lg, m0n)))
+                     for x in xs_n]
+            ax[2].plot(xs_n, pdf_n, color=color, ls=":", lw=1.6,
+                       label=f"HL natural sigma_nat={nat.sigma(Lg):.2f} "
+                             "(no cover)")
     if args.share_target:
         ax[2].axvline(args.share_target, color="k", ls=":", lw=1)
         ax[2].text(args.share_target, 0, " share target", rotation=90, fontsize=7)
     ax[2].set_yscale("log")
-    ax[2].set_title("merit distribution vs the fitted exponential")
+    ax[2].set_title("merit distribution: fit to these data (dashed)\n"
+                    "vs HL natural, no cover (dotted)")
     ax[2].set_xlabel("merit")
     ax[2].set_ylabel("candidates (log)")
     ax[2].legend(fontsize=8)
@@ -834,9 +944,20 @@ def make_plot(all_cands, groups, table, args, outpath):
             xs = [m0 + i * (merits[0] - m0) / 200.0 for i in range(201)]
             ax[3].plot(xs, [math.exp(-(max(x - m0, 0.0)) / sigma) for x in xs],
                        color=color, ls="--", lw=1.2)
+        # Dotted: nature at this run's L.  The dashed fit comes from the same
+        # data it is compared with; this line is the external reference.
+        nat = natural_law()
+        Lg = group_L(cands)
+        if nat is not None and Lg > 0 and merits[-1] > 0:
+            m0n = merits[-1]
+            xs_n = [m0n + i * (merits[0] - m0n) / 200.0 for i in range(201)]
+            ax[3].plot(xs_n, [math.exp(-(nat.E(Lg, x) - nat.E(Lg, m0n)))
+                              for x in xs_n],
+                       color=color, ls=":", lw=1.6)
     ax[3].set_yscale("log")
-    ax[3].set_title("tail: observed P(merit >= m) vs exponential fit\n"
-                    "(a curve falling FASTER than its dash line = missing candidates)")
+    ax[3].set_title("tail: observed P(merit >= m)\n"
+                    "dashed = fit to these data, dotted = HL natural "
+                    "(falling faster than the DASH = missing candidates)")
     ax[3].set_xlabel("merit")
     ax[3].set_ylabel("P(merit >= m)")
     ax[3].legend(fontsize=8)

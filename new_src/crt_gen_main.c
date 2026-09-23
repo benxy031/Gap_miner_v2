@@ -49,8 +49,8 @@ int main(int argc, char **argv) {
         }
     }
 
-    if (shift < 14 || shift > 1024) {
-        fprintf(stderr, "error: --shift must be in [14, 1024]\n");
+    if (shift < 14 || shift > 1792) {
+        fprintf(stderr, "error: --shift must be in [14, 1792]\n");
         return 2;
     }
 

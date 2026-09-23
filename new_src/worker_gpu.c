@@ -52,7 +52,8 @@
  * candidate limbs are cached and advanced by 64-bit delta increments between
  * consecutive candidates instead of a GMP conversion + mpz_powm per candidate.
  * Falls back to the GMP base-2+3 Euler path when the limb count exceeds
- * PRIMALITY_CPU_MAX_LIMBS (not reachable for Gapcoin shifts ≤ 1024). */
+ * PRIMALITY_CPU_MAX_LIMBS (i.e. above shift 1024 in the 2048-bit GPU build;
+ * GAPMINER_CPU_LIMBS=1 then silently uses GMP, which is correct but slower). */
 struct worker_limb_cache {
     uint64_t limbs[PRIMALITY_CPU_MAX_LIMBS];
     int nlimbs;
@@ -128,6 +129,12 @@ static int worker_limb_cache_euler(struct worker_limb_cache *cache,
     cache->last_offset = offset;
     cache->valid = 1;
     if (cache->nlimbs <= 0) {
+        /* Candidate is wider than PRIMALITY_CPU_MAX_LIMBS limbs: export
+           truncated it.  Invalidate the cache, otherwise the NEXT candidate
+           would be advanced by a delta on top of the truncated value and
+           Euler-tested as a bogus 20-limb number (a false "probable prime").
+           Reachable once the shift ceiling exceeds 1024 (256+shift > 1280). */
+        cache->valid = 0;
         return euler_quick_probable_prime_with_context(euler_context, scratch);
     }
     return euler_test_cpu_nlimbs(cache->limbs, cache->nlimbs);

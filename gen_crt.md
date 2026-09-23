@@ -31,7 +31,7 @@ make bin/gen_crt
 Usage: bin/gen_crt --calc-ctr --ctr-primes N --ctr-file FILE [options]
 
   --calc-ctr            Calculate a CRT file (accepted for compatibility)
-  --ctr-primes N        Number of CRT primes (2..200)
+  --ctr-primes N        Number of CRT primes (2..256)
   --ctr-merit  M        Target merit (default 22.0)
   --ctr-bits   B        Extra bits: shift - log2(primorial) (default 0)
   --ctr-strength S      Greedy restarts / quality (default 50)
@@ -120,6 +120,23 @@ falls in `[450, 1024]`. `shift = ceil(log2(primorial)) + 8`:
 | 82 | 578 | 98 | 720 | 114 | 867 | 130 | 1017 |
 
 (The next prime, 131, yields shift 1027 > 1024, so 130 is the last.)
+
+The prime-count cap was raised 200 -> 256 on 2026-09-23 so large-L covers can be
+generated (a record hunt at 2048-bit numbers needs shift 1784). The same formula
+continues:
+
+| primes | shift | 256+shift | GPU AL | note |
+|-------:|------:|----------:|-------:|------|
+| 190 | 1609 | 1865 | 30 | AL%4, TPI=8 |
+| 195 | 1660 | 1916 | 30 | AL%4, TPI=8 |
+| 200 | 1712 | 1968 | 31 | odd AL -> scalar kernel (slow) |
+| 205 | 1763 | 2019 | 32 | AL%4, TPI=8 (last TPI=8 width) |
+| 207 | 1784 | 2040 | 32 | the shipped large-L file |
+| 208 | 1794 | 2050 | 33 | needs GPU_BITS >= 2112 (odd AL -> scalar) |
+| 256 | 2298 | 2554 | 40 | needs TPI=16 and GPU_BITS 2560 |
+
+Pick a prime count whose `256+shift` lands on an even AL with `AL%4 == 0`
+(that is the only family that runs CGBN at TPI=8, its measured optimum).
 
 ## Generating the whole set
 

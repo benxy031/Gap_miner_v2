@@ -174,7 +174,11 @@ static int run_gpu_fermat_device_path_test(void) {
     gmp_randinit_mt(rng);
     gmp_randseed_ui(rng, 0xD00D1234u);
 
-    static const int limb_cases[] = {5, 10, 12, 20};
+    /* 24/28/32 are the wide CGBN TPI=8 widths added with the 2048-bit build
+       (2026-09-23): AL=32 is the last width whose limbs/thread (AL/4) fits
+       CGBN's 8-limb half algorithm, so these three exercise the new
+       instantiation and rounding paths. */
+    static const int limb_cases[] = {5, 10, 12, 20, 24, 28, 32};
     int all_ok = 1;
 
     for (size_t ci = 0; ci < sizeof(limb_cases) / sizeof(limb_cases[0]); ci++) {

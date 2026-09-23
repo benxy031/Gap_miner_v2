@@ -1210,6 +1210,15 @@ static __host__ __forceinline__ int cgbn_supports_al(int al)
     #if NL >= 20
     case 20:
     #endif
+    #if NL >= 24
+    case 24:
+    #endif
+    #if NL >= 28
+    case 28:
+    #endif
+    #if NL >= 32
+    case 32:
+    #endif
         return 1;
     default:
         return 0;
@@ -1366,6 +1375,20 @@ static cudaError_t launch_fermat(int al, cudaStream_t stream,
             #endif
             #if NL >= 20
             CGBN_DISP_WIDE(20)                       /* 1280-bit */
+            #endif
+            /* AL=24/28/32 (1536/1792/2048-bit) are TPI=8-ONLY: TPI=4 would
+               need 12/14/16 limbs per thread, beyond CGBN's 4-limb half
+               algorithm (dlimbs_algs_multi is not implemented).  The auto
+               rule above already picks 8 for AL%4==0, so CGBN_DISP_WIDE is
+               safe here; GPU_FERMAT_TPI=4 must NOT be used at these widths. */
+            #if NL >= 24
+            CGBN_DISP_WIDE(24)                       /* 1536-bit */
+            #endif
+            #if NL >= 28
+            CGBN_DISP_WIDE(28)                       /* 1792-bit */
+            #endif
+            #if NL >= 32
+            CGBN_DISP_WIDE(32)                       /* 2048-bit */
             #endif
             /* All other AL: scalar fermat_kernel_t */
             default: break;
@@ -2014,8 +2037,19 @@ int gpu_fermat_limbs_for_bits(uint32_t bits)
         limbs = 12;
     } else if (limbs <= 16) {
         limbs = 16;
-    } else {
+    } else if (limbs <= 20) {
         limbs = 20;
+    } else if (limbs <= 24) {
+        limbs = 24;
+    } else if (limbs <= 28) {
+        limbs = 28;
+    } else if (limbs <= 32) {
+        limbs = 32;
+    } else {
+        /* Wider than any instantiated CGBN case: round UP to a multiple of
+           four so the value is never truncated below the true width, then let
+           the NL clamp below apply (callers guard 256+shift <= NL*64). */
+        limbs = ((limbs + 3) / 4) * 4;
     }
     if (limbs > NL) limbs = NL;
 #else

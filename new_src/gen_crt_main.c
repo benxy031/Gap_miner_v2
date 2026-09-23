@@ -24,7 +24,12 @@
 #include <time.h>
 #include <getopt.h>
 
-#define MAX_PRIMES 200
+/* Raised 200 -> 256 (Aug 2026): shift 1792 (h256+shift = 2048 bits, the widest
+   CGBN TPI=8 width) needs ~207 primes, and 200 capped the generator at shift
+   ~1703.  NOTE: the file's shift is DERIVED as ceil(log2(primorial)) + ctr-bits,
+   so n_primes > 208 produces shift > 1792 (2052+ bits, AL > 32), which the
+   shipped GPU_BITS=2048 build cannot run - check the shift in the output. */
+#define MAX_PRIMES 256
 
 static uint64_t g_primes[MAX_PRIMES];
 static int g_prime_count = 0;

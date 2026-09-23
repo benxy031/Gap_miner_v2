@@ -75,7 +75,7 @@ void gpu_adapter_set_candidate_bits(struct gpu_adapter *adapter, uint32_t bits) 
        (n < 2^bits < 2^(AL*64)) and lands on the production-verified CGBN
        paths. */
     {
-        static const int cgbn_als[] = {2, 4, 6, 8, 12, 16, 20};
+        static const int cgbn_als[] = {2, 4, 6, 8, 12, 16, 20, 24, 28, 32};
         int nl = (int)GPU_NLIMBS;
         if (limbs > nl) limbs = nl;
         for (size_t i = 0; i < sizeof(cgbn_als) / sizeof(cgbn_als[0]); i++) {

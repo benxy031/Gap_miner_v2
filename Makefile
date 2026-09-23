@@ -20,14 +20,15 @@ BUILD_DIR = build
 BIN_DIR = bin
 
 # Optional CUDA GPU Fermat acceleration (new_src/gpu/gpu_fermat.cu).
-# Enable with: make WITH_CUDA=1 [WITH_CGBN_FERMAT=1] [GPU_BITS=1280] [CUDA_ARCH=-arch=sm_86]
-# GPU_BITS default (1280 = 20 limbs) covers the full non-CRT shift range up to
-# 1024 (h256 256 bits + shift 1024 = 1280 bits). The active limb count is
+# Enable with: make WITH_CUDA=1 [WITH_CGBN_FERMAT=1] [GPU_BITS=2048] [CUDA_ARCH=-arch=sm_86]
+# GPU_BITS default (2048 = 32 limbs) covers h256 256 bits + shift 1792 = 2048
+# bits, the widest shift CGBN can run at TPI=8: above AL=32 the per-thread limb
+# count exceeds the 8-limb half algorithm CGBN implements. The active limb count is
 # narrowed at runtime per shift (gpu_adapter_set_candidate_bits), so low
 # shifts still run at their actual width (e.g. AL=6 at shift 26) and land on
 # CGBN's AL=6/TPI=4 fast path when WITH_CGBN_FERMAT=1. Without WITH_CUDA,
 # gpu_adapter.c falls back to the existing CPU (GMP) Fermat test unchanged.
-GPU_BITS ?= 1280
+GPU_BITS ?= 2048
 GPU_NLIMBS := $(shell echo '$(GPU_BITS) / 64' | bc)
 
 ifdef WITH_CUDA

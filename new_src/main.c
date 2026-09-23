@@ -371,7 +371,7 @@ void print_usage(const char *prog_name) {
     printf("  --user <name>         RPC username (default: benxy031)\n");
     printf("  --pass <pass>         RPC password (default: xx)\n");
     printf("  --threads <count>     Number of worker threads (default: 1)\n");
-    printf("  --shift <value>       Non-CRT shift (20-1024; default: 26); window scales through shift 26\n");
+    printf("  --shift <value>       Non-CRT shift (20-1792; default: 26); window scales through shift 26\n");
     printf("  --crt-file <path>     CRT covering file (text format from gen_crt); enables CRT\n");
     printf("                        mode: workers hash strided header nonces in parallel at the\n");
     printf("                        file's shift (--shift is ignored; pair with --threads N,\n");
@@ -592,9 +592,9 @@ int main(int argc, char *argv[]) {
                (unsigned long long)crt_rt.gap_target, crt_rt.merit);
     }
 
-    if (!crt_mode && (user_shift < 20 || user_shift > 1024)) {
+    if (!crt_mode && (user_shift < 20 || user_shift > 1792)) {
         fprintf(stderr,
-                "[Main] Non-CRT scanning supports --shift values from 20 through 1024\n");
+                "[Main] Non-CRT scanning supports --shift values from 20 through 1792\n");
         return 1;
     }
 

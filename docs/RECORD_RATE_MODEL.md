@@ -696,3 +696,60 @@ held the geometry fixed and moved ONLY the optimizer budget.
   (`gen_crt_batch.sh --only 207 --merit 30`, full strength) is the missing
   measurement; n=207 + `--bits 8` gives shift 1784 = 2040 bits = AL=32, the last
   width CGBN runs at its measured-optimal TPI=8.
+
+## 14. First large-L run: three verified records, and the deep tail is steeper (2026-09-24)
+
+`data/crt/m30/shift1784_p207_strong_m30.txt`, `--gap-hunt --gap-hunt-min-merit 21`,
+sieve 2M, single thread + RTX 3070.  Ran 7.1 h (7,658,496 windows, win_s_avg 298,
+last tick 285.7, cap_hits 0, vram_est 4026 MB, AL=32/TPI=8).
+
+### 14.1 Three FIRST_KNOWN_OCCURRENCEs, independently verified
+
+| gap | our merit | best known | margin | found (UTC) |
+|---:|---:|---:|---:|---|
+| 37882 | 26.803420 | 25.602900 | +1.2005 | 2026-09-23 22:22 |
+| 35180 | 24.891619 | 24.452400 | +0.4392 | 2026-09-24 00:38 |
+| 37204 | 26.323701 | 25.168400 | +1.1553 | 2026-09-24 02:19 |
+
+Checked with gmpy2 (independent of the miner): `start` is prime, `start+gap` is
+prime, **`nextprime(start) == start+gap`** (so it is a true consecutive-prime
+gap, not two distant primes), and `gap/ln(start)` reproduces the reported merit
+to <2e-7.  The frontier values come from the same table snapshot the watcher
+recorded (`sha256[:12]=b2bebffea359`).  Rate: **1 record per 2.4 h**, versus
+**0 records in 12.7 h** at the old L (shift 1017) - the honest aggregate estimate
+(1.53x all targets, 1.71x for margin >= 1) was conservative.
+
+### 14.2 The deep tail bends: sigma 1.52 (shallow) -> 1.10 (deep)
+
+From the 114 gaps the run logged at merit >= 21: min 21.0015, median 21.7175,
+mean 22.0971, max 26.8034, so **sigma_MLE = mean - 21 = 1.10**, against
+1.48-1.52 measured at the merit-10 threshold.  An exponential tail would be
+memoryless (sigma identical at every anchor); it is not, so every shallow-anchor
+extrapolation overestimates the deep rate.  Measured check: R10=0.0306/window
+with sigma=1.52 predicts 2.19e-5 gaps >= 21 per window; the run delivered
+114/7,658,496 = 1.489e-5, i.e. 0.68x.  With sigma=1.10 the same anchor predicts
+1.39e-5 - a match.  Practical rule: choose targets as close to the frontier
+minimum as possible, and do not quote a deep-target ETA derived from a shallow
+sigma.
+
+### 14.3 The frontier is not monotone in gap length
+
+At L=1414.02: frontier 27.04/27.99/28.25 at gaps 34266/34670/35388 (strong, our
+margin -2.8 to -3.5) but only 24.45/25.17/25.60 at 35180/37204/37882 (where all
+three records landed), and the weakest band in the whole 30k-40k region is
+38782-39454 (20.71-21.47).  So a record is won where the frontier has a hole, not
+where our merit is highest: the 38.8k-39.5k lengths are the easiest to beat in
+merit terms but need a merit ~27.4-27.9 from us, i.e. ~14x rarer than the lengths
+that actually delivered.
+
+### 14.4 These are merits-table records, not blocks
+
+`gap_hunt.h` takes an optional `start_hex` base anchor (NULL = 2^762) and every
+one of the run's 114 start primes shares the same 64-digit prefix: the hunt walks
+a FIXED synthetic base, not a node block header, so these gaps cannot be
+assembled into blocks.  They are first-known-occurrence entries for the prime-gap
+merit table only.  For reference, a fixed merit threshold (the block-difficulty
+form) is passed ~6x more often per second at L=882 than at L=1414 (2.6e-2 vs
+4.2e-3 gaps >= 21/s), because windows/s falls 4.45x with width while the merit
+distribution stays L-flat - the reason the fleet's block configuration is a
+separate decision, already settled by its own A/B.

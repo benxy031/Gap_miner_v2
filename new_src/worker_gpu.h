@@ -28,6 +28,19 @@
 #define NON_CRT_LOOKAHEAD_SIZE 8192U
 #define NON_CRT_WINDOW_CHUNK 8U
 
+/* Maximum number of worker threads.  The per-worker telemetry block is indexed
+   by worker id, so this is a MEMORY-SAFETY bound, not a tuning hint: main.c
+   clamps --threads to it and the array is sized from it, so no worker id can
+   ever index past the end.  Cost is 256 B of .bss per slot.
+   Why it matters (measured 2026-09-24 on the 2x3060 fleet): with the old
+   `[8]` array a 9th worker's `nonces_processed` fetch_add -- which runs once
+   per processed window -- landed exactly on the global `g_stop_requested`
+   (nm: g_worker_stats = 0x800 bytes at 0x14e0280, g_stop_requested at
+   0x14e0a80, and `nonces_processed` is the struct's first field), so
+   `--threads 9..12` silently stopped the whole run after ~1 header: GPUs at
+   0-2% utilization, no error message. */
+#define WORKER_STATS_MAX 64U
+
 struct crt_runtime;
 
 /* Owned-window sizing: window = 2^max(shift-14, MIN) capped at MAX.

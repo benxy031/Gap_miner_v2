@@ -185,7 +185,7 @@ struct worker_counter_state {
     _Atomic uint64_t sieve_extract_us;
 } __attribute__((aligned(64)));
 
-static struct worker_counter_state g_worker_stats[8] = {0};  /* Max 8 GPUs */
+static struct worker_counter_state g_worker_stats[WORKER_STATS_MAX] = {0};
 
 /* FUSED_STAGE_TIMING=1 enables the per-stage wall-clock accumulators above. */
 static int worker_stage_timing(void) {
@@ -200,7 +200,7 @@ static int worker_stage_timing(void) {
 
 /* Reset the optional stage-timing accumulators (no-op cost when unused). */
 static void worker_stage_reset(uint32_t worker_id) {
-    if (worker_id >= 8) return;
+    if (worker_id >= WORKER_STATS_MAX) return;
     atomic_store(&g_worker_stats[worker_id].us_mark, 0);
     atomic_store(&g_worker_stats[worker_id].us_extract, 0);
     atomic_store(&g_worker_stats[worker_id].us_collect, 0);

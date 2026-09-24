@@ -377,7 +377,9 @@ void print_usage(const char *prog_name) {
     printf("  --port <port>         Gapcoin RPC port (default: 31397)\n");
     printf("  --user <name>         RPC username (default: benxy031)\n");
     printf("  --pass <pass>         RPC password (default: xx)\n");
-    printf("  --threads <count>     Number of worker threads (default: 1)\n");
+    printf("  --threads <count>     Number of worker threads (default: 1; measured optimum on the\n");
+    printf("                        fused CRT chain path is 4 per GPU; values above %u are clamped)\n",
+           (unsigned)WORKER_STATS_MAX);
     printf("  --shift <value>       Non-CRT shift (20-1792; default: 26); window scales through shift 26\n");
     printf("  --crt-file <path>     CRT covering file (text format from gen_crt); enables CRT\n");
     printf("                        mode: workers hash strided header nonces in parallel at the\n");
@@ -501,7 +503,18 @@ int main(int argc, char *argv[]) {
         } else if (strcmp(argv[i], "--pass") == 0 && i + 1 < argc) {
             rpc_pass = argv[++i];
         } else if (strcmp(argv[i], "--threads") == 0 && i + 1 < argc) {
-            num_threads = atoi(argv[++i]);
+            long v = strtol(argv[++i], NULL, 10);
+            if (v < 1) v = 1;
+            if (v > (long)WORKER_STATS_MAX) {
+                fprintf(stderr,
+                        "[Main] --threads %ld exceeds the maximum %u worker "
+                        "ids (per-worker telemetry is indexed by worker id); "
+                        "using %u\n",
+                        v, (unsigned)WORKER_STATS_MAX,
+                        (unsigned)WORKER_STATS_MAX);
+                v = (long)WORKER_STATS_MAX;
+            }
+            num_threads = (uint32_t)v;
         } else if (strcmp(argv[i], "--shift") == 0 && i + 1 < argc) {
             user_shift = atoi(argv[++i]);
         } else if (strcmp(argv[i], "--crt-file") == 0 && i + 1 < argc) {

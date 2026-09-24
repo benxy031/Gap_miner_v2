@@ -1,0 +1,94 @@
+# Makefile.win - Windows host build of GapMiner V2 (MSYS2 MINGW64 shell).
+#
+# Two-toolchain layout (nvcc on Windows only accepts MSVC as host compiler):
+#   1. bin/gapgpu.dll    CUDA code (gpu_fermat.cu + gpu_sieve.cu) built by
+#                        nvcc + MSVC  -> windows/build_gpu_dll.bat
+#   2. bin/gapminer.exe  all the C host code built by MinGW-w64 GCC (this
+#                        file), linked directly against bin/gapgpu.dll.
+# The DLL boundary is the plain-C API of gpu_fermat.h / gpu_sieve.h
+# (extern "C"), exported through windows/gapgpu.def.
+#
+# Usage (MSYS2 MINGW64):  make -f Makefile.win [-j4] [all|tests|clean]
+# Normally driven by windows/build_host.sh.
+
+CC      ?= gcc
+BIN_DIR  = bin
+OBJ_DIR  = build-win
+SRC_DIR  = new_src
+TEST_DIR = tests
+
+# CUDA headers are only needed by the three GPU test programs, which call the
+# CUDA runtime directly (cudaMalloc/cudaMemcpy) to stage device buffers.
+CUDA_INC ?= /c/Program Files/NVIDIA GPU Computing Toolkit/CUDA/v12.9/include
+
+# Must match the value gapgpu.dll was built with (build_gpu_dll.bat uses the
+# same GPU_NLIMBS environment variable).  32 limbs = 2048-bit candidates, the
+# upstream default (GPU_BITS=2048 in the Linux Makefile).
+GPU_NLIMBS ?= 32
+
+# CUDA runtime DLL copied next to gapgpu.dll by build_gpu_dll.bat
+# (cudart64_12.dll with CUDA 12.x, cudart64_13.dll with CUDA 13.x).
+CUDART_DLL = $(firstword $(wildcard $(BIN_DIR)/cudart64_*.dll))
+
+CFLAGS  = -Wall -Wextra -O2 -g -std=c99 -MMD -MP \
+          -D__USE_MINGW_ANSI_STDIO=1 \
+          -DWITH_CUDA -DGPU_NLIMBS=$(GPU_NLIMBS) -DWITH_CGBN_FERMAT \
+          -include $(SRC_DIR)/win_compat.h -I$(SRC_DIR) \
+          $(shell pkg-config --cflags libcurl jansson)
+LDLIBS  = $(BIN_DIR)/gapgpu.dll \
+          $(shell pkg-config --libs libcurl jansson) \
+          -lgmp -lssl -lcrypto -lws2_32 -lm -pthread
+
+SOURCES = sieve_core gap_detection gap_dist halfclass primality_fermat \
+          primality_euler primality_bpsw primality_limbs atomic_nonce \
+          gap_priority crt_set gap_target covering crt_runtime worker_gpu \
+          miner_farm gpu_adapter gapcoin_rpc gapcoin_work block_assembly \
+          submission_pipeline merit_records record_log gap_hunt stratum
+
+OBJECTS = $(SOURCES:%=$(OBJ_DIR)/$(SRC_DIR)/%.o)
+
+# CPU-only tests (run anywhere) and GPU tests (need a CUDA device).
+CPU_TESTS = test_primality test_gap_detection test_sieve_core \
+            test_crt_submission test_block_submission test_halfclass
+GPU_TESTS = test_gpu_fermat test_gpu_sieve test_gpu_resolve
+
+CPU_TEST_BINS = $(CPU_TESTS:%=$(BIN_DIR)/%.exe)
+GPU_TEST_BINS = $(GPU_TESTS:%=$(BIN_DIR)/%.exe)
+
+.PHONY: all tests clean
+
+all: $(BIN_DIR)/gapminer.exe tests
+
+tests: $(CPU_TEST_BINS) $(GPU_TEST_BINS)
+
+$(BIN_DIR)/gapgpu.dll:
+	@echo "ERROR: $@ is missing - run windows\\build_gpu_dll.bat first" && exit 1
+
+$(OBJ_DIR)/%.o: %.c
+	@mkdir -p $(dir $@)
+	$(CC) $(CFLAGS) -c $< -o $@
+
+# GPU tests include <cuda_runtime.h>.
+$(OBJ_DIR)/$(TEST_DIR)/test_gpu_%.o: $(TEST_DIR)/test_gpu_%.c
+	@mkdir -p $(dir $@)
+	$(CC) $(CFLAGS) -I"$(CUDA_INC)" -Wno-builtin-macro-redefined -c $< -o $@
+
+$(BIN_DIR)/gapminer.exe: $(OBJECTS) $(OBJ_DIR)/$(SRC_DIR)/main.o $(BIN_DIR)/gapgpu.dll
+	$(CC) -o $@ $(OBJECTS) $(OBJ_DIR)/$(SRC_DIR)/main.o $(LDLIBS)
+	@echo "Built: $@"
+
+$(CPU_TEST_BINS): $(BIN_DIR)/%.exe: $(OBJECTS) $(OBJ_DIR)/$(TEST_DIR)/%.o $(BIN_DIR)/gapgpu.dll
+	$(CC) -o $@ $(OBJECTS) $(OBJ_DIR)/$(TEST_DIR)/$*.o $(LDLIBS)
+	@echo "Built: $@"
+
+# The GPU tests call the CUDA runtime themselves: link the same cudart DLL the
+# gapgpu.dll uses (copied next to it by build_gpu_dll.bat) so both share one
+# runtime instance and device pointers are interchangeable.
+$(GPU_TEST_BINS): $(BIN_DIR)/%.exe: $(OBJECTS) $(OBJ_DIR)/$(TEST_DIR)/%.o $(BIN_DIR)/gapgpu.dll
+	$(CC) -o $@ $(OBJECTS) $(OBJ_DIR)/$(TEST_DIR)/$*.o $(LDLIBS) $(CUDART_DLL)
+	@echo "Built: $@"
+
+clean:
+	rm -rf $(OBJ_DIR) $(BIN_DIR)/*.exe
+
+-include $(shell find $(OBJ_DIR) -name '*.d' 2>/dev/null)

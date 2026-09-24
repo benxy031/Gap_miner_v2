@@ -180,7 +180,7 @@ int main(int argc, char **argv) {
         mpz_add(cand, cand, nadd0);
         if (mpz_odd_p(cand))
             mpz_sub_ui(cand, cand, 1);
-        mpz_add_ui(cand, cand, (unsigned long)surv[k]);
+        mpz_add_ui(cand, cand, (uint64_t)surv[k]);
         if (mpz_probab_prime_p(cand, 12) > 0)
             prime_count_window++;
     }

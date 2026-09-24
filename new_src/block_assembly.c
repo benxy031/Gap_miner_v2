@@ -4,7 +4,9 @@
 #include <string.h>
 #include <stdio.h>
 #include <openssl/sha.h>
+#ifndef _WIN32
 #include <arpa/inet.h>
+#endif
 
 /* For little-endian byte order helpers */
 #ifndef htole16

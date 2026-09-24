@@ -1,0 +1,3 @@
+windows/*.bat text eol=crlf
+windows/*.sh text eol=lf
+Makefile.win text eol=lf

@@ -5,6 +5,11 @@
 
 #include "gpu_sieve.h"
 
+/* MSVC host compiler (Windows DLL build): clock_gettime / __atomic shims. */
+#ifdef _MSC_VER
+#  include "compat_win32.h"
+#endif
+
 #include <cuda_runtime.h>
 
 #include <limits.h>
@@ -664,7 +669,7 @@ __global__ static void gpu_sieve_residues_kernel(const uint64_t *base_limbs,
     uint64_t r = 0;
     for (int i = chunks - 1; i >= 0; i--) {
         uint64_t v = (r << 32) | base32[i];
-        uint64_t q = (uint64_t)(((unsigned __int128)v * inv) >> 64);
+        uint64_t q = __umul64hi(v, inv);  /* high 64 bits of v*inv (portable: no __int128 under MSVC) */
         r = v - q * p;
         if (r >= p) r -= p;
     }
@@ -697,7 +702,7 @@ __global__ static void gpu_sieve_rows_residues_kernel(
     uint64_t r = 0;
     for (int i = chunks - 1; i >= 0; i--) {
         uint64_t v = (r << 32) | base32[i];
-        uint64_t q = (uint64_t)(((unsigned __int128)v * inv) >> 64);
+        uint64_t q = __umul64hi(v, inv);  /* high 64 bits of v*inv (portable: no __int128 under MSVC) */
         r = v - q * p;
         if (r >= p) r -= p;
     }
@@ -707,7 +712,7 @@ __global__ static void gpu_sieve_rows_residues_kernel(
     uint64_t s = 0;
     for (int i = chunks - 1; i >= 0; i--) {
         uint64_t v = (s << 32) | step32[i];
-        uint64_t q = (uint64_t)(((unsigned __int128)v * inv) >> 64);
+        uint64_t q = __umul64hi(v, inv);  /* high 64 bits of v*inv (portable: no __int128 under MSVC) */
         s = v - q * p;
         if (s >= p) s -= p;
     }
@@ -1154,7 +1159,7 @@ __global__ static void gpu_sieve_residues_mark_pair_kernel(
     uint64_t r = 0;
     for (int i = chunks - 1; i >= 0; i--) {
         uint64_t v = (r << 32) | base32[i];
-        uint64_t q = (uint64_t)(((unsigned __int128)v * inv) >> 64);
+        uint64_t q = __umul64hi(v, inv);  /* high 64 bits of v*inv (portable: no __int128 under MSVC) */
         r = v - q * p;
         if (r >= p) r -= p;
     }
@@ -1204,7 +1209,7 @@ __global__ static void gpu_sieve_pair_mark_prep_kernel(
     uint64_t r = 0;
     for (int k = chunks - 1; k >= 0; k--) {
         uint64_t v = (r << 32) | base32[k];
-        uint64_t q = (uint64_t)(((unsigned __int128)v * inv) >> 64);
+        uint64_t q = __umul64hi(v, inv);  /* high 64 bits of v*inv (portable: no __int128 under MSVC) */
         r = v - q * p;
         if (r >= p) r -= p;
     }

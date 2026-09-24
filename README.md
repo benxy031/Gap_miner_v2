@@ -336,13 +336,17 @@ make clean && make WITH_CUDA=1 WITH_CGBN_FERMAT=1
 ./bin/test_gpu_fermat
 ```
 
+A native **Windows** build (nvcc + MSVC producing `bin/gapgpu.dll` for the GPU
+side, MinGW-w64 for the host and tests, no WSL) is documented in
+[`README_WINDOWS.md`](README_WINDOWS.md); the Linux Makefile is unaffected.
+
 Then enable it in the live pipeline with `--enable-gpu-fermat`; the CUDA
 base-2 Miller-Rabin test becomes the primality filter and the CPU Euler test is
 skipped. Candidates are batched across windows before each GPU call to amortize
 the kernel launch (a single window is far too small).
 
 The active limb count is rounded **up to the nearest CGBN-supported width**
-(`2, 4, 6, 8, 12, 16, 20` limbs) so widths without a valid CGBN instantiation
+(`2, 4, 6, 8, 12, 16, 20, 24, 28, 32` limbs) so widths without a valid CGBN instantiation
 — e.g. 514-bit candidates (AL=10: TPI=4 needs 5 limbs/thread, TPI=8 needs a
 non-integer 2.5) — are zero-padded to the next CGBN width instead of falling
 back to the register-heavy scalar kernel (measured on shift258: 610 → 2786

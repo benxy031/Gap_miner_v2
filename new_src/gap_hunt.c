@@ -554,7 +554,7 @@ static int gh_batch_fill(struct gh_batch *b, int slot, uint64_t k0,
         uint64_t k = k0 + i;
         b->base_k[i] = k;
         mpz_set(g->bk, g->b0);
-        mpz_addmul_ui(g->bk, g->P, (unsigned long)k);
+        mpz_addmul_ui(g->bk, g->P, (uint64_t)k);
         mpz_sub_ui(g->wb, g->bk, g->back_limit);
         mpz_set(b->win_base[i], g->wb);
         /* The CRT template prefilter assumes an EVEN base (even t -> even
@@ -1292,6 +1292,12 @@ int gap_hunt_run(const struct gap_hunt_config *cfg) {
        group, so a one-shot signal() handler (SA_RESETHAND) dies on the
        second delivery before the loop can shut down cleanly. */
     {
+#ifdef _WIN32
+        /* No sigaction on Windows; the MS CRT keeps a SIGINT handler
+           installed for console Ctrl+C, which is all this needs. */
+        signal(SIGINT, on_signal);
+        signal(SIGTERM, on_signal);
+#else
         struct sigaction sa;
         memset(&sa, 0, sizeof(sa));
         sa.sa_handler = on_signal;
@@ -1299,6 +1305,7 @@ int gap_hunt_run(const struct gap_hunt_config *cfg) {
         sa.sa_flags = SA_RESTART;
         sigaction(SIGINT, &sa, NULL);
         sigaction(SIGTERM, &sa, NULL);
+#endif
     }
 
     fprintf(stderr,

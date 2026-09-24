@@ -23,22 +23,84 @@
 
 #include "stratum.h"
 
+#ifdef _WIN32
+#include <winsock2.h>
+#include <ws2tcpip.h>
+#else
 #include <arpa/inet.h>
-#include <errno.h>
 #include <fcntl.h>
-#include <jansson.h>
 #include <netdb.h>
 #include <netinet/in.h>
 #include <netinet/tcp.h>
+#include <sys/select.h>
+#include <sys/socket.h>
+#include <unistd.h>
+#endif
+#include <errno.h>
+#include <jansson.h>
 #include <pthread.h>
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <sys/select.h>
-#include <sys/socket.h>
 #include <time.h>
-#include <unistd.h>
+
+/* ── Portable socket shims (Winsock on Windows, BSD sockets elsewhere) ──
+   Sockets are kept in an `int` as upstream does; on Windows a SOCKET handle
+   fits (INVALID_SOCKET casts to -1). */
+#ifdef _WIN32
+#ifndef SHUT_RDWR
+#define SHUT_RDWR SD_BOTH
+#endif
+static int net_init_once(void)
+{
+    static volatile LONG done = 0;
+    if (InterlockedCompareExchange(&done, 1, 0) == 0) {
+        WSADATA wsa;
+        if (WSAStartup(MAKEWORD(2, 2), &wsa) != 0) {
+            InterlockedExchange(&done, 0);
+            return -1;
+        }
+    }
+    return 0;
+}
+/* Map the last Winsock error onto the errno values the POSIX logic tests. */
+static int sock_errno(void)
+{
+    int e = WSAGetLastError();
+    switch (e) {
+    case WSAEWOULDBLOCK:
+    case WSAETIMEDOUT:
+        return EAGAIN;
+    case WSAEINTR:
+        return EINTR;
+    case WSAEINPROGRESS:
+        return EINPROGRESS;
+    default:
+        return e;
+    }
+}
+static int sock_connect_pending(void)
+{
+    int e = WSAGetLastError();
+    return e == WSAEWOULDBLOCK || e == WSAEINPROGRESS;
+}
+static void sock_set_nonblocking(int s, int on)
+{
+    u_long mode = on ? 1UL : 0UL;
+    (void)ioctlsocket((SOCKET)s, FIONBIO, &mode);
+}
+static void sock_close_fd(int s)
+{
+    (void)closesocket((SOCKET)s);
+}
+#define SOCK_ERRNO() sock_errno()
+#else
+static int net_init_once(void) { return 0; }
+static int sock_connect_pending(void) { return errno == EINPROGRESS; }
+static void sock_close_fd(int s) { (void)close(s); }
+#define SOCK_ERRNO() errno
+#endif
 
 #define STRATUM_HOST_MAX 256
 #define STRATUM_PORT_MAX 16
@@ -222,7 +284,7 @@ static void sock_close_safe(int *s)
 {
     if (*s >= 0) {
         shutdown(*s, SHUT_RDWR);
-        close(*s);
+        sock_close_fd(*s);
         *s = -1;
     }
 }
@@ -235,6 +297,11 @@ static int tcp_connect_timeout(const char *host, const char *port, int timeout_s
     struct addrinfo *res = NULL;
     int sock = -1;
 
+    if (net_init_once() != 0) {
+        stratum_log("network init failed");
+        return -1;
+    }
+
     memset(&hints, 0, sizeof(hints));
     hints.ai_family = AF_UNSPEC;
     hints.ai_socktype = SOCK_STREAM;
@@ -244,21 +311,25 @@ static int tcp_connect_timeout(const char *host, const char *port, int timeout_s
     }
 
     for (struct addrinfo *ai = res; ai; ai = ai->ai_next) {
-        int flags;
+        int flags = 0;
         int rc;
         fd_set wfds;
         struct timeval tv;
 
-        sock = socket(ai->ai_family, ai->ai_socktype, ai->ai_protocol);
+        sock = (int)socket(ai->ai_family, ai->ai_socktype, ai->ai_protocol);
         if (sock < 0)
             continue;
 
+#ifdef _WIN32
+        sock_set_nonblocking(sock, 1);
+#else
         flags = fcntl(sock, F_GETFL, 0);
         if (flags >= 0)
             (void)fcntl(sock, F_SETFL, flags | O_NONBLOCK);
+#endif
 
-        rc = connect(sock, ai->ai_addr, ai->ai_addrlen);
-        if (rc != 0 && errno != EINPROGRESS) {
+        rc = connect(sock, ai->ai_addr, (int)ai->ai_addrlen);
+        if (rc != 0 && !sock_connect_pending()) {
             sock_close_safe(&sock);
             continue;
         }
@@ -278,13 +349,25 @@ static int tcp_connect_timeout(const char *host, const char *port, int timeout_s
         {
             int soerr = 0;
             socklen_t slen = sizeof(soerr);
-            if (getsockopt(sock, SOL_SOCKET, SO_ERROR, &soerr, &slen) != 0 ||
+            if (getsockopt(sock, SOL_SOCKET, SO_ERROR, (void *)&soerr, &slen) != 0 ||
                 soerr != 0) {
                 sock_close_safe(&sock);
                 continue;
             }
         }
     connected:
+#ifdef _WIN32
+        (void)flags;
+        sock_set_nonblocking(sock, 0);
+        {
+            int one = 1;
+            (void)setsockopt(sock, IPPROTO_TCP, TCP_NODELAY,
+                             (const char *)&one, sizeof(one));
+        }
+        /* No SO_RCVTIMEO on Windows: a timed-out blocking recv() leaves a
+           Winsock connection in an indeterminate state.  stratum_recv_line
+           waits with select() instead, which gives the same idle tick. */
+#else
         if (flags >= 0)
             (void)fcntl(sock, F_SETFL, flags);
         {
@@ -295,6 +378,7 @@ static int tcp_connect_timeout(const char *host, const char *port, int timeout_s
             struct timeval rtv = { STRATUM_RECV_TIMEOUT_S, 0 };
             (void)setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &rtv, sizeof(rtv));
         }
+#endif
         break;
     }
 
@@ -308,14 +392,15 @@ static int stratum_send_raw(stratum_ctx *ctx, const char *buf, size_t len)
 {
     size_t sent = 0;
     while (sent < len) {
-        ssize_t n = send(ctx->sock, buf + sent, len - sent, 0);
+        ssize_t n = send(ctx->sock, buf + sent, (int)(len - sent), 0);
+        int err = n < 0 ? SOCK_ERRNO() : 0;
         if (n > 0) {
             sent += (size_t)n;
             continue;
         }
-        if (n < 0 && (errno == EINTR))
+        if (n < 0 && (err == EINTR))
             continue;
-        if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+        if (n < 0 && (err == EAGAIN || err == EWOULDBLOCK)) {
             fd_set wfds;
             struct timeval tv = { STRATUM_RECV_TIMEOUT_S, 0 };
             FD_ZERO(&wfds);
@@ -381,15 +466,32 @@ static int stratum_recv_line(stratum_ctx *ctx, char **out)
         }
 
         {
-            ssize_t n = recv(ctx->sock, ctx->recv_buf + ctx->recv_buf_len,
-                             ctx->recv_buf_cap - ctx->recv_buf_len - 1U, 0);
+            ssize_t n;
+            int err;
+#ifdef _WIN32
+            {
+                fd_set rfds;
+                struct timeval tv = { STRATUM_RECV_TIMEOUT_S, 0 };
+                int sr;
+                FD_ZERO(&rfds);
+                FD_SET((SOCKET)ctx->sock, &rfds);
+                sr = select(0, &rfds, NULL, NULL, &tv);
+                if (sr == 0)
+                    return -2;     /* idle tick, not an error */
+                if (sr < 0)
+                    return -1;
+            }
+#endif
+            n = recv(ctx->sock, ctx->recv_buf + ctx->recv_buf_len,
+                     (int)(ctx->recv_buf_cap - ctx->recv_buf_len - 1U), 0);
+            err = n < 0 ? SOCK_ERRNO() : 0;
             if (n > 0) {
                 ctx->recv_buf_len += (size_t)n;
                 continue;
             }
-            if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK))
+            if (n < 0 && (err == EAGAIN || err == EWOULDBLOCK))
                 return -2;         /* idle tick, not an error */
-            if (n < 0 && errno == EINTR)
+            if (n < 0 && err == EINTR)
                 continue;
             return -1;
         }

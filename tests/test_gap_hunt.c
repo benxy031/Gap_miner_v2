@@ -60,7 +60,7 @@ int main(int argc, char *argv[]) {
             continue;
         }
 
-        mpz_add_ui(end, start, (unsigned long)gap);
+        mpz_add_ui(end, start, (uint64_t)gap);
 
         /* True merit arithmetic: merit must equal gap / ln(start).
            Overflow-safe ln: mpz_get_d overflows above 2^1024 (shift >=

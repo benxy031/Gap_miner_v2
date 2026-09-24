@@ -7,6 +7,7 @@
  * Tests: Fermat, Euler, BPSW across known primes and composites
  */
 
+#include <inttypes.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -38,7 +39,7 @@ static int test_fermat_known_values(void) {
         mpz_set_ui(n, primes[i]);
         int result = fermat_test_probable_prime(n, 5);
         if (!result) {
-            printf("  ✗ FAIL: Fermat failed on prime %lu\n", primes[i]);
+            printf("  ✗ FAIL: Fermat failed on prime %" PRIu64 "\n", primes[i]);
             pass = 0;
         }
     }
@@ -48,7 +49,7 @@ static int test_fermat_known_values(void) {
         mpz_set_ui(n, composites[i]);
         int result = fermat_test_probable_prime(n, 5);
         if (result && composites[i] != 91) {  /* 91 = 7*13, pseudoprime to base 2 */
-            printf("  ✗ FAIL: Fermat passed on composite %lu\n", composites[i]);
+            printf("  ✗ FAIL: Fermat passed on composite %" PRIu64 "\n", composites[i]);
             pass = 0;
         }
     }
@@ -82,7 +83,7 @@ static int test_euler_known_values(void) {
         mpz_set_ui(n, primes[i]);
         int result = euler_criterion_base2(n);
         if (!result) {
-            printf("  ✗ FAIL: Euler failed on prime %lu\n", primes[i]);
+            printf("  ✗ FAIL: Euler failed on prime %" PRIu64 "\n", primes[i]);
             pass = 0;
         }
     }
@@ -92,7 +93,7 @@ static int test_euler_known_values(void) {
         mpz_set_ui(n, composites[i]);
         int result = euler_criterion_base2(n);
         if (result) {
-            printf("  ✗ FAIL: Euler passed on composite %lu\n", composites[i]);
+            printf("  ✗ FAIL: Euler passed on composite %" PRIu64 "\n", composites[i]);
             pass = 0;
         }
     }
@@ -121,7 +122,7 @@ static int test_euler_context_equivalence(void) {
         int reference = euler_criterion_base2(n) && euler_criterion(n, 3);
         int optimized = euler_quick_probable_prime_with_context(&context, n);
         if (reference != optimized) {
-            printf("  ✗ FAIL: Euler context mismatch on %lu\n", value);
+            printf("  ✗ FAIL: Euler context mismatch on %" PRIu64 "\n", value);
             pass = 0;
             break;
         }
@@ -157,7 +158,7 @@ static int test_miller_rabin_known_values(void) {
         mpz_set_ui(n, primes[i]);
         int result = miller_rabin_base2(n);
         if (!result) {
-            printf("  ✗ FAIL: Miller-Rabin failed on prime %lu\n", primes[i]);
+            printf("  ✗ FAIL: Miller-Rabin failed on prime %" PRIu64 "\n", primes[i]);
             pass = 0;
         }
     }
@@ -167,7 +168,7 @@ static int test_miller_rabin_known_values(void) {
         mpz_set_ui(n, composites[i]);
         int result = miller_rabin_base2(n);
         if (result) {
-            printf("  ✗ FAIL: Miller-Rabin passed on composite %lu\n", composites[i]);
+            printf("  ✗ FAIL: Miller-Rabin passed on composite %" PRIu64 "\n", composites[i]);
             pass = 0;
         }
     }
@@ -204,7 +205,7 @@ static int test_bpsw_combined(void) {
         mpz_set_ui(n, primes[i]);
         int result = baillie_psw_test(n);
         if (!result) {
-            printf("  ✗ FAIL: BPSW failed on prime %lu\n", primes[i]);
+            printf("  ✗ FAIL: BPSW failed on prime %" PRIu64 "\n", primes[i]);
             pass = 0;
         }
     }
@@ -214,7 +215,7 @@ static int test_bpsw_combined(void) {
         mpz_set_ui(n, composites[i]);
         int result = baillie_psw_test(n);
         if (result) {
-            printf("  ✗ FAIL: BPSW passed on composite %lu\n", composites[i]);
+            printf("  ✗ FAIL: BPSW passed on composite %" PRIu64 "\n", composites[i]);
             pass = 0;
         }
     }

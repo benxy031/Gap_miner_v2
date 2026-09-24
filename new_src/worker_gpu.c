@@ -15,6 +15,7 @@
 #define _POSIX_C_SOURCE 200809L
 
 #include "worker_gpu.h"
+#include <inttypes.h>
 #include "sieve_core.h"
 #include "gap_detection.h"
 #include "gap_dist.h"
@@ -107,7 +108,7 @@ static int worker_limb_cache_euler(struct worker_limb_cache *cache,
                                    uint64_t offset) {
     if (!worker_cpu_limbs_enabled()) {
         mpz_set(scratch, base);
-        mpz_add_ui(scratch, scratch, (unsigned long)offset);
+        mpz_add_ui(scratch, scratch, (uint64_t)offset);
         return euler_quick_probable_prime_with_context(euler_context, scratch);
     }
     if (cache->valid && offset >= cache->last_offset) {
@@ -123,7 +124,7 @@ static int worker_limb_cache_euler(struct worker_limb_cache *cache,
         cache->valid = 0;
     }
     mpz_set(scratch, base);
-    mpz_add_ui(scratch, scratch, (unsigned long)offset);
+    mpz_add_ui(scratch, scratch, (uint64_t)offset);
     cache->nlimbs = primality_limbs_export(scratch, cache->limbs,
                                            PRIMALITY_CPU_MAX_LIMBS);
     cache->last_offset = offset;
@@ -360,7 +361,7 @@ static void worker_set_base(mpz_t base, const uint8_t h256[32],
         mpz_add_ui(base, base, h256[i]);
     }
     mpz_mul_2exp(base, base, shift);
-    mpz_add_ui(base, base, (unsigned long)nadd);
+    mpz_add_ui(base, base, (uint64_t)nadd);
 }
 
 uint32_t non_crt_owned_window_size(uint32_t shift) {
@@ -571,9 +572,9 @@ static void worker_process_window(uint32_t worker_id, struct worker_config *conf
         atomic_fetch_add(&g_worker_stats[worker_id].merit_candidates, gap_count);
         for (uint32_t i = 0; i < gap_count; i++) {
             mpz_set(p1, base);
-            mpz_add_ui(p1, p1, (unsigned long)gaps[i].offset_p1);
+            mpz_add_ui(p1, p1, (uint64_t)gaps[i].offset_p1);
             mpz_set(p2, base);
-            mpz_add_ui(p2, p2, (unsigned long)gaps[i].offset_p2);
+            mpz_add_ui(p2, p2, (uint64_t)gaps[i].offset_p2);
 
             atomic_fetch_add(&g_worker_stats[worker_id].bpsw_attempts, 1);
             if (baillie_psw_verify_gap_boundaries(p1, p2)) {
@@ -1539,7 +1540,7 @@ void *worker_thread_run(void *arg) {
     if (gpu) gpu_adapter_free(gpu);
 #endif
     
-    printf("[Worker %u] Stopped (nonces=%lu, candidates=%lu, gaps=%lu, gpu_sieve_calls=%lu, gpu_sieve_windows=%lu)\n",
+    printf("[Worker %u] Stopped (nonces=%" PRIu64 ", candidates=%" PRIu64 ", gaps=%" PRIu64 ", gpu_sieve_calls=%" PRIu64 ", gpu_sieve_windows=%" PRIu64 ")\n",
            worker_id,
             atomic_load(&g_worker_stats[worker_id].nonces_processed),
             atomic_load(&g_worker_stats[worker_id].candidates_tested),
@@ -2879,9 +2880,9 @@ static void crt_scan_gaps(uint32_t worker_id, uint32_t height, uint32_t nonce,
         atomic_fetch_add(&g_worker_stats[worker_id].merit_candidates, gap_count);
         for (uint32_t i = 0; i < gap_count; i++) {
             mpz_set(p1, window_base);
-            mpz_add_ui(p1, p1, (unsigned long)gaps[i].offset_p1);
+            mpz_add_ui(p1, p1, (uint64_t)gaps[i].offset_p1);
             mpz_set(p2, window_base);
-            mpz_add_ui(p2, p2, (unsigned long)gaps[i].offset_p2);
+            mpz_add_ui(p2, p2, (uint64_t)gaps[i].offset_p2);
 
             atomic_fetch_add(&g_worker_stats[worker_id].bpsw_attempts, 1);
             if (baillie_psw_verify_gap_boundaries(p1, p2)) {
@@ -2890,8 +2891,8 @@ static void crt_scan_gaps(uint32_t worker_id, uint32_t height, uint32_t nonce,
                 /* Full-width adder = nadd0 - adj + position. */
                 mpz_set(nadd_full, nadd0);
                 if (rt->adj) mpz_sub_ui(nadd_full, nadd_full, rt->adj);
-                mpz_add_ui(nadd_full, nadd_full, (unsigned long)gaps[i].offset_p1);
-                mpz_sub_ui(nadd_full, nadd_full, (unsigned long)back_limit);
+                mpz_add_ui(nadd_full, nadd_full, (uint64_t)gaps[i].offset_p1);
+                mpz_sub_ui(nadd_full, nadd_full, (uint64_t)back_limit);
                 char *nadd_dec = mpz_get_str(NULL, 10, nadd_full);
 
                 if (atomic_load_explicit(&g_submission_enabled, memory_order_acquire)) {
@@ -3544,7 +3545,7 @@ void *worker_thread_run_crt(void *arg) {
                     /* Sieve [base - back_limit, base + scan_window) so the
                        preceding prime lands inside the window and gap
                        detection sees it. */
-                    mpz_sub_ui(window_base, base, (unsigned long)back_limit);
+                    mpz_sub_ui(window_base, base, (uint64_t)back_limit);
                     uint32_t base_mod60 =
                         half_class ? (uint32_t)mpz_fdiv_ui(window_base, 60)
                                    : 0U;
@@ -4119,7 +4120,7 @@ void *worker_thread_run_crt(void *arg) {
                nadd0_row, rowP, rowLimit, rowCount, NULL);
     euler_context_clear(&euler_context);
 
-    printf("[Worker %u] CRT stopped (scans=%lu, candidates=%lu, gaps=%lu, gpu_sieve_windows=%lu)\n",
+    printf("[Worker %u] CRT stopped (scans=%" PRIu64 ", candidates=%" PRIu64 ", gaps=%" PRIu64 ", gpu_sieve_windows=%" PRIu64 ")\n",
            worker_id,
            atomic_load(&g_worker_stats[worker_id].nonces_processed),
            atomic_load(&g_worker_stats[worker_id].candidates_tested),

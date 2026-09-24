@@ -18,6 +18,7 @@
 
 #define _POSIX_C_SOURCE 200809L
 
+#include <inttypes.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -441,6 +442,14 @@ void print_usage(const char *prog_name) {
 }
 
 int main(int argc, char *argv[]) {
+#ifdef _WIN32
+    /* The MS C runtime fully buffers stdout/stderr when redirected to a file
+       or pipe (there is no line buffering), so a log would only appear in
+       4 KB bursts.  Unbuffered output keeps redirected logs live; the stats
+       block is printed every few seconds, so the cost is negligible. */
+    setvbuf(stdout, NULL, _IONBF, 0);
+    setvbuf(stderr, NULL, _IONBF, 0);
+#endif
     printf("================================================\n");
     printf("GapMiner V2 — Prime Gap Mining Engine (Phase 6)\n");
     printf("================================================\n\n");
@@ -1441,13 +1450,13 @@ int main(int argc, char *argv[]) {
                       printf("  Throughput: %.0f windows/s (%.3f ms/window) | Rolling avg: %.0f/s\n",
                           throughput, time_per_nonce, prev_throughput);
                   }
-                  printf("  Processed: %lu windows | Sieve survivors: %lu\n",
+                  printf("  Processed: %" PRIu64 " windows | Sieve survivors: %" PRIu64 "\n",
                        stats.total_nonces, stats.total_candidates);
                   if (stats.total_smart_tail_skipped > 0) {
-                      printf("  Smart-scan: %lu tails skipped (uncovered region not needed)\n",
+                      printf("  Smart-scan: %" PRIu64 " tails skipped (uncovered region not needed)\n",
                           stats.total_smart_tail_skipped);
                   }
-                  printf("  Euler passes: %lu | Euler pairs: %lu | Merit candidates: %lu\n",
+                  printf("  Euler passes: %" PRIu64 " | Euler pairs: %" PRIu64 " | Merit candidates: %" PRIu64 "\n",
                       stats.total_euler_passes, stats.total_euler_pairs,
                       stats.total_merit_candidates);
                   {
@@ -1463,7 +1472,7 @@ int main(int argc, char *argv[]) {
                       double mr_per_1000_surv = stats.total_candidates ?
                           1000.0 * (double)stats.total_candidates_tested /
                           (double)stats.total_candidates : 0.0;
-                      printf("  GPU MR tests: %lu (%.1f/window, %.1f per 1000 survivors)\n",
+                      printf("  GPU MR tests: %" PRIu64 " (%.1f/window, %.1f per 1000 survivors)\n",
                           stats.total_candidates_tested, mr_per_window,
                           mr_per_1000_surv);
                   }
@@ -1504,7 +1513,7 @@ int main(int argc, char *argv[]) {
                           (double)stats.total_sieve_extract_us / 1e6);
                   }
                   if (stats.total_gpu_euler_skipped > 0) {
-                      printf("  GPU Fermat: %lu Euler calls skipped (composite pre-filter)\n",
+                      printf("  GPU Fermat: %" PRIu64 " Euler calls skipped (composite pre-filter)\n",
                           stats.total_gpu_euler_skipped);
                   }
                   if (stats.total_gpu_sieve_calls > 0 ||
@@ -1513,12 +1522,12 @@ int main(int argc, char *argv[]) {
                           double windows_per_batch =
                               (double)stats.total_gpu_sieve_windows /
                               (double)stats.total_gpu_sieve_calls;
-                          printf("  GPU sieve: %lu batches | %lu windows (avg %.2f windows/batch)\n",
+                          printf("  GPU sieve: %" PRIu64 " batches | %" PRIu64 " windows (avg %.2f windows/batch)\n",
                               stats.total_gpu_sieve_calls,
                               stats.total_gpu_sieve_windows,
                               windows_per_batch);
                       } else {
-                          printf("  GPU sieve: %lu windows\n",
+                          printf("  GPU sieve: %" PRIu64 " windows\n",
                               stats.total_gpu_sieve_windows);
                       }
                   }
@@ -1527,7 +1536,7 @@ int main(int argc, char *argv[]) {
                   printf("  Header bases: %llu | Current header nonce: %u\n",
                       (unsigned long long)header_bases, active_work.nonce);
                   if (enable_submission) {
-                      printf("  BPSW attempts: %lu | Passed: %lu | Submit: attempts=%llu accepted=%llu rejected=%llu stale=%llu asm_fail=%llu\n",
+                      printf("  BPSW attempts: %" PRIu64 " | Passed: %" PRIu64 " | Submit: attempts=%llu accepted=%llu rejected=%llu stale=%llu asm_fail=%llu\n",
                           stats.total_bpsw_attempts, stats.total_gaps,
                           (unsigned long long)g_submit_attempts,
                           (unsigned long long)g_submit_accepted,
@@ -1535,7 +1544,7 @@ int main(int argc, char *argv[]) {
                           (unsigned long long)g_submit_stale,
                           (unsigned long long)g_submit_assemble_failed);
                   } else {
-                      printf("  BPSW attempts: %lu | Passed: %lu | Submitted: %lu (dry-run)\n",
+                      printf("  BPSW attempts: %" PRIu64 " | Passed: %" PRIu64 " | Submitted: %" PRIu64 " (dry-run)\n",
                           stats.total_bpsw_attempts, stats.total_gaps,
                           stats.total_submissions);
                   }

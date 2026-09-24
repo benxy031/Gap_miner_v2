@@ -82,8 +82,39 @@ tests, the same trade the C knob already measured as break-even).
   flight -> bench says **+26%** (873k -> 1.10M). Smallest change that tests the
   mechanism; cost is 2x candidate VRAM (12 GB fleet cards yes, 8 GB dev card only
   at reduced K).
+
+  **BUILT, MEASURED, REFUTED, CODE REMOVED (2026-09-24; built as
+  `MINING_JUMP2_INTERLEAVE=1`).** The prediction above is wrong for this
+  pipeline: **-5.9%**, not +26% (ABBA, 90 s arms, `shift507_p74_lex_m30`, 2
+  workers, K=2048, chunk 12, merit 16 dry-run): interleave OFF 13,314 / 13,320
+  win/s (1,162,053 / 1,185,472 windows), ON 12,192 / 12,877 (1,142,017 /
+  1,149,500); **both ON arms below both OFF arms**, ON spread +-2.8%,
+  `tests/window` identical (79.7/79.6 vs 79.7/79.7). The mechanism really ran
+  (not a silent inline fallback): the `Fused stage split` chain stage collapses
+  94.1%/95.0% -> 0.1% while the ROUND COUNT is unchanged (14,769/15,432 vs
+  14,743/14,948).
+  Why the premise fails HERE: this packing is already at **~87% of the card's
+  realized AL=12 ceiling** (13,314 win/s x 79.7 = 1.06M tests/s vs the ~1.21M
+  measured for 2 workers at K=2048/C=12; `GPU MR acc/wall` 0.85-0.87), so the
+  headroom was ~13%, not the ~36% the bench curve suggested. Two concurrent
+  rounds **share the SMs**, so each round's latency grows while the host still
+  pays the same total collect waits, and the per-window pump adds bookkeeping:
+  latency spread, not throughput. (One real defect was found while building it
+  and is NOT in the tree: the gather staging was per *context*, not per *slot*,
+  so two flights sharing one `gpu_fermat_ctx` would overwrite each other's
+  gathered candidates -- a silent false-gap class. Any future concurrent-flights
+  design must fix that first.)
 * **Stage 2 — the refilled pool** (steps 1-4 above). Needs the queue + on-the-fly
   mark/extract scheduling; this is the full +36% design.
+
+  **Its premise must be re-derived before it is built.** Stage 2 keeps the same
+  "fuller/steadier batch per round" premise and therefore inherits the refutation
+  above: at the measured ~87%-busy card the binding cost is the HOST round trip
+  per round (one blocking collect per round in the window loop), not the batch
+  size. The version that is still open is "**no host wait in the window loop**"
+  -- a producer/consumer split or a device-resident work queue that the persistent
+  kernel pulls from -- and it must be justified by a measurement showing
+  `acc/wall` >> 1 with work queued on-device, not by the batch curve alone.
 
 ## Hazards (from this repo's own history — read before coding)
 

@@ -182,6 +182,22 @@ scripts/arith_ceiling.py             # paper model at our exact sizes (AL per
                                      # ceiling at 768 bits), not assumed
 scripts/arith_ceiling.py --json      # machine-readable
 scripts/arith_ceiling.py --realisation 1.0   # optimistic: no discount
+tools/rns_count.py [bits ...]        # "count before claiming" for the RNS-16 road
+                                     # (default 768/1024/1280).  BIJ needs
+                                     # M > 4N AND M' > 2N, i.e. K = K' = ceil((b+2)/16)
+                                     # ~= 49 at 768-bit -- NOT the K'=10 an earlier
+                                     # note assumed.  Multiply stream alone: 7203
+                                     # 16-bit products = 28812 int8 MACs = 0.497 ns/
+                                     # montmul at the measured mma8+repack rate
+                                     # (57950 GMAC/s), vs CGBN's MEASURED 0.717 ns
+                                     # (bin/bench_fermat 12 40000 20).  Best case
+                                     # 1.44x on the multiply stream only, and 67% of
+                                     # that work IS the base extension, while CGBN
+                                     # already sits at 35% of the IMAD peak (2.9x
+                                     # unused headroom in its own scalar domain).
+                                     # Verdict: road closed; reopen only with a
+                                     # MEASURED RNS-16 montmul step that beats
+                                     # 0.717 ns/montmul end to end.
 tools/convert_horizon_crt.py IN.txt OUT.txt --shift 512
                                      # convert a Horizon/Golden "ChineseSet" CRT
                                      # file into our text format so their covers

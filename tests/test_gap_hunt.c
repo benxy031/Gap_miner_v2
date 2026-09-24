@@ -34,7 +34,12 @@ int main(int argc, char *argv[]) {
 
     mpz_t start, end, next;
     mpz_inits(start, end, next, NULL);
-    char buf[1024];
+    /* The start prime is a decimal string of 256+shift bits: 614 digits at
+       shift 1784 (the widest GPU build), so the field must not be truncated.
+       The old 511-char field silently cut it down, and every large-L line then
+       failed the merit check (a shorter number means a smaller ln(start) and
+       therefore a larger apparent merit). */
+    char buf[4096];
     unsigned long long checked = 0, bad = 0;
     int lineno = 0;
 
@@ -44,8 +49,8 @@ int main(int argc, char *argv[]) {
             continue;
         unsigned long long gap;
         double merit;
-        char gapstr[64], meritstr[64], startstr[512];
-        int n = sscanf(buf, "%63s %63s %511s", gapstr, meritstr, startstr);
+        char gapstr[64], meritstr[64], startstr[2048];
+        int n = sscanf(buf, "%63s %63s %2047s", gapstr, meritstr, startstr);
         if (n != 3) {
             fprintf(stderr, "line %d: malformed (%d fields)\n", lineno, n);
             bad++;

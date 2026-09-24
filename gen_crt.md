@@ -65,8 +65,19 @@ Usage: bin/gen_crt --calc-ctr --ctr-primes N --ctr-file FILE [options]
                         lex objective.  Flag retained for provenance;
                         the test_run_profile tool measures the real
                         runtime constellation.
+                        EXACT REASON (derived 2026-09-24): while every
+                        run is shorter than D the cost factorizes as
+                           sum_j exp(-(D-r_j)/L) = exp(-D/L) * sum_j exp(r_j/L)
+                        so D CANCELS OUT -- the objective (and therefore
+                        the produced file) does not depend on D at all, and
+                        the whole run family is bounded by exp(r_max/L) ~ 1.23.
+                        Confirmed empirically at 74 primes / shift 507 / m30:
+                        D=16 -> 1151/1154/1157 candidates, D=24 -> 1140/1164/1155
+                        (production min-survivors file: 1141).
   --ctr-difficulty D    D (merit units) for --ctr-blocks-objective
-                        (default: the --ctr-merit value)
+                        (default: the --ctr-merit value).  DEAD DIAL while
+                        D >> run length -- see the factorization above; the
+                        flag is kept only so old command lines still parse.
   --ctr-range  R        Percent deviation from --ctr-primes (default 0)
   --ctr-file   FILE     Output CRT file (required)
   --help                Show this help message

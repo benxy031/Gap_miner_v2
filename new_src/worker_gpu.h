@@ -85,6 +85,8 @@ struct worker_stats {
     uint64_t gpu_sieve_calls;   /* Hybrid GPU bitmap sieve batch invocations */
     uint64_t gpu_sieve_windows; /* Windows processed through batched GPU sieve */
     uint64_t smart_tail_skipped; /* CRT windows whose uncovered tail was skipped */
+    uint64_t q48_certified_skips; /* covered regions skipped because the Q48
+                                     certificate proved them below target */
     uint64_t gpu_accounted_us;  /* GPU-accounted MR kernel time (CUDA events) */
     /* Fused stage split (only accumulated when FUSED_STAGE_TIMING=1). */
     uint64_t us_mark;           /* launching the GPU sieve mark */
@@ -114,6 +116,9 @@ struct gap_queue_entry {
     uint64_t nadd;                 /* Full-width adder offset within the header's shift range */
     uint8_t nadd_bytes[128];       /* Little-endian nAdd bytes (CRT: >64-bit offsets) */
     uint32_t nadd_len;             /* 0 => use legacy `nadd`; >0 => use nadd_bytes */
+    uint64_t q48_difficulty;       /* The node's own difficulty() for this gap (Q48 fixed
+                                      point, rand() refinement included).  0 means
+                                      "not computed" and the submit gate fails open. */
 };
 
 /* Get pending gap from queue (thread-safe) */

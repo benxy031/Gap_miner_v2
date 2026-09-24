@@ -66,6 +66,7 @@ struct farm_stats {
     uint64_t total_gpu_sieve_calls;
     uint64_t total_gpu_sieve_windows;
     uint64_t total_smart_tail_skipped;
+    uint64_t total_q48_certified_skips;  /* covered regions certified below target */
     uint64_t total_gpu_accounted_us;
     /* Fused stage split (FUSED_STAGE_TIMING=1 only; 0 otherwise). */
     uint64_t total_us_mark;

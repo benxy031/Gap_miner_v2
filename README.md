@@ -23,10 +23,50 @@ sieve → probable-prime filter → gap/merit filter → BPSW verify → submit
    `--enable-gpu-fermat` — a CUDA base-2 Miller-Rabin test that *replaces* it
    (a real prime never fails, so no gap is missed).
 3. **Gap/merit filter** — among probable primes, find consecutive pairs whose
-   gap merit clears the live node difficulty (or the `--merit` override).
+   gap merit clears the **template's own `nDifficulty`** (the Q48 value the node
+   will check the submitted header against; `--merit` overrides it, and in pool
+   mode the pool's share target takes its place). This is a *prefilter*: it sets
+   the scan window, and every candidate that reaches the submit stage is then
+   re-checked with Gapcoin's exact arithmetic before an RPC is spent — see
+   "Q48 submit gate" below.
 4. **BPSW verify** — only gaps above the threshold get the full Baillie–PSW
    check. By default the result is logged (`dry-run`); `--enable-submission`
    submits it as a real `submitblock` RPC call.
+
+### Q48 submit gate and certified interval rejection
+
+Gapcoin's proof of work is **not** "merit ≥ difficulty": the node accepts a gap
+when its own Q48 fixed-point difficulty `merit + rand(start,end) % m2` is at
+least the header's `nDifficulty` (`PoW::valid()`), and `rand()` can lift a gap
+whose merit is *below* the target by up to `m2 = 2/ln(start)` (≈0.002-0.01
+merit). Two consequences are handled explicitly:
+
+- **Threshold source.** `nDifficulty` belongs to the *template* being mined,
+  while `getmininginfo`'s `difficulty` describes the **tip**. When a template
+  raises the target, mining on the tip's value queues gaps the node answers with
+  `high-hash`; when it lowers it, the scan window is sized for a gap too small
+  to qualify. The default threshold therefore tracks the template
+  (`[Main] Active merit threshold … from template nDifficulty`) and falls back to
+  `getmininginfo` only before the first template is materialized.
+- **Exact gate.** Every gap reaching the submit stage carries the difficulty the
+  **worker** computed from its two endpoints (log line: `node_diff=…`), and
+  `main` compares it against the `nDifficulty` inside the very 80-byte header it
+  is about to submit. A gap that fails is dropped locally and counted as
+  `below_target` instead of costing a `submitblock` (record log:
+  `status=below-target`). Both sides fail open: an unknown target or an
+  uncomputed difficulty submits as before.
+
+The same arithmetic is used to **certify** skips: a span that provably cannot
+reach the target (every gap inside it is shorter than the span itself, and even
+`rand()` cannot lift it) is rejected without examining the covered region, with
+any doubt falling back to examination. Emitted as `Q48 certificate: N covered
+regions proven below target` in STATS. New `below_target=` field next to
+`asm_fail=` in the submit line.
+
+The port is bit-exact against the node's own implementation and is verified by
+`tests/test_pow_q48.c` against committed vectors generated from Gapcoin's
+`src/PoWCore/PoWUtils.cpp` (`scripts/gen_pow_q48_vectors.sh`, oracle in
+`tools/pow_q48_oracle.cpp`). See `docs/GAPCOIN_Q48.md`.
 
 ## Two search modes
 
@@ -526,6 +566,10 @@ with 6 decimals, the record-submission precision).  Validate with
 `bin/test_gap_hunt <out-file>` (checks `nextprime(start) == start + gap` for
 every record).
 
+Validate the proof-of-work arithmetic against the node's own implementation:
+`./bin/test_pow_q48` (bit-exact vectors in `tests/data/pow_q48_vectors.txt`;
+regenerate with `GAPCOIN_SRC=/path/to/Gapcoin scripts/gen_pow_q48_vectors.sh`).
+
 Automatic record checking while the hunt runs (follows the results file,
 compares each gap against `data/prime_gap_merits.txt`, appends new records to
 `gap_hunt_records_found.txt` with a versioned comparison snapshot and the
@@ -579,8 +623,8 @@ covers are deployed in `gap_hunt_fleet.conf`.
 | `--shift <v>` | `26` | Non-CRT shift (`20..1792`); candidate = `256+shift` bits. The ceiling is `GPU_BITS-256` (default `GPU_BITS=2048` = 32 limbs = shift 1792, the widest width CGBN runs at TPI=8) |
 | `--crt-file <path>` | none | Enable CRT covering mode; the file's shift overrides `--shift` |
 | `--sieve-primes <n>` | `50000` | Small-prime sieve limit. Non-CRT + `--enable-gpu-fermat`: adaptive bit-scaled default (`log2(depth)` interpolated between 282-bit → window+halo cover and 311-bit → 20M, clamped to `[cover, 20M]`; measured +14% win/s at shift 55, deeper than 20M makes the CPU sieve the bottleneck). With `HALF_CLASS` the 311-bit anchor drops to 5M (measured peak at shift 55: 5M = 609 win/s vs 20M = 391). CRT mode: `10000000` on CPU, `100000` on GPU, `2000000` on the fused GPU path (`FUSED_GPU=1`; measured on the production host at shift475 live merit: 500K=3183, 1M=3197, 2M=3324, 5M=3205 win/s — 2M is the optimum; older dev-host runs: shift258 3106 win/s at 1M vs 2814 at 5M, shift509 1971 vs 1905). GAP_HUNT: default **`2000000`** (lowered from 10M on 2026-09-15; re-measured with the chunked mark split and the jump2 chain on, where the curve is flat-then-falling: shift507 0.5M=1893, 1M=1908, 2M=1897, 5M=1819, 10M=1736, 20M=1558 win/s; shift1017 2M=599, 5M=596, 10M=593, 20M=538 — 2M is equal-best at both shifts with 5× less prime table and faster startup; record parity at 2M vs 10M verified: identical gap/merit/start over the same k range. The older "deeper sieving trims survivors directly" advice (2M=91, 10M=154, 20M=161 win/s at shift1017) was measured in the full-scan path *before* the mark split, when the host sieve dominated; it no longer holds in chain mode) |
-| `--merit <v>` | node difficulty | Merit threshold override (lower = more BPSW work) |
-| `--enable-submission` | off | Submit BPSW-verified gaps via `submitblock`. In **pool mode** (`--stratum`) this is what enables share submission: without it the miner connects, finds qualifying gaps and sends **nothing** to the pool (the record log still fills up, which is exactly how a "mining but never credited" run looks). The block-assembly buffer is **sized from the live template** (`gapcoin_gbt_submission_hex_need()`: header + CompactSize + a coinbase bound + every template tx), with `GAPCOIN_SUBMIT_HEX_CAP` (256 KiB of hex = a 128 KiB block) only as a FLOOR — a node whose mempool holds large transactions hands out templates well above that floor, and a hard ceiling there makes the builder return `-1` for every candidate with no RPC attempt at all (2026-09-18 incident: 470 KB of template txs vs the old 128 KB cap; 6 gaps lost and, worse, never written to the record log). The stats line reports `Submit: attempts=… accepted=… rejected=… stale=… asm_fail=…`, where **`asm_fail` is local assembly failure, NOT a node rejection**: the gap was never offered to the node (it used to be added to `stale`), and it is written to the record log with `status=assemble-failed`. `stale` means only that the header had already rotated when the gap was queued. Assembly failures are always loud on stderr (`[gapcoin_work] block assembly needs …` / `coinbase build failed` / `template tx N/M unusable`) |
+| `--merit <v>` | template `nDifficulty` (pool mode: the pool's share target; before the first template: `getmininginfo`'s difficulty) | Merit threshold override — a **prefilter**, not the submit rule. The default is the template's own Q48 `nDifficulty` divided by 2^48, re-read automatically on every new template; `--merit` pins it and disables those re-reads. The threshold sizes the scan window and the BPSW work, so lowering it costs CPU while the exact Q48 gate (see "Q48 submit gate") still decides what is actually submitted. Example: `--merit 22.5` |
+| `--enable-submission` | off | Submit BPSW-verified gaps via `submitblock`. In **pool mode** (`--stratum`) this is what enables share submission: without it the miner connects, finds qualifying gaps and sends **nothing** to the pool (the record log still fills up, which is exactly how a "mining but never credited" run looks). The block-assembly buffer is **sized from the live template** (`gapcoin_gbt_submission_hex_need()`: header + CompactSize + a coinbase bound + every template tx), with `GAPCOIN_SUBMIT_HEX_CAP` (256 KiB of hex = a 128 KiB block) only as a FLOOR — a node whose mempool holds large transactions hands out templates well above that floor, and a hard ceiling there makes the builder return `-1` for every candidate with no RPC attempt at all (2026-09-18 incident: 470 KB of template txs vs the old 128 KB cap; 6 gaps lost and, worse, never written to the record log). The stats line reports `Submit: attempts=… accepted=… rejected=… stale=… asm_fail=… below_target=…`, where **`asm_fail` is local assembly failure, NOT a node rejection**: the gap was never offered to the node (it used to be added to `stale`), and it is written to the record log with `status=assemble-failed`. `stale` means only that the header had already rotated when the gap was queued. Assembly failures are always loud on stderr (`[gapcoin_work] block assembly needs …` / `coinbase build failed` / `template tx N/M unusable`) |
 | `--coinbase-script-hex <hex>` | none (`OP_TRUE`) | Payout scriptPubKey for submitted blocks. **Ignored in pool mode** (`--stratum`): the pool owns the coinbase and pays your pool account, so the OP_TRUE fallback warning is suppressed there too |
 | `--stratum <host:port>` | off | Mine on a Gapcoin **pool** instead of a local node (accepts `stratum+tcp://host:port`). Speaks the **legacy** Gapcoin pool protocol — the one the official miners use — which is what suprnova serves on port **2434**; port **2433** is suprnova's private "new stratum" that only their own closed miners implement, so it is not supported. Pool mode contacts **no node**: the pool's 80-byte header becomes the work, the pool's **share target** becomes the merit threshold, and solutions go back as `mining.submit` PoW payloads (`hdr80 + nNonce(LE) + nShift(LE) + nAdd(LE)`, >86 bytes) — no coinbase, no block assembly, no `submitblock`. There is **no share/block flag in the protocol**: the envelope is identical and the pool classifies the solution by merit (share above its target, block above network difficulty), which is why the default threshold is the share target rather than the network difficulty — override with `--merit`. Record-log entries carry `height=0` (the legacy protocol has no height) and the verdict adds `status=accepted` / `rejected` / `unresolved`. Verified live on 2026-09-19 against `gap.suprnova.cc:2434`: 90 s, **88 shares queued, 88 accepted, 0 rejected**, pool share target 15.7726 merit with network difficulty 23.7473 merit decoded from the header; and a 6-minute run after the push-method fix: **308 queued, 308 accepted, 0 rejected** across 40 adopted template rotations. See `docs/POOL_STRATUM.md` |
 | `--stratum-user <name>` | — | Pool worker, or the wallet address for anonymous mining (fallback: `GAPMINER_STRATUM_USER`). Only needed when no auth file is used: a worker name on line 1 of `--stratum-auth-file` takes precedence over this flag |

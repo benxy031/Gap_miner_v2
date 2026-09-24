@@ -32,6 +32,7 @@
 #include "miner_farm.h"
 #include "gapcoin_rpc.h"
 #include "gapcoin_work.h"
+#include "pow_q48.h"
 #include "worker_gpu.h"
 #include "merit_records.h"
 #include "record_log.h"
@@ -57,6 +58,11 @@ static uint64_t g_submit_stale = 0;
    They used to be added to g_submit_stale, which made a local buffer bug look
    like a node rejection (2026-09-18). */
 static uint64_t g_submit_assemble_failed = 0;
+/* Gaps dropped by the exact Gapcoin Q48 gate: the worker computed the very
+   difficulty() the node computes, and the header about to be submitted
+   carries the template nDifficulty it must beat.  These would have come back
+   as "high-hash"; they are counted instead of costing an RPC (see README). */
+static uint64_t g_submit_below_target = 0;
 
 /* RPC polling thread state */
 static volatile int g_rpc_running = 0;
@@ -1059,6 +1065,23 @@ int main(int argc, char *argv[]) {
                 prev_height = tmpl->height;
             }
 
+            /* The template's own nDifficulty (Q48) is the authority for the
+               merit threshold: it is exactly what the node compares the
+               submitted header against, while getmininginfo's "difficulty"
+               describes the TIP.  When a template raises the target, mining
+               against the tip's value makes every queued gap come back as
+               "high-hash" (and mining against a too-SMALL window misses the
+               gaps that would qualify). */
+            if (!merit_threshold_overridden && tmpl->difficulty != 0) {
+                double tmpl_merit = pow_q48_readable(tmpl->difficulty);
+                if (tmpl_merit > 0.0 && tmpl_merit != merit_threshold) {
+                    merit_threshold = tmpl_merit;
+                    miner_farm_set_merit_threshold(g_farm, merit_threshold);
+                    printf("[Main] Active merit threshold %.4f from template nDifficulty\n",
+                           merit_threshold);
+                }
+            }
+
             if (gapcoin_gbt_work_init(&active_work, tmpl) != 0) {
                 fprintf(stderr, "[Main] Stopping: cannot materialize new GBT header\n");
                 miner_farm_stop(g_farm);
@@ -1251,6 +1274,37 @@ int main(int argc, char *argv[]) {
                     continue;
                 }
 
+                /* Exact submit gate (Gapcoin Q48).  The 80 byte header about
+                   to be submitted carries the template's nDifficulty at offset
+                   72, and the worker stored the gap's difficulty() exactly as
+                   the node computes it (rand() refinement included).  A gap
+                   that fails this comparison would come back as "high-hash",
+                   so it is dropped here and counted instead of costing an RPC.
+                   0 on either side means "unknown" and fails open to the old
+                   behaviour. */
+                {
+                    uint64_t q48_target =
+                        pow_q48_target_from_header(active_work.header_prefix);
+                    if (q48_target != 0 && entry.q48_difficulty != 0 &&
+                        entry.q48_difficulty < q48_target) {
+                        g_submit_below_target++;
+                        fprintf(stderr,
+                                "[Main] Not submitting: gap below the template target "
+                                "(height=%u nAdd=%s gap=%u merit=%.4f node_diff=%.4f "
+                                "target=%.4f)\n",
+                                entry.height, nadd_dec ? nadd_dec : "?",
+                                entry.gap_length, entry.merit,
+                                pow_q48_readable(entry.q48_difficulty),
+                                pow_q48_readable(q48_target));
+                        record_log_write_outcome_big(entry.height, entry.shift,
+                                                     entry.header_nonce, nadd_dec,
+                                                     entry.gap_length, entry.merit,
+                                                     "below-target");
+                        free(nadd_dec);
+                        continue;
+                    }
+                }
+
                 /* Size the assembly buffer from THIS template: a node whose
                    mempool holds large transactions hands out templates far
                    bigger than the 128 KiB floor, and a short buffer makes the
@@ -1372,13 +1426,21 @@ int main(int argc, char *argv[]) {
                 info = gapcoin_rpc_get_mining_info(g_rpc);
             }
             if (info) {
+                /* Node mode: the live template is the authority (see above);
+                   getmininginfo is only the fallback while no template has
+                   been materialized yet. */
+                double node_target = (tmpl && tmpl->difficulty != 0)
+                                         ? pow_q48_readable(tmpl->difficulty)
+                                         : info->difficulty;
                 if (!pool_info_local && !merit_threshold_overridden &&
-                    info->difficulty > 0.0 &&
-                    info->difficulty != merit_threshold) {
-                    merit_threshold = info->difficulty;
+                    node_target > 0.0 &&
+                    node_target != merit_threshold) {
+                    merit_threshold = node_target;
                     miner_farm_set_merit_threshold(g_farm, merit_threshold);
-                    printf("[Main] Updated active merit threshold to %.2f from node difficulty\n",
-                           merit_threshold);
+                    printf("[Main] Updated active merit threshold to %.4f from %s\n",
+                           merit_threshold,
+                           (tmpl && tmpl->difficulty != 0) ? "template nDifficulty"
+                                                           : "node difficulty");
                 }
 
                 /* Calculate throughput over last 30 seconds */
@@ -1455,6 +1517,10 @@ int main(int argc, char *argv[]) {
                   if (stats.total_smart_tail_skipped > 0) {
                       printf("  Smart-scan: %" PRIu64 " tails skipped (uncovered region not needed)\n",
                           stats.total_smart_tail_skipped);
+                  }
+                  if (stats.total_q48_certified_skips > 0) {
+                      printf("  Q48 certificate: %" PRIu64 " covered regions proven below target (resolve skipped)\n",
+                          stats.total_q48_certified_skips);
                   }
                   printf("  Euler passes: %" PRIu64 " | Euler pairs: %" PRIu64 " | Merit candidates: %" PRIu64 "\n",
                       stats.total_euler_passes, stats.total_euler_pairs,
@@ -1536,13 +1602,14 @@ int main(int argc, char *argv[]) {
                   printf("  Header bases: %llu | Current header nonce: %u\n",
                       (unsigned long long)header_bases, active_work.nonce);
                   if (enable_submission) {
-                      printf("  BPSW attempts: %" PRIu64 " | Passed: %" PRIu64 " | Submit: attempts=%llu accepted=%llu rejected=%llu stale=%llu asm_fail=%llu\n",
+                      printf("  BPSW attempts: %" PRIu64 " | Passed: %" PRIu64 " | Submit: attempts=%llu accepted=%llu rejected=%llu stale=%llu asm_fail=%llu below_target=%llu\n",
                           stats.total_bpsw_attempts, stats.total_gaps,
                           (unsigned long long)g_submit_attempts,
                           (unsigned long long)g_submit_accepted,
                           (unsigned long long)g_submit_rejected,
                           (unsigned long long)g_submit_stale,
-                          (unsigned long long)g_submit_assemble_failed);
+                          (unsigned long long)g_submit_assemble_failed,
+                          (unsigned long long)g_submit_below_target);
                   } else {
                       printf("  BPSW attempts: %" PRIu64 " | Passed: %" PRIu64 " | Submitted: %" PRIu64 " (dry-run)\n",
                           stats.total_bpsw_attempts, stats.total_gaps,

@@ -125,6 +125,7 @@ void miner_farm_get_stats(struct miner_farm *farm, struct farm_stats *stats) {
         stats->total_gpu_sieve_calls += wstats.gpu_sieve_calls;
         stats->total_gpu_sieve_windows += wstats.gpu_sieve_windows;
         stats->total_smart_tail_skipped += wstats.smart_tail_skipped;
+        stats->total_q48_certified_skips += wstats.q48_certified_skips;
         stats->total_gpu_accounted_us += wstats.gpu_accounted_us;
         stats->total_us_mark += wstats.us_mark;
         stats->total_us_extract += wstats.us_extract;

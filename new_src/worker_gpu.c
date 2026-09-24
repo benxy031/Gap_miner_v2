@@ -26,6 +26,7 @@
 #include "gpu_adapter.h"
 #include "crt_runtime.h"
 #include "gapcoin_work.h"
+#include "pow_q48.h"
 #ifdef WITH_CUDA
 #include "gpu/gpu_sieve.h"
 #include "gpu/gpu_fermat.h"
@@ -167,6 +168,7 @@ struct worker_counter_state {
     _Atomic uint64_t gpu_sieve_calls;
     _Atomic uint64_t gpu_sieve_windows;
     _Atomic uint64_t smart_tail_skipped;
+    _Atomic uint64_t q48_certified_skips;
     _Atomic uint64_t gpu_accounted_us;
     /* Stage split (FUSED_STAGE_TIMING=1).  Host wall time per fused stage,
        accumulated in microseconds.  The defaults cost one atomic load per
@@ -265,6 +267,17 @@ static pthread_mutex_t g_gap_queue_lock = PTHREAD_MUTEX_INITIALIZER;
 /* Disabled by default; main enables it only when the operator opts in. */
 static _Atomic int g_submission_enabled = 0;
 
+/*
+ * The template's nDifficulty (Gapcoin Q48) for the current work generation,
+ * read from the same 80 byte header prefix that gets hashed and submitted.
+ * It is the authority for "can this gap reach the target at all" decisions
+ * inside the scan (certified interval rejection, see crt_scan_gaps); 0 means
+ * unknown and every such decision then fails open to the old behaviour.
+ * This is set under work_lock by the snapshots, i.e. it changes only when the
+ * worker picks up new work -- never mid-generation.
+ */
+static _Atomic uint64_t g_q48_target = 0;
+
 void worker_set_submission_enabled(int enabled) {
     atomic_store_explicit(&g_submission_enabled, enabled ? 1 : 0, memory_order_release);
 }
@@ -311,6 +324,9 @@ static int worker_snapshot_work(const struct worker_config *config,
     *height = config->height;
     *shift = config->shift;
     *merit_threshold = config->merit_threshold;
+    atomic_store_explicit(&g_q48_target,
+                          pow_q48_target_from_header(config->hdr80),
+                          memory_order_release);
     memcpy(h256, config->h256, 32);
     *header_nonce = config->header_nonce;
     pthread_mutex_unlock(config->work_lock);
@@ -347,6 +363,9 @@ static int worker_snapshot_crt_work(const struct worker_config *config,
 
     *height = config->height;
     *merit_threshold = config->merit_threshold;
+    atomic_store_explicit(&g_q48_target,
+                          pow_q48_target_from_header(config->hdr80),
+                          memory_order_release);
     memcpy(hdr80, config->hdr80, 80);
     *pass_nonce = config->pass_nonce;
     pthread_mutex_unlock(config->work_lock);
@@ -589,11 +608,17 @@ static void worker_process_window(uint32_t worker_id, struct worker_config *conf
                     entry.generation = generation;
                     entry.header_nonce = header_nonce;
                     entry.nadd = nadd;
+                    /* The node's own verdict input: difficulty(p1,p2) in Q48.
+                       Main compares it with the nDifficulty in the header it
+                       is about to submit, so a gap the node would answer with
+                       "high-hash" never costs an RPC. */
+                    entry.q48_difficulty = pow_q48_difficulty(p1, p2);
                     int queued = worker_queue_push(&entry);
                     fprintf(stderr,
-                            "[Worker %u] BPSW candidate: height=%u nAdd=%llu gap=%u merit=%.2f (%s)\n",
+                            "[Worker %u] BPSW candidate: height=%u nAdd=%llu gap=%u merit=%.2f node_diff=%.4f (%s)\n",
                             worker_id, height, (unsigned long long)nadd,
                             gaps[i].gap_length, gaps[i].merit,
+                            pow_q48_readable(entry.q48_difficulty),
                             queued ? "queued for submission" : "submission queue full, dropped");
                     record_log_write(height, shift, header_nonce, nadd, p1,
                                      gaps[i].gap_length, gaps[i].merit,
@@ -2697,8 +2722,33 @@ static void crt_scan_gaps(uint32_t worker_id, uint32_t height, uint32_t nonce,
                     mpz_add_ui(gv, gv, chain[cl - 1]);
                     double term_merit = gap_detection_compute_merit(
                         (uint32_t)(vis_off[first_vis] - chain[cl - 1]), gv);
+
+                    /* Certified interval rejection (Gapcoin Q48): every
+                       sub-gap inside this terminal span is shorter than the
+                       span itself, so a span that provably cannot reach the
+                       template's nDifficulty proves that no hidden interior
+                       prime can produce a qualifying gap.  Unlike the
+                       merit-only test below, the certificate accounts for the
+                       node's rand() refinement, so it never skips a span the
+                       node would accept; with no known target it fails open to
+                       that test. */
+                    uint64_t q48_target = atomic_load_explicit(
+                        &g_q48_target, memory_order_acquire);
+                    int qualify;
+                    if (q48_target != 0) {
+                        uint64_t span =
+                            (uint64_t)(vis_off[first_vis] - chain[cl - 1]);
+                        qualify = pow_q48_span_may_qualify(gv, span, q48_target);
+                        if (!qualify) {
+                            atomic_fetch_add(
+                                &g_worker_stats[worker_id].q48_certified_skips,
+                                1);
+                        }
+                    } else {
+                        qualify = (term_merit >= merit_threshold);
+                    }
                     mpz_clear(gv);
-                    if (term_merit >= merit_threshold) {
+                    if (qualify) {
                         struct gap_result *sub = NULL;
                         uint32_t sub_count = 0;
                         int sub_rc;
@@ -2914,12 +2964,16 @@ static void crt_scan_gaps(uint32_t worker_id, uint32_t height, uint32_t nonce,
                         nb = sizeof(entry.nadd_bytes);
                     }
                     entry.nadd_len = (uint32_t)nb;
+                    /* The node's own verdict input: difficulty(p1,p2) in Q48
+                       (see the non-CRT site). */
+                    entry.q48_difficulty = pow_q48_difficulty(p1, p2);
                     int queued = worker_queue_push(&entry);
                     fprintf(stderr,
-                            "[Worker %u] CRT BPSW candidate: height=%u nonce=%u nAdd=%s gap=%u merit=%.2f (%s)\n",
+                            "[Worker %u] CRT BPSW candidate: height=%u nonce=%u nAdd=%s gap=%u merit=%.2f node_diff=%.4f (%s)\n",
                             worker_id, height, nonce,
                             nadd_dec ? nadd_dec : "?",
                             gaps[i].gap_length, gaps[i].merit,
+                            pow_q48_readable(entry.q48_difficulty),
                             queued ? "queued for submission"
                                    : "submission queue full, dropped");
                     record_log_write_big(height, rt->shift, nonce,
@@ -2998,6 +3052,7 @@ void *worker_thread_run_crt(void *arg) {
     atomic_store(&g_worker_stats[worker_id].gpu_sieve_calls, 0);
     atomic_store(&g_worker_stats[worker_id].gpu_sieve_windows, 0);
     atomic_store(&g_worker_stats[worker_id].smart_tail_skipped, 0);
+    atomic_store(&g_worker_stats[worker_id].q48_certified_skips, 0);
     atomic_store(&g_worker_stats[worker_id].gpu_accounted_us, 0);
 
     double logbase = (256.0 + (double)rt->shift) * log(2.0);
@@ -4151,6 +4206,7 @@ void worker_get_stats(uint32_t worker_id, struct worker_stats *stats) {
     stats->gpu_sieve_calls = atomic_load(&g_worker_stats[worker_id].gpu_sieve_calls);
     stats->gpu_sieve_windows = atomic_load(&g_worker_stats[worker_id].gpu_sieve_windows);
     stats->smart_tail_skipped = atomic_load(&g_worker_stats[worker_id].smart_tail_skipped);
+    stats->q48_certified_skips = atomic_load(&g_worker_stats[worker_id].q48_certified_skips);
     stats->gpu_accounted_us = atomic_load(&g_worker_stats[worker_id].gpu_accounted_us);
     stats->us_mark = atomic_load(&g_worker_stats[worker_id].us_mark);
     stats->us_extract = atomic_load(&g_worker_stats[worker_id].us_extract);

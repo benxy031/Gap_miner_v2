@@ -38,6 +38,8 @@ Double-click `windows\build_all.bat` (or run it from `cmd`). It:
    time; objects are cached per arch/width in `build-win\`),
 2. builds `bin\gapminer.exe` and the tests with MinGW (`windows\build_host.sh`),
 3. runs the CPU tests and `test_gpu_fermat` / `test_gpu_sieve` / `test_gpu_resolve`.
+   The CPU set includes `test_pow_q48` (Gapcoin Q48 proof-of-work arithmetic,
+   checked against committed vectors generated from the node's own `PoWUtils`).
 
 `build_all.bat host` rebuilds only the host side when `gapgpu.dll` exists.
 Logs are in `windows\logs\`.
@@ -92,6 +94,11 @@ unbuffered, so redirecting it to a log file (`>> miner.log 2>&1`) keeps the log 
   connection in an undefined state.
 - `gap_hunt.c`: `signal()` instead of `sigaction()`; `block_assembly.c`: no
   `arpa/inet.h`.
+- `pow_q48.c`: LLP64-clean by construction — no `unsigned long` or
+  `mpz_get_ui()` on a Q48 value, `mpz_import` for `uint64` -> mpz, `mpz_cmp` for
+  span comparisons, `(uint64_t)` casts on the `*_ui` macros. See
+  `docs/GAPCOIN_Q48.md` §5 for the audit and for what was and was not verified on
+  real Windows.
 
 ## Validation (5x P104-100, CUDA 12.9, MSVC 14.44, MSYS2 GCC)
 

@@ -41,15 +41,19 @@ LDLIBS  = $(BIN_DIR)/gapgpu.dll \
 
 SOURCES = sieve_core gap_detection gap_dist halfclass primality_fermat \
           primality_euler primality_bpsw primality_limbs atomic_nonce \
-          gap_priority crt_set gap_target covering crt_runtime worker_gpu \
-          miner_farm gpu_adapter gapcoin_rpc gapcoin_work block_assembly \
-          submission_pipeline merit_records record_log gap_hunt stratum
+          gap_priority crt_set gap_target pow_q48 covering crt_runtime \
+          worker_gpu miner_farm gpu_adapter gapcoin_rpc gapcoin_work \
+          block_assembly submission_pipeline merit_records record_log \
+          gap_hunt stratum
 
 OBJECTS = $(SOURCES:%=$(OBJ_DIR)/$(SRC_DIR)/%.o)
 
 # CPU-only tests (run anywhere) and GPU tests (need a CUDA device).
+# test_pow_q48 reads tests/data/pow_q48_vectors.txt relative to the repo root,
+# so run it from there: bin\test_pow_q48.exe
 CPU_TESTS = test_primality test_gap_detection test_sieve_core \
-            test_crt_submission test_block_submission test_halfclass
+            test_crt_submission test_block_submission test_halfclass \
+            test_pow_q48
 GPU_TESTS = test_gpu_fermat test_gpu_sieve test_gpu_resolve
 
 CPU_TEST_BINS = $(CPU_TESTS:%=$(BIN_DIR)/%.exe)

@@ -624,10 +624,15 @@ static void worker_process_window(uint32_t worker_id, struct worker_config *conf
                                      gaps[i].gap_length, gaps[i].merit,
                                      queued ? "queued" : "queue-full");
                 } else {
+                    /* Dry-run: no submission, but the operator still wants to
+                       see what the node WOULD compute -- node_diff is the same
+                       exact Q48 difficulty the submit gate uses. */
+                    uint64_t q48_diff = pow_q48_difficulty(p1, p2);
                     fprintf(stderr,
-                            "[Worker %u] BPSW candidate: height=%u nAdd=%llu gap=%u merit=%.2f (dry-run)\n",
+                            "[Worker %u] BPSW candidate: height=%u nAdd=%llu gap=%u merit=%.2f node_diff=%.4f (dry-run)\n",
                             worker_id, height, (unsigned long long)nadd,
-                            gaps[i].gap_length, gaps[i].merit);
+                            gaps[i].gap_length, gaps[i].merit,
+                            pow_q48_readable(q48_diff));
                     record_log_write(height, shift, header_nonce, nadd, p1,
                                      gaps[i].gap_length, gaps[i].merit, "dry-run");
                 }
@@ -2982,11 +2987,15 @@ static void crt_scan_gaps(uint32_t worker_id, uint32_t height, uint32_t nonce,
                                          gaps[i].merit,
                                          queued ? "queued" : "queue-full");
                 } else {
+                    /* Dry-run: see the non-CRT site -- node_diff is the exact
+                       Q48 difficulty the submit gate would compare. */
+                    uint64_t q48_diff = pow_q48_difficulty(p1, p2);
                     fprintf(stderr,
-                            "[Worker %u] CRT BPSW candidate: height=%u nonce=%u nAdd=%s gap=%u merit=%.2f (dry-run)\n",
+                            "[Worker %u] CRT BPSW candidate: height=%u nonce=%u nAdd=%s gap=%u merit=%.2f node_diff=%.4f (dry-run)\n",
                             worker_id, height, nonce,
                             nadd_dec ? nadd_dec : "?",
-                            gaps[i].gap_length, gaps[i].merit);
+                            gaps[i].gap_length, gaps[i].merit,
+                            pow_q48_readable(q48_diff));
                     record_log_write_big(height, rt->shift, nonce,
                                          nadd_dec, p1,
                                          gaps[i].gap_length,

@@ -189,15 +189,17 @@ tools/rns_count.py [bits ...]        # "count before claiming" for the RNS-16 ro
                                      # note assumed.  Multiply stream alone: 7203
                                      # 16-bit products = 28812 int8 MACs = 0.497 ns/
                                      # montmul at the measured mma8+repack rate
-                                     # (57950 GMAC/s), vs CGBN's MEASURED 0.717 ns
-                                     # (bin/bench_fermat 12 40000 20).  Best case
-                                     # 1.44x on the multiply stream only, and 67% of
+                                     # (57950 GMAC/s), vs CGBN's MEASURED 0.934 ns
+                                     # (bin/bench_fermat 12 40000 20 = 1,394,233
+                                     # cand/s = 717 ns/candidate / 768 squarings).
+                                     # Best case 1.88x on the multiply stream only,
+                                     # and 67% of
                                      # that work IS the base extension, while CGBN
-                                     # already sits at 35% of the IMAD peak (2.9x
+                                     # already sits at 27% of the IMAD peak (3.7x
                                      # unused headroom in its own scalar domain).
                                      # Verdict: road closed; reopen only with a
                                      # MEASURED RNS-16 montmul step that beats
-                                     # 0.717 ns/montmul end to end.
+                                     # 0.934 ns/montmul end to end.
 tools/convert_horizon_crt.py IN.txt OUT.txt --shift 512
                                      # convert a Horizon/Golden "ChineseSet" CRT
                                      # file into our text format so their covers

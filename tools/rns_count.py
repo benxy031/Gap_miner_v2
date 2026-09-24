@@ -9,9 +9,13 @@ SERIAL dependency chain) is listed as uncharted, because that is where every
 previous bignum path in this repo lost 85-99% (see bench_rns_mont.cu).
 
 MEASURED ANCHORS (RTX 3070, this box, refreshed 2026-09-24):
-  CGBN AL=12 montmul   0.717 ns   <- bin/bench_fermat 12 40000 20 = 1,394,233 cand/s
-                                    (device-aggregate; the 1102 ns figure printed by
-                                     cuda_int_throughput is a LATENCY artifact)
+  CGBN AL=12 montmul   0.934 ns   <- bin/bench_fermat 12 40000 20 = 1,394,233 cand/s
+                                    (device-aggregate).  One candidate = one MR test =
+                                    768 mont_sqr (the exponent n-1 is 768 bits), so
+                                    717 ns/candidate / 768 = 0.934 ns per montmul.
+                                    Do NOT use the cand/s number as a per-montmul
+                                    figure, and note the 1102 ns printed by
+                                    cuda_int_throughput is a LATENCY artifact.
   mul32 (IMAD)         4592.68 GMAC/s   bin/cuda_int_throughput 200000
   dp4a                 20591.01 GMAC/s
   mma8 register        67399.26 GMAC/s
@@ -29,7 +33,8 @@ Usage: rns_count.py [bits ...]   (default: 768 1024 1280)
 import math, sys
 
 # ---- measured anchors (provenance above) -----------------------------------
-CGBN_NS_768 = 0.717          # ns per Montgomery multiplication, AL=12 (768-bit)
+CGBN_NS_768 = 0.934          # ns per Montgomery multiplication, AL=12 (768-bit);
+                             # 717 ns per candidate (1,394,233 cand/s) / 768 squarings
 IMAD_GMAC   = 4592.68        # 32-bit MAC with 64-bit accumulate
 MMA_PACK    = 57950.44       # int8 MACs/s with the residue repack in the loop
 MMA_REG     = 67399.26       # int8 MACs/s register-resident (upper bound)
@@ -84,11 +89,11 @@ def main():
     print("    memory traffic the register-resident MMA rate does not include")
     print("  - CGBN's 0.717 ns already includes ALL of its own non-multiply work")
     print()
-    print("VERDICT (2026-09-24): the RNS multiply stream buys <= ~1.4-1.8x in the best")
-    print("case, while CGBN sits at ~35% of the SAME-box IMAD peak (2.9x unused scalar")
+    print("VERDICT (2026-09-24): the RNS multiply stream buys <= ~1.9x in the best")
+    print("case, while CGBN sits at ~27% of the SAME-box IMAD peak (3.7x unused scalar")
     print("headroom in its own domain) and is latency-bound, not multiply-bound.  The")
     print("road stays closed; reopen only with a MEASURED RNS-16 768-bit Montgomery step")
-    print("(not a stream rate) that beats 0.717 ns/montmul end to end.")
+    print("(not a stream rate) that beats 0.934 ns/montmul end to end.")
 
 
 if __name__ == '__main__':

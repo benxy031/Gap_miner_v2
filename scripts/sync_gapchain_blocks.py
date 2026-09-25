@@ -1,0 +1,437 @@
+#!/usr/bin/env python3
+import argparse
+import base64
+import json
+import os
+import sqlite3
+import sys
+import time
+import urllib.error
+import urllib.request
+from datetime import datetime, timezone
+from pathlib import Path
+
+DEFAULT_CONF = Path.home() / ".gapcoin2606" / "gapcoin.conf"
+DEFAULT_DB = Path(__file__).resolve().parents[1] / "gapchain.sqlite3"
+
+
+def load_rpc_conf(path):
+    values = {}
+    if not path.exists():
+        raise FileNotFoundError(f"RPC config not found: {path}")
+    for raw in path.read_text(encoding="utf-8").splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        values[key.strip()] = value.strip()
+    return values
+
+
+def make_rpc(url, user, password):
+    auth = base64.b64encode(f"{user}:{password}".encode("utf-8")).decode("ascii")
+    headers = {
+        "Content-Type": "application/json",
+        "Authorization": f"Basic {auth}",
+    }
+    req_id = [0]
+
+    def rpc(method, params=None):
+        if params is None:
+            params = []
+        req_id[0] += 1
+        body = json.dumps(
+            {
+                "jsonrpc": "1.0",
+                "id": str(req_id[0]),
+                "method": method,
+                "params": params,
+            }
+        ).encode("utf-8")
+        req = urllib.request.Request(url, data=body, headers=headers)
+        try:
+            with urllib.request.urlopen(req, timeout=30) as resp:
+                data = json.loads(resp.read().decode("utf-8"))
+        except urllib.error.HTTPError as exc:
+            body_text = exc.read().decode("utf-8", errors="replace")
+            data = json.loads(body_text)
+        except urllib.error.URLError as exc:
+            raise RuntimeError(f"RPC connection failed: {exc}") from exc
+        if data.get("error"):
+            raise RuntimeError(str(data["error"]))
+        return data["result"]
+
+    return rpc
+
+
+def connect_db(path):
+    conn = sqlite3.connect(str(path))
+    conn.row_factory = sqlite3.Row
+    return conn
+
+
+def ensure_schema(conn):
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS gapchain (
+            height INTEGER PRIMARY KEY,
+            difficulty NUMERIC,
+            primesps NUMERIC,
+            shift INTEGER,
+            adder INTEGER,
+            startprime TEXT,
+            gapsize INTEGER,
+            merit NUMERIC,
+            primedigits INTEGER,
+            date TEXT,
+            time TEXT,
+            payout_script TEXT,
+            payout TEXT
+        )
+        """
+    )
+    conn.commit()
+    # Migration for databases created before block attribution existed.
+    # ALTER TABLE ADD COLUMN is metadata-only, so it is instant even on a
+    # multi-million-row database; the column is then filled lazily by
+    # --backfill-payout (verbosity 2) or by the next sync of that height.
+    have = {row[1] for row in conn.execute("PRAGMA table_info(gapchain)")}
+    for column in ("payout_script", "payout"):
+        if column not in have:
+            conn.execute(f"ALTER TABLE gapchain ADD COLUMN {column} TEXT")
+    # Attribution queries group/filter by coinbase script, which is the only
+    # reliable per-operator key (there is no address field in the block).
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_gapchain_payout "
+        "ON gapchain(payout_script)"
+    )
+    conn.commit()
+
+
+def payout_of(block):
+    """Coinbase payout of a block fetched with getblock(hash, 2).
+
+    Returns (script_hex, address).  The script hex is the reliable operator
+    identifier: it needs no interpretation, whereas `address` is only present
+    when the node can decode the script (a P2PK output such as the 5120...
+    33-byte pubkey push can come back without an `addresses` entry).
+
+    Returns (None, None) for a verbosity-1 block (no tx list), which is why
+    the upsert below uses COALESCE: a later verbosity-1 sync must not erase
+    attribution that a verbosity-2 sync already recorded.
+    """
+    txs = block.get("tx")
+    if not isinstance(txs, list) or not txs:
+        return None, None
+    coinbase = txs[0]
+    if not isinstance(coinbase, dict):
+        return None, None
+    vout = coinbase.get("vout")
+    if not isinstance(vout, list) or not vout:
+        return None, None
+    spk = vout[0].get("scriptPubKey") or {}
+    # Older nodes return "addresses" (a list); current ones return "address"
+    # (a single string).  Reading only the list left this column NULL for every
+    # block on a node that had moved on (found 2026-09-19 while looking up
+    # record-holding miners).
+    addresses = spk.get("addresses") or []
+    addr = addresses[0] if addresses else spk.get("address")
+    return spk.get("hex"), addr
+
+
+def get_last_height(conn):
+    row = conn.execute("SELECT MAX(height) FROM gapchain").fetchone()
+    if row is None or row[0] is None:
+        return None
+    return int(row[0])
+
+
+def parse_block_timestamp(unix_ts):
+    dt = datetime.fromtimestamp(int(unix_ts), tz=timezone.utc)
+    return dt.strftime("%Y-%m-%d"), dt.strftime("%H:%M:%S")
+
+
+def store_block(conn, block, primesps_value=None):
+    height = block.get("height")
+    if height is None:
+        raise ValueError("Block missing height")
+
+    date_value, time_value = parse_block_timestamp(block.get("time", 0))
+    gapstart = block.get("gapstart")
+    gaplen = block.get("gaplen")
+    adder = block.get("adder")
+    # primedigits is derived from the block's startprime/gapstart payload,
+    # which is the same source used by the older imported rows.
+    primedigits_value = len(str(gapstart)) if gapstart is not None else None
+    merit = block.get("merit")
+    shift = block.get("shift")
+    difficulty = block.get("difficulty")
+    payout_script_value, payout_value = payout_of(block)
+
+    conn.execute(
+        """
+        INSERT INTO gapchain(
+            height, difficulty, primesps, shift, adder, startprime,
+            gapsize, merit, primedigits, date, time, payout_script, payout
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(height) DO UPDATE SET
+            difficulty=excluded.difficulty,
+            primesps=excluded.primesps,
+            shift=excluded.shift,
+            adder=excluded.adder,
+            startprime=excluded.startprime,
+            gapsize=excluded.gapsize,
+            merit=excluded.merit,
+            primedigits=excluded.primedigits,
+            date=excluded.date,
+            time=excluded.time,
+            payout_script=COALESCE(excluded.payout_script, payout_script),
+            payout=COALESCE(excluded.payout, payout)
+        """,
+        (
+            height,
+            difficulty,
+            primesps_value,
+            shift,
+            adder,
+            str(gapstart) if gapstart is not None else None,
+            gaplen,
+            merit,
+            primedigits_value,
+            date_value,
+            time_value,
+            payout_script_value,
+            payout_value,
+        ),
+    )
+
+
+def backfill_payout(conn, rpc, count, progress_every=50):
+    """Fill payout_script/payout for the `count` highest heights lacking them.
+
+    Needs verbosity 2 (the full tx list), so it is deliberately explicit and
+    bounded instead of being folded into every sync: this is how rows written
+    before attribution existed get covered without re-syncing the chain.
+    """
+    rows = conn.execute(
+        "SELECT height FROM gapchain WHERE payout_script IS NULL "
+        "ORDER BY height DESC LIMIT ?",
+        (count,),
+    ).fetchall()
+    if not rows:
+        return 0
+    done = 0
+    for row in rows:
+        height = int(row[0])
+        block = fetch_block_with_retry(rpc, height, verbosity=2)
+        script, address = payout_of(block)
+        conn.execute(
+            "UPDATE gapchain SET payout_script=?, payout=? WHERE height=?",
+            (script, address, height),
+        )
+        done += 1
+        if done % progress_every == 0 or done == len(rows):
+            conn.commit()
+            print(f"payout backfill: {done}/{len(rows)} (height={height})")
+    conn.commit()
+    return done
+
+
+def fetch_block_with_retry(rpc, height, retries=5, delay=1, verbosity=2):
+    last_error = None
+    for attempt in range(1, retries + 1):
+        try:
+            block_hash = rpc("getblockhash", [height])
+            return rpc("getblock", [block_hash, verbosity])
+        except Exception as exc:
+            last_error = exc
+            if attempt < retries:
+                time.sleep(delay)
+                continue
+            raise RuntimeError(f"failed to fetch height {height} after {retries} attempts: {exc}") from exc
+
+
+class PrimespsCalibrator:
+    """Derives a per-block primesps estimate from that block's own
+    difficulty, instead of repeating one network-wide getnetworkminingpower()
+    reading across many consecutive blocks.
+
+    getnetworkminingpower() is itself a smoothed/lookback-window average on
+    the node side, so calling it once per block still returns an identical
+    value for long runs of blocks (confirmed via gapchain.sqlite3: primesps
+    stayed pinned to one of two values across 26 consecutive heights while
+    each block's own difficulty kept fluctuating). Scaling each block's own
+    difficulty by a ratio recalibrated every `every` blocks keeps primesps
+    varying per row while cutting RPC round-trips during bulk syncs.
+    """
+
+    def __init__(self, rpc, every=50):
+        self.rpc = rpc
+        self.every = max(1, every)
+        self.ratio = None
+        self.since_calibration = 0
+
+    def _recalibrate(self):
+        mining_power = self.rpc("getnetworkminingpower")
+        difficulty = self.rpc("getdifficulty")
+        if difficulty:
+            self.ratio = mining_power / difficulty
+        self.since_calibration = 0
+        return mining_power
+
+    def value_for(self, block_difficulty):
+        if self.ratio is None or self.since_calibration >= self.every:
+            mining_power = self._recalibrate()
+            if self.ratio is None:
+                # difficulty was falsy on the calibration sample; fall back
+                # to the raw network reading for this block only.
+                return mining_power
+        self.since_calibration += 1
+        if block_difficulty is None:
+            return None
+        return block_difficulty * self.ratio
+
+
+def sync_range(conn, rpc, start, end, primesps_mode="calibrated", recalibrate_every=50,
+               payout=True):
+    total = 0
+    calibrator = PrimespsCalibrator(rpc, every=recalibrate_every) if primesps_mode == "calibrated" else None
+    for height in range(start, end + 1):
+        # verbosity 2 carries the tx list, which is the only way to read the
+        # winning coinbase payout (the block payload has no address field).
+        block = fetch_block_with_retry(rpc, height, verbosity=2 if payout else 1)
+        if calibrator is not None:
+            primesps_value = calibrator.value_for(block.get("difficulty"))
+        else:
+            # Legacy behavior: one raw getnetworkminingpower() RPC call per
+            # block. Kept for comparison via --primesps-mode network.
+            primesps_value = rpc("getnetworkminingpower")
+        store_block(conn, block, primesps_value)
+        conn.commit()
+        total += 1
+        if total % 100 == 0 or height == end:
+            print(f"synced height={height} (progress {total}/{end - start + 1})")
+    return total
+
+
+def parse_args():
+    parser = argparse.ArgumentParser(description="Import Gapcoin blocks into gapchain.sqlite3")
+    parser.add_argument("--db", default=str(DEFAULT_DB), help="SQLite database path")
+    parser.add_argument("--conf", default=str(DEFAULT_CONF), help="Path to gapcoin.conf")
+    parser.add_argument("--from-height", type=int, default=None, help="Start importing from this height")
+    parser.add_argument("--to-height", type=int, default=None, help="Stop importing at this height")
+    parser.add_argument("--watch", action="store_true", help="Keep watching for new blocks")
+    parser.add_argument("--poll-seconds", type=int, default=10, help="Polling interval in seconds")
+    parser.add_argument(
+        "--primesps-mode",
+        choices=("calibrated", "network"),
+        default="calibrated",
+        help=(
+            "calibrated (default): scale each block's own difficulty by a ratio "
+            "recalibrated every --recalibrate-every blocks, so primesps varies per "
+            "row instead of repeating one getnetworkminingpower() reading. "
+            "network: legacy behavior, one getnetworkminingpower() RPC call per block."
+        ),
+    )
+    parser.add_argument(
+        "--recalibrate-every",
+        type=int,
+        default=50,
+        help="Blocks between getnetworkminingpower()/getdifficulty() recalibration samples in calibrated mode (default: 50)",
+    )
+    parser.add_argument(
+        "--no-payout",
+        action="store_true",
+        help=(
+            "Fetch blocks with verbosity 1 and leave payout_script/payout NULL. "
+            "Use only for a large historical backfill where attribution is not "
+            "needed: incremental sync defaults to verbosity 2 so every new block "
+            "is attributed to its winning payout script."
+        ),
+    )
+    parser.add_argument(
+        "--backfill-payout",
+        type=int,
+        default=0,
+        metavar="N",
+        help=(
+            "Before syncing, fill payout_script/payout for the N highest heights "
+            "that still lack them (verbosity 2). This is how rows written before "
+            "attribution existed are covered without re-syncing the whole chain."
+        ),
+    )
+    return parser.parse_args()
+
+
+def main():
+    args = parse_args()
+    conf_path = Path(args.conf).expanduser()
+    conf = load_rpc_conf(conf_path)
+
+    host = conf.get("rpcconnect", "127.0.0.1")
+    port = conf.get("rpcport", "31397")
+    user = conf.get("rpcuser", "")
+    password = conf.get("rpcpassword", "")
+    rpc_url = f"http://{host}:{port}/"
+
+    rpc = make_rpc(rpc_url, user, password)
+    conn = connect_db(args.db)
+    ensure_schema(conn)
+
+    try:
+        tip = int(rpc("getblockcount"))
+    except Exception as exc:
+        print(f"RPC error: {exc}", file=sys.stderr)
+        return 1
+
+    if args.backfill_payout > 0:
+        filled = backfill_payout(conn, rpc, args.backfill_payout)
+        print(f"payout backfill done: {filled} heights")
+
+    if args.from_height is not None:
+        start = args.from_height
+    else:
+        last_height = get_last_height(conn)
+        start = (last_height or 0) + 1
+
+    if args.to_height is not None:
+        end = min(args.to_height, tip)
+    else:
+        end = tip
+
+    if start > end:
+        print("No new heights to sync")
+        return 0
+
+    print(f"Syncing heights {start}..{end} (tip={tip})")
+    sync_range(conn, rpc, start, end, primesps_mode=args.primesps_mode,
+               recalibrate_every=args.recalibrate_every, payout=not args.no_payout)
+
+    if args.watch:
+        print("Watching for new blocks...")
+        while True:
+            time.sleep(args.poll_seconds)
+            try:
+                new_tip = int(rpc("getblockcount"))
+            except Exception as exc:
+                print(f"RPC poll error: {exc}", file=sys.stderr)
+                continue
+            if new_tip > end:
+                print(f"New tip detected: {new_tip}")
+                synced = sync_range(
+                    conn,
+                    rpc,
+                    end + 1,
+                    new_tip,
+                    primesps_mode=args.primesps_mode,
+                    recalibrate_every=args.recalibrate_every,
+                    payout=not args.no_payout,
+                )
+                if synced:
+                    end = new_tip
+
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

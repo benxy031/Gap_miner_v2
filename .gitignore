@@ -92,3 +92,12 @@ tools/__pycache__/poly_gap_search.cpython-314.pyc
 build-win/
 windows/logs/
 windows/include_gmp/
+gapchain.sqlite3
+docs/CRT_DESIGN_MERIT_EXPERIMENT.md
+docs/PUBLISHABLE_RECORDS.md
+docs/RECORD_PREDICTION_THEORY.md
+docs/TARGET_LENGTHS.md
+scripts/target_lengths_report.py
+scripts/winnability_map.py
+scripts/cover_dist_compare.py
+scripts/__pycache__/submit_records.cpython-314.pyc

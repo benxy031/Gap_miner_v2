@@ -177,8 +177,11 @@ static int run_gpu_fermat_device_path_test(void) {
     /* 24/28/32 are the wide CGBN TPI=8 widths added with the 2048-bit build
        (2026-09-23): AL=32 is the last width whose limbs/thread (AL/4) fits
        CGBN's 8-limb half algorithm, so these three exercise the new
-       instantiation and rounding paths. */
-    static const int limb_cases[] = {5, 10, 12, 20, 24, 28, 32};
+       instantiation and rounding paths.
+       16 is the hunt's 1024-bit width (shift 720) and, together with 32, the
+       second CIOS instantiation (GPU_MR_KERNEL=cios) -- both are checked
+       against the CPU reference whenever that hook is set. */
+    static const int limb_cases[] = {5, 10, 12, 16, 20, 24, 28, 32};
     int all_ok = 1;
 
     for (size_t ci = 0; ci < sizeof(limb_cases) / sizeof(limb_cases[0]); ci++) {
@@ -197,12 +200,26 @@ static int run_gpu_fermat_device_path_test(void) {
             break;
         }
 
-        /* Random odd candidates, full AL-limb width, packed at AL stride. */
+        /* Random odd candidates packed at AL stride.  Three widths matter:
+             - full width (top bit at AL*64-1): the classic case;
+             - partial top limb (production shape: e.g. a 976-bit candidate
+               inside a 1024-bit stride) -- this is exactly where the
+               "Mont(1) = 2^(32*N32) - n" shortcut is WRONG, so it is the only
+               shape that validates cios_mont_one's bitlength + doublings;
+             - half width: a longer doubling run and exponent bits above the
+               top word must read as zero.
+           Remaining high limbs stay zero from calloc. */
         mpz_t n;
         mpz_init(n);
         for (uint32_t i = 0; i < TEST_CANDIDATE_COUNT; i++) {
-            mpz_urandomb(n, rng, (unsigned long)AL * 64UL);
-            mpz_setbit(n, (unsigned long)AL * 64UL - 1UL);
+            unsigned long bits = (unsigned long)AL * 64UL;
+            if ((i & 3U) == 2U) {
+                bits = (unsigned long)AL * 64UL - 1UL - (unsigned long)(i % 56U);
+            } else if ((i & 3U) == 3U) {
+                bits = (unsigned long)AL * 32UL;      /* ~half width */
+            }
+            mpz_urandomb(n, rng, bits);
+            mpz_setbit(n, bits - 1UL);
             mpz_setbit(n, 0);
             size_t written = 0;
             mpz_export(h_cands + (size_t)i * (size_t)AL, &written, -1,

@@ -532,8 +532,22 @@ __global__ void fermat_kernel_soa_t(const uint64_t * __restrict__ cands_soa,
  *  1.73M cand/s at 768-bit vs CGBN TPI=8's 1.39M (~1.25x), and CGBN loses more
  *  at the small batches the chain actually uses (0.96M at a 2048 batch).
  *
- *  Registered widths: 2*AL for AL in {5,6,12}; 24 x 32-bit limbs is the
- *  practical register limit at the 8-blocks/SM target set by __launch_bounds__.
+ *  Registered widths: 2*AL for AL in {5,6,12,16,32} (320..2048-bit).  The
+ *  original shape kept 6*N32 words live (n, one, neg, y, dsh, nm1), which is
+ *  exactly why 24 x 32-bit limbs (768-bit) was the ceiling.  The current shape
+ *  recomputes Mont(1) after the loop and reads the exponent bits straight out
+ *  of n, leaving n[N32] + y[N32] + the (N32+2)-word accumulator live, so 32
+ *  and 64 limbs fit at 4 / 2 blocks per SM.  COMPILE CONSTRAINT: the outer
+ *  multiply loop must stay `#pragma unroll 1` -- fully unrolling the N32^2
+ *  nest segfaults nvcc 12.4 at 64 limbs (see the note in cios_mont_mul).
+ *
+ *  GEOMETRY NOTE (measured 2026-09-22, see the README GPU_MR_KERNEL row): CIOS
+ *  wins the standalone large-batch stream (+25%) but LOSES end-to-end on the
+ *  fused chain (-8..-35%), because that path submits only a few hundred to ~2k
+ *  candidates per MR launch while 1 thread/candidate needs >=4k in flight.
+ *  The --gap-hunt walk batches ~1.8-2.2M candidates per MR flight (K windows x
+ *  ~355 tests/window), which is the geometry the standalone win came from; the
+ *  16/32-limb instantiations exist for that path (shifts 720 / 1784).
  *
  *  CORRECTNESS TRAP (the one real one): Mont(1) = R mod n = 2^(32*N32) mod n
  *  must NOT be computed as 2^(32*N32) - n.  That shortcut only holds when
@@ -555,7 +569,16 @@ void cios_mont_mul(uint32_t *__restrict__ r, const uint32_t *__restrict__ a,
 #pragma unroll
     for (int i = 0; i < N32 + 2; i++) t[i] = 0U;
 
-#pragma unroll
+    /* The OUTER loop stays rolled ON PURPOSE.  Fully unrolling this nest
+       (outer x inner = N32^2 mul-adds) makes nvcc 12.4 (V12.4.131) crash on
+       the 64-limb instantiation -- "cicc: Segmentation fault (core dumped)"
+       after ~2 min, no diagnostic -- and take minutes on the smaller ones;
+       with this single directive every width 10..64 compiles in seconds.
+       The inner loop is still fully unrolled, so each outer iteration still
+       presents N32 independent mul-adds to the scheduler, and the CIOS
+       reduction chain is serial anyway (m depends on t[0] of the previous
+       iteration), so the branch costs ~2% rather than ~2x. */
+#pragma unroll 1
     for (int i = 0; i < N32; i++) {
         uint64_t c = 0;
         const uint64_t bi = (uint64_t)b[i];
@@ -584,43 +607,95 @@ void cios_mont_mul(uint32_t *__restrict__ r, const uint32_t *__restrict__ a,
         t[N32 + 1] = 0U;
     }
 
-    /* result may be in [n, 2n): one conditional subtraction */
+    /* result may be in [n, 2n): one conditional subtraction.  Done on t in
+       place (compare first, subtract only if needed) so no N32-word scratch
+       array is live -- that array is what used to cap the usable width. */
     uint32_t borrow = 0;
-    uint32_t sub[N32];
 #pragma unroll
     for (int j = 0; j < N32; j++) {
         uint64_t d = (uint64_t)t[j] - (uint64_t)n[j] - (uint64_t)borrow;
-        sub[j] = (uint32_t)d;
         borrow = (uint32_t)((d >> 32) & 1ULL);
     }
-    const int need = (t[N32] != 0U) | (borrow == 0U);
+    if (t[N32] != 0U || borrow == 0U) {
+        borrow = 0;
 #pragma unroll
-    for (int j = 0; j < N32; j++) r[j] = need ? sub[j] : t[j];
+        for (int j = 0; j < N32; j++) {
+            uint64_t d = (uint64_t)t[j] - (uint64_t)n[j] - (uint64_t)borrow;
+            t[j] = (uint32_t)d;
+            borrow = (uint32_t)((d >> 32) & 1ULL);
+        }
+    }
+#pragma unroll
+    for (int j = 0; j < N32; j++) r[j] = t[j];
 }
 
-/* r = 2*a mod n (one add + one conditional subtract) */
+/* r = 2*r mod n, in place (one shift + one conditional subtract).  No N32-word
+   scratch array: r is doubled in place, then compared against n, and only then
+   subtracted -- the sum's carry-out and the compare's borrow-out together say
+   whether 2r >= n. */
 template<int N32>
 __device__ static __forceinline__
-void cios_dbl_mod(uint32_t *__restrict__ r, const uint32_t *__restrict__ a,
-                  const uint32_t *__restrict__ n)
+void cios_dbl_mod(uint32_t *__restrict__ r, const uint32_t *__restrict__ n)
 {
-    uint32_t c = 0, t[N32];
+    uint32_t c = 0;
 #pragma unroll
     for (int j = 0; j < N32; j++) {
-        uint64_t s = (uint64_t)a[j] * 2ULL + (uint64_t)c;
-        t[j] = (uint32_t)s;
+        uint64_t s = ((uint64_t)r[j] << 1) | (uint64_t)c;
+        r[j] = (uint32_t)s;
         c = (uint32_t)(s >> 32);
     }
-    uint32_t borrow = 0, sub[N32];
+    uint32_t borrow = 0;
 #pragma unroll
     for (int j = 0; j < N32; j++) {
-        uint64_t d = (uint64_t)t[j] - (uint64_t)n[j] - (uint64_t)borrow;
-        sub[j] = (uint32_t)d;
+        uint64_t d = (uint64_t)r[j] - (uint64_t)n[j] - (uint64_t)borrow;
         borrow = (uint32_t)((d >> 32) & 1ULL);
     }
-    const int need = (c != 0U) | (borrow == 0U);
+    if (c != 0U || borrow == 0U) {
+        borrow = 0;
 #pragma unroll
-    for (int j = 0; j < N32; j++) r[j] = need ? sub[j] : t[j];
+        for (int j = 0; j < N32; j++) {
+            uint64_t d = (uint64_t)r[j] - (uint64_t)n[j] - (uint64_t)borrow;
+            r[j] = (uint32_t)d;
+            borrow = (uint32_t)((d >> 32) & 1ULL);
+        }
+    }
+}
+
+/* one = R mod n = 2^(32*N32) mod n for odd n (exact for every n < 2^(32*N32)).
+   Start from 2^b - n (b = bitlength(n)) and double (32*N32 - b) times -- the
+   R - n shortcut is only valid for n >= 2^(32*N32 - 1), which production
+   candidates are not (763-bit candidates inside a 768-bit stride). */
+template<int N32>
+__device__ static __forceinline__
+void cios_mont_one(uint32_t *__restrict__ one, const uint32_t *__restrict__ n)
+{
+    int b = 0;
+#pragma unroll
+    for (int j = N32 - 1; j >= 0; j--) {
+        if (b == 0 && n[j] != 0U) b = j * 32 + (32 - __clz(n[j]));
+    }
+    uint32_t borrow = 0;
+#pragma unroll
+    for (int j = 0; j < N32; j++) {
+        uint32_t v = (b < N32 * 32 && j == (b >> 5)) ? (1U << (b & 31)) : 0U;
+        uint64_t d = (uint64_t)v - (uint64_t)n[j] - (uint64_t)borrow;
+        one[j] = (uint32_t)d;
+        borrow = (uint32_t)((d >> 32) & 1ULL);
+    }
+#pragma unroll 1
+    for (int i = b; i < N32 * 32; i++) cios_dbl_mod<N32>(one, n);
+}
+
+/* Bit `pos` (0 = LSB) of n-1 for odd n: n-1 is n with word 0 decremented and
+   no borrow out of word 0, so no nm1/ shifted-exponent array has to be kept
+   live across the squaring loop. */
+template<int N32>
+__device__ static __forceinline__
+uint32_t cios_nm1_bit(const uint32_t *__restrict__ n, int pos)
+{
+    const int w = pos >> 5;
+    if (w >= N32) return 0U;
+    return ((n[w] - (w == 0 ? 1U : 0U)) >> (pos & 31)) & 1U;
 }
 
 /* Base-2 strong probable-prime test.  1 = probable prime, 0 = composite.
@@ -631,7 +706,11 @@ template<int N32>
 __device__ static __forceinline__
 int cios_mr_base2(const uint32_t *__restrict__ nin)
 {
-    uint32_t n[N32], one[N32], neg[N32], y[N32], dsh[N32], nm1[N32];
+    /* Live registers through the squaring loop: n[N32], y[N32] and the
+       N32+2-word accumulator inside cios_mont_mul.  Mont(1) is recomputed
+       after the loop and the exponent bits are read out of n directly, so
+       neither one[] nor the (nm1[], dsh[]) pair is live here. */
+    uint32_t n[N32], one[N32], y[N32];
     uint32_t n0inv = 1U;
 #pragma unroll
     for (int k = 0; k < 5; k++) n0inv = n0inv * (2U - nin[0] * n0inv);
@@ -639,96 +718,56 @@ int cios_mr_base2(const uint32_t *__restrict__ nin)
 #pragma unroll
     for (int j = 0; j < N32; j++) n[j] = nin[j];
 
-    /* ONE = R mod n, exact for every n < 2^(32*N32) (see the trap note above) */
-    int b = 0;
-#pragma unroll
-    for (int j = N32 - 1; j >= 0; j--) {
-        if (b == 0 && n[j] != 0U) b = j * 32 + (32 - __clz(n[j]));
-    }
-    {
-        uint32_t borrow = 0;
-#pragma unroll
-        for (int j = 0; j < N32; j++) {
-            uint32_t v = (b < N32 * 32 && j == (b >> 5)) ? (1U << (b & 31)) : 0U;
-            uint64_t d = (uint64_t)v - (uint64_t)n[j] - (uint64_t)borrow;
-            one[j] = (uint32_t)d;
-            borrow = (uint32_t)((d >> 32) & 1ULL);
-        }
-    }
-#pragma unroll 1
-    for (int i = b; i < N32 * 32; i++) cios_dbl_mod<N32>(one, one, n);
+    cios_mont_one<N32>(y, n);                    /* y = R mod n = Mont(1) */
+    cios_dbl_mod<N32>(y, n);                     /* y = Mont(2) */
 
-    /* neg = n - one = Mont(n-1) */
-    {
-        uint32_t borrow = 0;
-#pragma unroll
-        for (int j = 0; j < N32; j++) {
-            uint64_t d = (uint64_t)n[j] - (uint64_t)one[j] - (uint64_t)borrow;
-            neg[j] = (uint32_t)d;
-            borrow = (uint32_t)((d >> 32) & 1ULL);
-        }
-    }
-
-    /* d = (n-1) >> s */
-    {
-        uint32_t borrow = 0;
-        uint64_t d0 = (uint64_t)n[0] - 1ULL;
-        nm1[0] = (uint32_t)d0;
-        borrow = (uint32_t)((d0 >> 32) & 1ULL);
-#pragma unroll
-        for (int j = 1; j < N32; j++) {
-            uint64_t dd = (uint64_t)n[j] - (uint64_t)borrow;
-            nm1[j] = (uint32_t)dd;
-            borrow = (uint32_t)((dd >> 32) & 1ULL);
-        }
-    }
+    /* s = trailing zero bits of n-1 (odd n => word 0 is n[0] - 1) */
     int s = 0;
     {
         int j = 0;
-        while (j < N32 && nm1[j] == 0U) { s += 32; j++; }
-        if (j < N32) {
-            uint32_t w = nm1[j];
-            while ((w & 1U) == 0U) { w >>= 1; s++; }
-        }
-    }
-    {
-        const int sh = s & 31, wi = s >> 5;
-#pragma unroll
-        for (int j = 0; j < N32; j++) {
-            uint32_t lo = (j + wi     < N32) ? nm1[j + wi]     : 0U;
-            uint32_t hi = (j + wi + 1 < N32) ? nm1[j + wi + 1] : 0U;
-            dsh[j] = (sh == 0) ? lo : (uint32_t)((lo >> sh) | (hi << (32 - sh)));
+        while (j < N32) {
+            uint32_t w = n[j] - (j == 0 ? 1U : 0U);
+            if (w != 0U) { while ((w & 1U) == 0U) { w >>= 1; s++; } break; }
+            s += 32;
+            j++;
         }
     }
     int dbits = N32 * 32 - s;
-    while (dbits > 0 &&
-           ((dsh[(dbits - 1) >> 5] >> ((dbits - 1) & 31)) & 1U) == 0U)
+    while (dbits > 0 && cios_nm1_bit<N32>(n, dbits - 1 + s) == 0U)
         dbits--;
 
-    cios_dbl_mod<N32>(y, one, n);                /* y = Mont(2) */
     for (int bit = dbits - 2; bit >= 0; bit--) {
         cios_mont_mul<N32>(y, y, y, n, n0inv);   /* square (in place) */
-        if ((dsh[bit >> 5] >> (bit & 31)) & 1U)
-            cios_dbl_mod<N32>(y, y, n);          /* x Mont(2) == x*2 */
+        if (cios_nm1_bit<N32>(n, bit + s))       /* bit `bit` of d = bit+s of n-1 */
+            cios_dbl_mod<N32>(y, n);             /* x Mont(2) == x*2 */
     }
+
+    cios_mont_one<N32>(one, n);                  /* Mont(1), recomputed */
     int is_one = 1, is_neg = 1;
+    uint32_t carry = 0U;
 #pragma unroll
     for (int j = 0; j < N32; j++) {
         if (y[j] != one[j]) is_one = 0;
-        if (y[j] != neg[j]) is_neg = 0;
+        /* Mont(-1) test without materialising n - one: y + one == n */
+        uint64_t sum = (uint64_t)y[j] + (uint64_t)one[j] + (uint64_t)carry;
+        carry = (uint32_t)(sum >> 32);
+        if ((uint32_t)sum != n[j]) is_neg = 0;
     }
+    if (carry != 0U) is_neg = 0;
     if (is_one || is_neg) return 1;
     for (int i = 1; i < s; i++) {
         cios_mont_mul<N32>(y, y, y, n, n0inv);
-        int got_neg = 1;
+        int got_neg = 1, got_one = 1;
+        uint32_t c2 = 0U;
 #pragma unroll
-        for (int j = 0; j < N32; j++)
-            if (y[j] != neg[j]) got_neg = 0;
-        if (got_neg) return 1;
-        int got_one = 1;
-#pragma unroll
-        for (int j = 0; j < N32; j++)
+        for (int j = 0; j < N32; j++) {
             if (y[j] != one[j]) got_one = 0;
+            uint64_t sum = (uint64_t)y[j] + (uint64_t)one[j] + (uint64_t)c2;
+            c2 = (uint32_t)(sum >> 32);
+            if ((uint32_t)sum != n[j]) got_neg = 0;
+        }
+        if (c2 != 0U) got_neg = 0;
+        if (got_neg) return 1;
         if (got_one) return 0;
     }
     return 0;
@@ -736,8 +775,13 @@ int cios_mr_base2(const uint32_t *__restrict__ nin)
 
 /* SOA: cands_soa[(word * count) + idx]; AoS: cands[idx * words + word].
    64-bit words hold two little-endian 32-bit limbs. */
+/* Register budget per thread scales with N32: the 320/384/768-bit widths keep
+   the original 8 blocks/SM (128-reg) target, 1024-bit gets 4 blocks/SM and
+   1536/2048-bit 2 blocks/SM (256-reg cap), because the slimmed live set needs
+   ~3*N32 + 4 registers and forcing 128 regs at 64 limbs would spill the
+   modulus. */
 template<int N32, bool SOA>
-__global__ void __launch_bounds__(64, 8)
+__global__ void __launch_bounds__(64, (N32 <= 24) ? 8 : ((N32 <= 32) ? 4 : 2))
 cios_fermat_kernel(const uint64_t *__restrict__ cands,
                    const uint64_t *__restrict__ cands_soa,
                    uint8_t *__restrict__ results,
@@ -1254,9 +1298,11 @@ static __host__ __forceinline__ int gpu_fermat_mr_kernel(void)
 static __host__ __forceinline__ int cios_supports_al(int al)
 {
     switch (al) {
-    case 5:  /* 320-bit -> 10 x 32-bit limbs  */
-    case 6:  /* 384-bit -> 12 x 32-bit limbs  */
-    case 12: /* 768-bit -> 24 x 32-bit limbs  */
+    case 5:  /* 320-bit  -> 10 x 32-bit limbs */
+    case 6:  /* 384-bit  -> 12 x 32-bit limbs */
+    case 12: /* 768-bit  -> 24 x 32-bit limbs */
+    case 16: /* 1024-bit -> 32 x 32-bit limbs (hunt shift ~720)  */
+    case 32: /* 2048-bit -> 64 x 32-bit limbs (hunt shift ~1784) */
         return 1;
     default:
         return 0;
@@ -1296,6 +1342,8 @@ static cudaError_t launch_fermat(int al, cudaStream_t stream,
         case 5:  CIOS_LAUNCH(10); break;
         case 6:  CIOS_LAUNCH(12); break;
         case 12: CIOS_LAUNCH(24); break;
+        case 16: CIOS_LAUNCH(32); break;
+        case 32: CIOS_LAUNCH(64); break;
         default: break;   /* unreachable: guarded by cios_supports_al */
         }
         #undef CIOS_LAUNCH

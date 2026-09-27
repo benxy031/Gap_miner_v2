@@ -223,9 +223,15 @@ tools/convert_horizon_crt.py IN.txt OUT.txt --shift 512
                                      # n_candidates counts uncovered positions over
                                      # [0, size-1] (INCLUDING the anchor, ours
                                      # excludes it), so counts may differ by +-1 at
-                                     # an identical cover.  The converter asserts a
-                                     # round-trip against their own n_candidates and
-                                     # exits 2 if the convention ever changes.
+                                     # an identical cover.  Residue 0 means
+                                     # "excluded" in our format, so their class-0
+                                     # rows (o_p = 0) are written as r = p --
+                                     # writing 0 would silently drop that prime
+                                     # and weaken the cover (measured: 3,079
+                                     # survivors instead of 876 on the m22 file at
+                                     # gap_target 12,644).  The converter asserts
+                                     # a round-trip against their own n_candidates
+                                     # and exits 2 if the convention changes.
                                      # Their `size` IS their gap_target: m22@512 =
                                      # 11,703 vs our 11,712, and their
                                      # "crt-22m-512s-761-verified.txt" is really a

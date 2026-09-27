@@ -987,7 +987,7 @@ def make_plot(all_cands, groups, table, args, outpath):
                        color=color, ls=":", lw=1.6)
     ax[3].set_yscale("log")
     ax[3].set_title("tail: observed P(merit >= m)\n"
-                    "dashed = fit to these data, dotted = HL natural "
+                    "dashed = fit to these data, dotted = HL natural\n"
                     "(falling faster than the DASH = missing candidates)")
     ax[3].set_xlabel("merit")
     ax[3].set_ylabel("P(merit >= m)")

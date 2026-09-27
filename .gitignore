@@ -149,3 +149,5 @@ forum/__pycache__/derive_hl_gap_4param_exact_90090.kernel_order3-531.py314.1.nbc
 forum/__pycache__/derive_hl_gap_4param_exact_90090.kernel_order3-531.py314.nbi
 forum/__pycache__/derive_hl_gap_4param_exact_90090.kernel_order4-427.py314.1.nbc
 forum/__pycache__/derive_hl_gap_4param_exact_90090.kernel_order4-427.py314.nbi
+docs/CUDA_SPEEDUP_REVIEW_2026-09-27.md
+forum/GapCoinMiner.pdf

@@ -74,6 +74,14 @@ Caveats it states out loud instead of hiding:
   * `sigma` fitted from fewer than ~30 candidates is noise, and so is any
     threshold whose EXPECTED count is small: the verdict only treats a ratio as
     real when it exceeds both 25% and twice the Poisson error of its count;
+  * the record log is written by several threads, so a candidate's lines can
+    appear in ANY order: the submit-context line (`status=submitted`) is
+    written by the consumer thread right after it takes the gap off the
+    submission queue, while the worker logs the discovery a moment later, so
+    `submitted` can precede `queued` in the same second.  Lines are paired by
+    (height, shift, header_nonce, nAdd), and the discovery fields are adopted
+    from whichever line carries them, so the order does not change the
+    candidate — it is deliberately NOT counted as a repeated discovery;
   * the record log only contains what the miner chose to report — it is not a
     census of all survivors.
 
@@ -212,6 +220,19 @@ class Candidate:
         return self.statuses[0] if self.statuses else "?"
 
     @property
+    def has_discovery(self) -> bool:
+        """True once a discovery line has been paired with this key.
+
+        Separates a candidate created from a verdict or submit-context line
+        (the discovery write can trail it by a moment: the worker pushes the
+        gap to the submission queue BEFORE it logs the find, so the consumer's
+        `submitted` line can land first in the same second) from one that
+        already carries its discovery -- so build_candidates can adopt a late
+        discovery instead of counting it as a repeat.
+        """
+        return any(s in DISCOVERY_STATUSES for s in self.statuses)
+
+    @property
     def verdict_status(self) -> str | None:
         """The terminal verdict, if the work source gave one.
 
@@ -337,9 +358,31 @@ def build_candidates(entries):
                     merit=e.fnum("merit"), start=start,
                     header_nonce=e.f("header_nonce"), nadd=e.f("nAdd"))
                 by_key[key] = cand
+            elif not cand.has_discovery:
+                # The candidate so far was built from a verdict or
+                # submit-context line that OVERTOOK the discovery write (the
+                # worker queues the gap before it logs it, so `submitted` can
+                # land first, in the same second -- observed in real logs).
+                # This is the FIRST discovery for this key: adopt its fields or
+                # the candidate would keep start=None and drop out of every
+                # ln(start) statistic, while the real find would be reported as
+                # "re-issued work".
+                if cand.start is None:
+                    cand.start = e.f("start")
+                if cand.shift is None:
+                    cand.shift = _int(e.f("shift"))
+                if cand.gap is None:
+                    cand.gap = _int(e.f("gap"))
+                if cand.merit is None:
+                    cand.merit = e.fnum("merit")
+                if cand.header_nonce is None:
+                    cand.header_nonce = e.f("header_nonce")
+                if cand.nadd is None:
+                    cand.nadd = e.f("nAdd")
             else:
-                # The same search position reported twice: legitimate only if
-                # the work was re-issued (e.g. the pool re-sent a template).
+                # The same search position reported twice: a second discovery
+                # line is legitimate only if the work was re-issued (e.g. the
+                # pool re-sent a template).
                 repeats += 1
             cand.statuses.append(e.status)
         else:
@@ -1288,7 +1331,9 @@ def selftest() -> int:
     Builds a synthetic log with a KNOWN exponential merit distribution (sigma
     1.2, m0 15.0) and checks that the tool recovers the count, the pairing
     (discovery line + verdict line = ONE candidate), the sigma and the outcome
-    mix — plus the empty-log rate bound.  No real logs and no mining needed.
+    mix — plus the empty-log rate bound, and that a submit-context line that
+    lands BEFORE its discovery line is adopted (start kept) instead of being
+    reported as a repeat.  No real logs and no mining needed.
     """
     import random
     import tempfile
@@ -1296,6 +1341,7 @@ def selftest() -> int:
     print("selftest: synthetic log with sigma=1.2, m0=15.0, n=400")
     rng = random.Random(1234)
     n = 400
+    n_inv = 3            # candidates whose submit-context line lands FIRST
     rng_ok = 0
     tmpdir = tempfile.mkdtemp(prefix="records_report_selftest_")
     # The file name must contain "pool" for the source label to come out right.
@@ -1321,6 +1367,23 @@ def selftest() -> int:
                 fh.write(f"{base} start={10 ** 200 + i} gap={gap} "
                          f"merit={m:.4f} best_known_merit=unknown "
                          f"new_record=unknown claim=none status=dry-run\n")
+        # Inverted ordering (the 2026-09-27 defect case): the submit-context
+        # line is written FIRST, in the SAME second, because the worker pushes
+        # the gap to the submission queue before it logs the discovery.  The
+        # tool must adopt the discovery fields and must NOT call the real find
+        # a repeat.
+        for i in range(n_inv):
+            m = 15.0 + (-math.log(1.0 - rng.random())) * 1.2
+            gap = int(round(m * 531.0))
+            base = (f"2026-09-19T11:{i:02d}:05Z height=0 shift=509 "
+                    f"header_nonce={2000 + i} nAdd={10 ** 6 + i}")
+            fh.write(f"{base} gap={gap} merit={m:.4f} status=submitted "
+                     f"template_prevhash={'ab' * 32} template_time=1789844329 "
+                     f"template_ndiff=65448618605459 template_merit=23.7473\n")
+            fh.write(f"{base} start={10 ** 200 + i} gap={gap} merit={m:.4f} "
+                     f"best_known_merit=unknown new_record=unknown claim=none "
+                     f"status=queued\n")
+            fh.write(f"{base} gap={gap} merit={m:.4f} status=accepted\n")
     entries, bad = load_file(path)
     cands, repeats = build_candidates(entries)
     lines = len(entries)
@@ -1330,17 +1393,21 @@ def selftest() -> int:
     rejected = sum(1 for c in cands if c.verdict_status == "rejected")
     accepted = sum(1 for c in cands if c.verdict_status == "accepted")
     not_submitted = sum(1 for c in cands if outcome_label(c).startswith("dry-run"))
+    starts_missing = sum(1 for c in cands if c.start is None)
     rate, lo, hi = poisson_rate(n, 10.0 / 60.0)
 
     checks = [
         ("parsed every line", f"{lines} lines, {bad} bad",
-         lines == n + half and bad == 0),
-        ("one candidate per found gap", f"{len(cands)} candidates (want {n})",
-         len(cands) == n),
+         lines == n + half + 3 * n_inv and bad == 0),
+        ("one candidate per found gap",
+         f"{len(cands)} candidates (want {n + n_inv})",
+         len(cands) == n + n_inv),
         ("no repeated discovery line", f"repeats={repeats}", repeats == 0),
+        ("submit-line-first keeps start (not a repeat)",
+         f"starts missing={starts_missing}", starts_missing == 0),
         ("verdict attached to its candidate", f"accepted={accepted} "
-         f"rejected={rejected} (want {half - rng_ok}/{rng_ok})",
-         accepted == half - rng_ok and rejected == rng_ok),
+         f"rejected={rejected} (want {half - rng_ok + n_inv}/{rng_ok})",
+         accepted == half - rng_ok + n_inv and rejected == rng_ok),
         ("dry-run is not called 'awaiting verdict'",
          f"{not_submitted} dry-run candidates", not_submitted == n - half),
         ("sigma recovered", f"sigma={sigma:.3f} (want 1.2 +-15%)",

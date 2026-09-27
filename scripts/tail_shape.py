@@ -12,8 +12,10 @@ both covers.  Before adding machinery, this tool asks the prior question:
 
     is the tail exponential at all, above the threshold?
 
-The mean-excess function E[m - M0 | m >= M0] answers it directly.  For an
-exponential it is CONSTANT (= sigma) at every M0.  It RISES with M0 for a
+The HL natural law (scripts/hl_model.py) anchors the answer: sigma_nat ~
+0.96-1.00 across our sizes, so the reference line printed with every fit says
+how far this walk's tail sits from the NO-COVER law (covered walks normally
+sit above it near the threshold).
 heavier-than-exponential tail and FALLS for a lighter one.  Measured on the
 shift507 lex walk (same cover, same anchor, 755k gaps):
 
@@ -69,6 +71,15 @@ import math
 import os
 import random
 import sys
+
+# HL natural reference (scripts/hl_model.py, stdlib-only).  Optional: without
+# the forum/ tables or local order-3 extensions the reference lines drop out
+# and everything else works unchanged.
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+try:
+    import hl_model
+except ImportError:                    # fleet boxes / partial checkout
+    hl_model = None
 
 FAMILIES = ("exp", "stretched", "gpd")
 
@@ -231,6 +242,21 @@ def load_merits(path):
     return ms
 
 
+def hl_sigma_nat(L, gap_target):
+    """HL natural (no-cover) sigma near gap_target = m*L, or None.
+
+    hl_model averages the local c-slopes over the nearest table gaps: the
+    delta(g) = g - c1(g) wobble (~+-1.5 between neighbours) makes any single
+    gap's slope jumpy, so the mean is the stable reading.
+    """
+    if hl_model is None or L is None or L != L or L <= 0 or gap_target <= 0:
+        return None
+    try:
+        return hl_model.natural_sigma_avg(L, gap_target)
+    except Exception:
+        return None
+
+
 def ln_int(n):
     """ln() of a big int without overflow (float() dies above 2^1024)."""
     if n <= 0:
@@ -340,8 +366,8 @@ def bisect_right(a, x):
 # --------------------------------------------------------------------------
 # per-file analysis
 # --------------------------------------------------------------------------
-def analyse(path, merits, u_fit, u_tests, min_n):
-    out = {"path": path, "n": len(merits)}
+def analyse(path, merits, u_fit, u_tests, min_n, L=None):
+    out = {"path": path, "n": len(merits), "L": L}
     if u_fit is None:
         u_fit = auto_u_fit(merits, min_n)
     if u_fit is None:
@@ -362,6 +388,11 @@ def analyse(path, merits, u_fit, u_tests, min_n):
             meas.append((t, sum(x) / len(x), len(x), [m for m in merits
                                                       if m >= t]))
     out["measured"] = meas
+    # HL natural reference at the DEEPEST held-out threshold: the question is
+    # not only "exponential?" but "how far from the no-cover law is this?".
+    out["sigma_nat"] = (hl_sigma_nat(L, max(u_tests) * L)
+                        if L is not None else None)
+    out["sigma_nat_m"] = max(u_tests) if out["sigma_nat"] else None
 
     models = {}
     for fam in FAMILIES:
@@ -402,6 +433,10 @@ def report(res):
         print("  FACT  measured mean excess: "
               + "  ".join(f"M0={t:g}: {s:.4f} (n={n})"
                           for t, s, n, _ in res["measured"]))
+    if res.get("sigma_nat"):
+        print(f"  FACT  HL natural (no cover) sigma at m={res['sigma_nat_m']:g}"
+              f" = {res['sigma_nat']:.3f}  (exponential reference; a covered"
+              f" walk normally sits ABOVE it near the threshold)")
     print(f"  {'family':10} {'params':38} {'held-out LL':>12} {'sum|z|':>8}")
     for fam in FAMILIES:
         rec = res["models"][fam]
@@ -428,6 +463,23 @@ def report(res):
         print(f"  NOTE  GPD xi={p['xi']:+.4f} is indistinguishable from 0 at"
               f" this threshold => no finite endpoint resolved here;"
               f" refit higher (--u-fit) to probe the deep curvature")
+    if res.get("sigma_nat") and res["measured"]:
+        t, s_emp, n, _ = res["measured"][-1]
+        rel = s_emp / res["sigma_nat"]
+        if rel < 0.98:
+            print(f"  NOTE  deepest measured mean excess {s_emp:.4f} "
+                  f"(M0={t:g}) is {100.0 * (1 - rel):.0f}% BELOW the HL "
+                  f"natural sigma {res['sigma_nat']:.3f}: the deep tail is "
+                  f"LIGHTER than even the no-cover law")
+        elif rel > 1.15:
+            print(f"  NOTE  deepest measured mean excess {s_emp:.4f} "
+                  f"(M0={t:g}) is {100.0 * (rel - 1):.0f}% ABOVE the HL "
+                  f"natural sigma {res['sigma_nat']:.3f}: cover lift still "
+                  f"active at this depth")
+        else:
+            print(f"  NOTE  deepest measured mean excess {s_emp:.4f} "
+                  f"(M0={t:g}) agrees with the HL natural sigma "
+                  f"{res['sigma_nat']:.3f} within {100.0 * abs(rel - 1):.0f}%")
 
 
 # --------------------------------------------------------------------------
@@ -526,14 +578,16 @@ def main():
         if not tests:
             print("  no held-out threshold above u_fit; pass --u-test")
             return 2
-        report(analyse(label, all_ms, m0, tests, args.min_n))
+        Ls = [i[2] for i in infos if i[2] == i[2]]
+        L_pool = (sum(Ls) / len(Ls)) if Ls else None
+        report(analyse(label, all_ms, m0, tests, args.min_n, L=L_pool))
         return 0
 
     for path in args.files:
         if not os.path.exists(path):
             print(f"missing: {path}", file=sys.stderr)
             continue
-        merits = load_merits(path)
+        merits, L_file, _ = load_full(path)
         if not merits:
             print(f"no merits in {path}", file=sys.stderr)
             continue
@@ -547,7 +601,7 @@ def main():
         else:
             tests = [m0 + d for d in (2, 4, 6, 8)]
         tests = [t for t in tests if t > m0]
-        res = analyse(path, merits, m0, tests, args.min_n)
+        res = analyse(path, merits, m0, tests, args.min_n, L=L_file)
         report(res)
     return 0
 

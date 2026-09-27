@@ -22,8 +22,11 @@ are skipped) it reports:
     target) upper bound.  Targets whose needed merit is already below the
     threshold are excluded from the sum and counted separately.  With
     fewer than 30 records the fitted sigma is noise, so the projection is
-    also shown for the prior sigma ~= 1.29 (three independent rate
-    anchors from the shift-507 corpus);
+    also shown for a prior sigma = 1.30 x sigma_nat(L), with sigma_nat
+    from the HL coefficient model (scripts/hl_model.py; the 1.30 lift
+    reproduces the historical shift-507 anchor 1.29 ~= 1.30 x 0.99, and
+    the natural law is size-flat at 0.96-1.00 across our range).  Without
+    the HL tables the prior falls back to the constant 1.29;
   * the easiest recordable targets at this size.
 
 Usage:
@@ -39,6 +42,15 @@ import glob
 import math
 import os
 
+# HL natural reference (scripts/hl_model.py; stdlib-only).  Optional: a box
+# without the forum/ tables or the local order-3 extensions loses one
+# reference line and falls back to the historical constant prior.
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+try:
+    import hl_model
+except ImportError:
+    hl_model = None
+
 # Half-width, in GAP UNITS, of the merit bin a table entry occupies.  Gaps
 # between odd primes are EVEN, so a size g lives in the merit bin [g-1, g+1)
 # (width 2/L) and the next table entry g+2 starts exactly where it ends: the
@@ -50,6 +62,14 @@ import os
 # against a Monte-Carlo on the real table before it is used to score anything.
 # `--bin-half 0.5` reproduces the pre-fix (pessimistic) numbers deliberately.
 BIN_HALF = 1.0
+
+# Prior cover lift for sigma when a file is too small to fit its own tail:
+# the shift-507 anchors (sigma_eff ~= 1.29) sit at 1.30 x the HL natural
+# sigma ~= 0.99, and the natural law is size-flat, so the same lift applied
+# to sigma_nat(L) generalizes the anchor to every shift.  PRIOR_FALLBACK is
+# the bare historical constant used only when hl_model is unavailable.
+PRIOR_COVER_LIFT = 1.30
+PRIOR_FALLBACK = 1.29
 
 
 def load_table(path):
@@ -172,6 +192,12 @@ def main():
         L = sum(ln for _, _, ln in recs) / len(recs)
         l_info.append((path, L))
 
+        # HL natural reference and the projection priors (see header note).
+        g_med = sorted(g for g, _, _ in recs)[len(recs) // 2]
+        sig_nat = (hl_model.natural_sigma_avg(L, float(g_med))
+                   if hl_model is not None and L > 0 else None)
+        sig_prior = (PRIOR_COVER_LIFT * sig_nat) if sig_nat else PRIOR_FALLBACK
+
         # sigma: mean excess over threshold (exponential MLE)
         sig_me = sum(m - m_min for m in merits) / len(merits)
         # sigma: two-quantile rate estimate
@@ -212,15 +238,15 @@ def main():
         below = [t for t in tgt if t[0] <= m_min]   # free records, not summable
         tgt_above = [t for t in tgt if t[0] > m_min]
         small = n < 30
-        sig_fit = sig_me if sig_me > 0 else 1.29
+        sig_fit = sig_me if sig_me > 0 else sig_prior
         p_fit = math.exp(-(m_easy - m_min) / sig_fit) if m_easy else 0.0
         unit = (1.0 - math.exp(-(2.0 * BIN_HALF) / (sig_fit * L))
                 if L > 0 and sig_fit > 0 else 0.0)
         p_sum_fit = (unit * sum(math.exp(-(m_t - m_min) / sig_fit)
                                 for m_t, _, _ in tgt_above)
                      if m_easy else 0.0)
-        p_prior = math.exp(-(m_easy - m_min) / 1.29) if m_easy else 0.0
-        unit_p = (1.0 - math.exp(-(2.0 * BIN_HALF) / (1.29 * L))
+        p_prior = math.exp(-(m_easy - m_min) / sig_prior) if m_easy else 0.0
+        unit_p = (1.0 - math.exp(-(2.0 * BIN_HALF) / (sig_prior * L))
                   if L > 0 else 0.0)
         p_sum_prior = (unit_p * sum(math.exp(-(m_t - m_min) / 1.29)
                                     for m_t, _, _ in tgt_above)
@@ -245,7 +271,18 @@ def main():
             return f" x{c}" if c > 1 else ""
         print(f"   sigma: mean-excess={sig_me:.3f}"
               + (f"  quantile={sig_q:.3f}" if sig_q else "")
-              + ("  [n<30: NOISY — prior 1.29 used below]" if small else ""))
+              + ("  [n<30: NOISY — prior used below]" if small else ""))
+        if sig_nat:
+            print(f"   HL natural sigma={sig_nat:.3f} at L={L:.0f} "
+                  f"(slopes near gap {g_med}); projection prior "
+                  f"{sig_prior:.3f} = x{PRIOR_COVER_LIFT:g} cover lift")
+        else:
+            print(f"   HL natural unavailable; projection prior "
+                  f"{sig_prior:.3f} (historical shift-507 anchor)")
+        if sig_nat and not small and sig_me < 0.98 * sig_nat:
+            print(f"   WARNING: fitted sigma {sig_me:.3f} is BELOW the HL "
+                  f"natural floor {sig_nat:.3f}; a covered walk should sit "
+                  f"ABOVE it — suspect a mixed-threshold file or a bug")
         if found:
             print(f"   *** {len(found)} RECORD(S) ALREADY FOUND ***")
             for d, g, m, _ in found:
@@ -263,7 +300,8 @@ def main():
                   f"~{1.0 / p_sum_fit:.0f} (unreliable, n<30)"
                   if p_sum_fit > 0 else
                   "      (no summable targets)")
-            print(f"      prior sigma 1.29 -> sum {p_sum_prior:.3e} -> "
+            print(f"      prior sigma {sig_prior:.3f} -> sum "
+                  f"{p_sum_prior:.3e} -> "
                   f"expected reported gaps ~{1.0 / p_sum_prior:.0f}")
         else:
             print(f"      SUM over {len(tgt_above)} recordable targets "

@@ -45,6 +45,13 @@ Usage:
              errors) is printed whether or not --plot is given.
 
 Runs without numpy/matplotlib for the text part (fleet boxes).
+
+HL3 NOTE (2026-09-27): data/hl_order3_targets.csv adds exact order-3 rows for
+g = 17.9k..40.5k (scripts/hl_order3_targets.py).  This tool keeps the
+hl_natural POWER-LAW fit as its baseline: it needs a smooth sigma(L) at an
+evaluation point, where a per-gap local slope wobbles with delta(g) ~ +-1.5
+between neighbours.  A hl_model local-slope cross-check is printed beside it
+so the two methods' ~3% spread (0.99 vs 0.96 at our L) stays visible.
 """
 import sys
 import math
@@ -59,6 +66,10 @@ try:
     import hl_natural
 except ImportError:                      # pragma: no cover - fleet boxes
     hl_natural = None
+try:
+    import hl_model                     # local-slope cross-check (optional)
+except ImportError:                      # pragma: no cover - fleet boxes
+    hl_model = None
 
 
 def resolve(path):
@@ -365,6 +376,13 @@ def main():
                               (os.path.basename(fb), L_b, sb)):
             if L > 0:
                 print("  %s: %s" % (lab, natural.describe(L, s_eff)))
+                if hl_model is not None:
+                    sn = hl_model.natural_sigma_avg(L, 24.0 * L)
+                    if sn:
+                        print("      cross-check (local slopes, nearest table"
+                              " gaps): sigma_nat=%.3f -- the ~3%% method"
+                              " spread does not change any verdict below"
+                              % sn)
         if L_a > 0 and L_b > 0:
             print("  natural size effect between the two corpora: %+.2f %% "
                   "(measured %+.2f %%) -> %s"

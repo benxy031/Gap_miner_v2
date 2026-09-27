@@ -41,7 +41,14 @@ What it reports (per file, then pooled):
     shape mismatch; the natural line is the external reference.  A tailed cover
     should sit ABOVE that line by its covering gain (sigma_eff/sigma_nat,
     printed as xG at merit 28/40).  A tail that MATCHES the natural law means
-    the cover is adding nothing at this size, which is a finding, not a pass;
+    the cover is adding nothing at this size, which is a finding, not a pass.
+    TWO independent estimators of that sigma_nat exist: the smooth power-law
+    fit of the coefficient tables (scripts/hl_natural.py; the line and the
+    dotted curves) and scripts/hl_model.py averaging the LOCAL same-order
+    slopes of the nearest table rows.  They differ by ~3% at our sizes; the
+    local reading is printed beside the line as a cross-check so the spread is
+    visible, and it feeds no computed number (the sigma_eff and the gain come
+    from the candidates themselves and from the coefficient tables);
   * how the work source ruled on each candidate (accepted / rejected /
     unresolved / stale ...), PER HOUR — for a pool this is the plot that shows
     a stale-work outage (a run that stops being accepted keeps finding
@@ -98,6 +105,15 @@ try:
     import hl_natural
 except ImportError:                      # pragma: no cover - fleet boxes
     hl_natural = None
+
+# The LOCAL-slope HL reading (scripts/hl_model.py) is a second, independent
+# estimator of the same natural sigma.  It is used ONLY for the cross-check
+# line printed beside the power-law baseline (see the natural-tail block in
+# report_group); without the coefficient tables it silently does nothing.
+try:
+    import hl_model
+except ImportError:                      # pragma: no cover - fleet boxes
+    hl_model = None
 
 _NATURAL = None      # cached: Natural object, or False when unavailable
 
@@ -593,6 +609,21 @@ def report_group(title, cands, table, args, out=sys.stdout, comparable=True):
               "(HL, no cover"
               + ("; extrapolated beyond g=%d" % nat.max_g
                  if nat.is_extrapolated(L_nat) else "") + ")", file=out)
+        # Same natural sigma, read LOCALLY (hl_model: average of the
+        # same-order c-slopes at the nearest table gaps) instead of through
+        # the smooth power-law fit above.  The two differ by ~3% at our
+        # sizes; printed so the spread is visible rather than hidden inside
+        # one method's digits.  It feeds no computed number below: sigma_eff
+        # comes from these candidates and the gain from the coefficient
+        # tables, so no verdict can hinge on which reading is quoted.
+        if hl_model is not None:
+            gaps = sorted(c.gap for c in cands if c.gap)
+            g_t = quantile(gaps, 0.5) if gaps else 24.0 * L_nat
+            sn = hl_model.natural_sigma_avg(L_nat, g_t)
+            if sn:
+                print(f"                  cross-check (local slopes, nearest "
+                      f"table gaps): sigma_nat={sn:.3f} -- the ~3% method "
+                      f"spread changes none of the numbers below", file=out)
         if s_eff:
             print(f"                  sigma_eff={s_eff:.3f} -> cover gain "
                   f"x{nat.gain(28.0, s_eff, L_nat):.1f} at merit 28, "

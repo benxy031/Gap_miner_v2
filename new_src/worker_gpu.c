@@ -1705,6 +1705,22 @@ candidate_capacity x K (see the loud alloc-failure message below). */
    Emitted-set parity vs a full scan is verified at chunk 12/16/24/32
    (bad_windows=0 bad_pairs=0 over ~900 flights each at --merit 16). */
 #define MINING_JUMP2_CHUNK_DEFAULT 12
+/* BEACON-style wave start for the mining chain (MINING_JUMP2_WAVE env):
+   each window's scan tests chunks w0, 2*w0, 4*w0 ... capped at
+   MINING_JUMP2_CHUNK, so small slices are used near the anchor (where the
+   searched prime usually sits) and large ones far out (where the round
+   count matters).  This is the same mechanism as GAP_HUNT_JUMP2_WAVE; the
+   measured hunt defaults are chunk 16 / wave 8 (2026-09-28).  Default here
+   follows the mining chunk 12: start 6.  0 or >= the cap = fixed chunk
+   (the pre-2026-09-28 behaviour).
+   MEASURED 2026-09-28 (dev 3070, shift509_p74_covermax_m38, 1 thread, 90 s
+   arms): 8761 win/s (wave 0) vs 8943/8814/8784 (wave 6) = +0.6..1.0%; MR
+   tests/window 79.6 -> 76.9 (-3.4%); parity MINING_JUMP2_VERIFY: 2048-
+   window full-flight replays all bad_windows=0 bad_pairs=0.  One 2965 win/s
+   outlier appeared under external load and did NOT reproduce (repeat 8913)
+   -- check before theorizing (the arm's tests/window matched all the rest). */
+#define MINING_JUMP2_WAVE_DEFAULT 6
+static int g_mj2_wave = MINING_JUMP2_WAVE_DEFAULT;
 
 struct fused_flight_window {
     uint32_t nonce;
@@ -2080,6 +2096,7 @@ struct mining_chain_state {
     uint32_t qidx[MINING_JUMP2_BATCH_MAX];
     uint32_t clo[MINING_JUMP2_BATCH_MAX];
     uint32_t chi[MINING_JUMP2_BATCH_MAX];
+    uint32_t wcur[MINING_JUMP2_BATCH_MAX];  /* current wave width */
     uint8_t  phase[MINING_JUMP2_BATCH_MAX];
     uint64_t thr[MINING_JUMP2_BATCH_MAX];
     uint32_t cum[MINING_JUMP2_BATCH_MAX + 1];
@@ -2175,6 +2192,11 @@ static int crt_fused_chain_flight(struct gpu_sieve_ctx *gpu_sieve,
 {
     const uint32_t K = (uint32_t)fl->n_windows;
     const uint32_t C = (uint32_t)chunk;
+    /* BEACON-style adaptive wave (MINING_JUMP2_WAVE, file-static): growing
+       chunks w0, 2*w0, ... capped at C; w0 >= C restores fixed-chunk
+       behaviour exactly. */
+    const uint32_t w0 = (g_mj2_wave >= 2 && (uint32_t)g_mj2_wave < C)
+                            ? (uint32_t)g_mj2_wave : C;
     const uint32_t total = fl->total_count;
     if (K == 0)
         return 1;
@@ -2193,7 +2215,8 @@ static int crt_fused_chain_flight(struct gpu_sieve_ctx *gpu_sieve,
         cs->qidx[i] = UINT32_MAX;
         cs->phase[i] = MJ2_FIND_FIRST;
         cs->clo[i] = 0;
-        cs->chi[i] = fl->wins[i].count < C ? fl->wins[i].count : C;
+        cs->chi[i] = fl->wins[i].count < w0 ? fl->wins[i].count : w0;
+        cs->wcur[i] = (w0 * 2 < C) ? w0 * 2 : C;
         double t = fl->merit_threshold *
                    worker_log_mpz(fl->wins[i].window_base);
         cs->thr[i] = (uint64_t)ceil(t);
@@ -2292,14 +2315,20 @@ static int crt_fused_chain_flight(struct gpu_sieve_ctx *gpu_sieve,
                         cs->phase[i] = MJ2_DONE;
                     } else {
                         cs->phase[i] = MJ2_JUMP_BACK;
-                        uint32_t cl = cs->qidx[i] > C ? cs->qidx[i] - C : 0;
+                        cs->wcur[i] = w0;
+                        uint32_t cl = cs->qidx[i] > cs->wcur[i]
+                                          ? cs->qidx[i] - cs->wcur[i] : 0;
                         cs->clo[i] = (cl > found + 1) ? cl : found + 1;
                         cs->chi[i] = cs->qidx[i];
+                        cs->wcur[i] = (cs->wcur[i] * 2 < C)
+                                          ? cs->wcur[i] * 2 : C;
                     }
                 } else {
                     cs->clo[i] = cs->chi[i];
-                    cs->chi[i] = (cs->chi[i] + C < cnt_i)
-                                     ? cs->chi[i] + C : cnt_i;
+                    cs->chi[i] = (cs->chi[i] + cs->wcur[i] < cnt_i)
+                                     ? cs->chi[i] + cs->wcur[i] : cnt_i;
+                    cs->wcur[i] = (cs->wcur[i] * 2 < C)
+                                      ? cs->wcur[i] * 2 : C;
                     if (cs->clo[i] >= cnt_i)
                         cs->phase[i] = MJ2_DONE;
                 }
@@ -2316,26 +2345,35 @@ static int crt_fused_chain_flight(struct gpu_sieve_ctx *gpu_sieve,
                     if (cs->qidx[i] == UINT32_MAX) {
                         cs->phase[i] = MJ2_DONE;
                     } else {
-                        uint32_t cl = cs->qidx[i] > C ? cs->qidx[i] - C : 0;
+                        cs->wcur[i] = w0;
+                        uint32_t cl = cs->qidx[i] > cs->wcur[i]
+                                          ? cs->qidx[i] - cs->wcur[i] : 0;
                         cs->clo[i] = (cl > found + 1) ? cl : found + 1;
                         cs->chi[i] = cs->qidx[i];
+                        cs->wcur[i] = (cs->wcur[i] * 2 < C)
+                                          ? cs->wcur[i] * 2 : C;
                     }
                 } else {
                     if (base == cs->pidx[i] + 1) {
                         /* (p, q) fully composite: find the true endpoint. */
                         cs->phase[i] = MJ2_FIND_END;
+                        cs->wcur[i] = w0;
                         cs->clo[i] = cs->qidx[i];
-                        cs->chi[i] = (cs->qidx[i] + C < cnt_i)
-                                         ? cs->qidx[i] + C : cnt_i;
+                        cs->chi[i] = (cs->qidx[i] + cs->wcur[i] < cnt_i)
+                                         ? cs->qidx[i] + cs->wcur[i] : cnt_i;
+                        cs->wcur[i] = (cs->wcur[i] * 2 < C)
+                                          ? cs->wcur[i] * 2 : C;
                         if (cs->chi[i] <= cs->clo[i])
                             cs->phase[i] = MJ2_DONE;
                     } else {
                         uint32_t old_lo = base;
                         uint32_t new_lo =
-                            (old_lo > cs->pidx[i] + 1 + C)
-                                ? old_lo - C : cs->pidx[i] + 1;
+                            (old_lo > cs->pidx[i] + 1 + cs->wcur[i])
+                                ? old_lo - cs->wcur[i] : cs->pidx[i] + 1;
                         cs->chi[i] = old_lo;
                         cs->clo[i] = new_lo;
+                        cs->wcur[i] = (cs->wcur[i] * 2 < C)
+                                          ? cs->wcur[i] * 2 : C;
                     }
                 }
             } else { /* MJ2_FIND_END */
@@ -2352,14 +2390,20 @@ static int crt_fused_chain_flight(struct gpu_sieve_ctx *gpu_sieve,
                         cs->phase[i] = MJ2_DONE;
                     } else {
                         cs->phase[i] = MJ2_JUMP_BACK;
-                        uint32_t cl = cs->qidx[i] > C ? cs->qidx[i] - C : 0;
+                        cs->wcur[i] = w0;
+                        uint32_t cl = cs->qidx[i] > cs->wcur[i]
+                                          ? cs->qidx[i] - cs->wcur[i] : 0;
                         cs->clo[i] = (cl > found + 1) ? cl : found + 1;
                         cs->chi[i] = cs->qidx[i];
+                        cs->wcur[i] = (cs->wcur[i] * 2 < C)
+                                          ? cs->wcur[i] * 2 : C;
                     }
                 } else {
                     cs->clo[i] = cs->chi[i];
-                    cs->chi[i] = (cs->chi[i] + C < cnt_i)
-                                     ? cs->chi[i] + C : cnt_i;
+                    cs->chi[i] = (cs->chi[i] + cs->wcur[i] < cnt_i)
+                                     ? cs->chi[i] + cs->wcur[i] : cnt_i;
+                    cs->wcur[i] = (cs->wcur[i] * 2 < C)
+                                      ? cs->wcur[i] * 2 : C;
                     if (cs->clo[i] >= cnt_i)
                         cs->phase[i] = MJ2_DONE;
                 }
@@ -3290,6 +3334,13 @@ void *worker_thread_run_crt(void *arg) {
         if (mc && *mc) {
             long v = strtol(mc, NULL, 10);
             if (v >= 8 && v <= 512) mining_jump2_chunk = (int)v;
+        }
+    }
+    {
+        const char *mw = getenv("MINING_JUMP2_WAVE");
+        if (mw && *mw) {
+            long v = strtol(mw, NULL, 10);
+            if (v >= 0 && v <= 512) g_mj2_wave = (int)v;
         }
     }
     int mining_jump2_verify = worker_env_enabled(getenv("MINING_JUMP2_VERIFY"));

@@ -225,10 +225,21 @@ static int g_jump = 0;         /* GAP_HUNT_JUMP env: Kehrig-style walk */
    chunk that tests fewer candidates per window (measured shift1017: K=64
    chunk 32 -> 679 win/s with 268 tests/window vs K=64 chunk 64 -> 664 win/s
    with 390 tests/window; shift507: 2406 win/s @222 tests vs 2283 @369).  It is
-   coupled to GAP_HUNT_BATCH: at K=32, chunk 32 is worse than 64. */
-#define GAP_HUNT_JUMP2_CHUNK_DEFAULT 32
+   coupled to GAP_HUNT_BATCH: at K=32, chunk 32 is worse than 64.
+   LOWERED 32 -> 16 (2026-09-28, K=1024, dev 3070, ABBA-style arms, emitted
+   sets byte-identical): 1784/m21 284.8 -> 301-302 win/s (+6%), 507/m8 1694 ->
+   1903 (+12%), 1017/m10 603 -> 662 (+10%).  The optimum is flat 12..20 (as in
+   the mining chain's own sweep); 8 and >=24 are worse. */
+#define GAP_HUNT_JUMP2_CHUNK_DEFAULT 16
 static int g_jump2 = 1;        /* GAP_HUNT_JUMP2=0 restores the full scan */
 static int g_jump2_chunk = GAP_HUNT_JUMP2_CHUNK_DEFAULT;
+/* BEACON-style wave start (GAP_HUNT_JUMP2_WAVE): each window's scan tests
+   chunks w0, 2*w0, 4*w0 ... capped at GAP_HUNT_JUMP2_CHUNK.  DEFAULT 8 =
+   half of the default chunk 16 (measured 2026-09-28: vs the same binary's
+   fixed chunk it is +1.8% at 507/m8, +0.8% at 1017/m10 and neutral at
+   1784/m21 -- never a regression in any arm).  Set 0 to force the fixed
+   chunk (the pre-2026-09-28 behaviour), or a value >= the cap (also fixed). */
+static int g_jump2_wave = 8;
 
 /* Optional HOST-stage accounting (GAP_HUNT_TIMING=1, diagnostics only).  The
    walk's windows/s is only meaningful if the host side is not the wall, so the
@@ -359,12 +370,24 @@ static int gh_jump2_scan(struct gh_batch *b, int slot, struct gh_ctx *g,
     if (K > GAP_HUNT_BATCH_MAX)
         return 0;
 
+    /* BEACON-style adaptive wave (GAP_HUNT_JUMP2_WAVE): scan every window in
+       GROWING chunks w0, 2*w0, ... capped at C instead of one fixed C-wide
+       chunk.  Measured 2026-09-28 at shift1784/m21/K=1024 (dev 3070):
+       tests/window 287.8 (C=8) vs 354.5 (C=32), rounds/1k-win 104.5 vs 27.3
+       -- a small fixed chunk saves MR tests but pays rounds, a large one the
+       other way (the 2026-09-19 mining sweep shows the same flat optimum
+       12..20 with 8 and >=24 clearly worse).  The wave buys small near the
+       anchor and large far out.  w0 >= C restores fixed-chunk behaviour. */
+    const uint32_t w0 = (g_jump2_wave >= 2 && (uint32_t)g_jump2_wave < C)
+                            ? (uint32_t)g_jump2_wave : C;
+
     uint64_t thr[GAP_HUNT_BATCH_MAX];
     uint32_t pidx[GAP_HUNT_BATCH_MAX];
     uint32_t qidx[GAP_HUNT_BATCH_MAX];
     uint8_t  phase[GAP_HUNT_BATCH_MAX];
     uint32_t clo[GAP_HUNT_BATCH_MAX];
     uint32_t chi[GAP_HUNT_BATCH_MAX];
+    uint32_t wcur[GAP_HUNT_BATCH_MAX];   /* current wave width per window */
 
     for (uint32_t i = 0; i < K; i++) {
         /* Reset per-fill record slots: the flight struct is reused across
@@ -381,7 +404,8 @@ static int gh_jump2_scan(struct gh_batch *b, int slot, struct gh_ctx *g,
         qidx[i] = UINT32_MAX;
         phase[i] = J2_FIND_FIRST;
         clo[i] = 0;
-        chi[i] = b->count[i] < C ? b->count[i] : C;
+        chi[i] = b->count[i] < w0 ? b->count[i] : w0;
+        wcur[i] = (w0 * 2 < C) ? w0 * 2 : C;
     }
 
     uint32_t lo[GAP_HUNT_BATCH_MAX], hi[GAP_HUNT_BATCH_MAX];
@@ -456,14 +480,18 @@ static int gh_jump2_scan(struct gh_batch *b, int slot, struct gh_ctx *g,
                         phase[i] = J2_DONE;
                     } else {
                         phase[i] = J2_JUMP_BACK;
-                        uint32_t cl = qidx[i] > C ? qidx[i] - C : 0;
+                        wcur[i] = w0;
+                        uint32_t cl = qidx[i] > wcur[i]
+                                          ? qidx[i] - wcur[i] : 0;
                         clo[i] = (cl > found + 1) ? cl : found + 1;
                         chi[i] = qidx[i];
+                        wcur[i] = (wcur[i] * 2 < C) ? wcur[i] * 2 : C;
                     }
                 } else {
                     clo[i] = chi[i];
-                    chi[i] = (chi[i] + C < b->count[i])
-                                 ? chi[i] + C : b->count[i];
+                    chi[i] = (chi[i] + wcur[i] < b->count[i])
+                                 ? chi[i] + wcur[i] : b->count[i];
+                    wcur[i] = (wcur[i] * 2 < C) ? wcur[i] * 2 : C;
                     if (clo[i] >= b->count[i])
                         phase[i] = J2_DONE;
                 }
@@ -477,25 +505,32 @@ static int gh_jump2_scan(struct gh_batch *b, int slot, struct gh_ctx *g,
                     if (qidx[i] == UINT32_MAX) {
                         phase[i] = J2_DONE;
                     } else {
-                        uint32_t cl = qidx[i] > C ? qidx[i] - C : 0;
+                        phase[i] = J2_JUMP_BACK;
+                        wcur[i] = w0;
+                        uint32_t cl = qidx[i] > wcur[i]
+                                          ? qidx[i] - wcur[i] : 0;
                         clo[i] = (cl > found + 1) ? cl : found + 1;
                         chi[i] = qidx[i];
+                        wcur[i] = (wcur[i] * 2 < C) ? wcur[i] * 2 : C;
                     }
                 } else {
                     if (base == pidx[i] + 1) {
                         /* (p, q) fully composite: find the true endpoint. */
                         phase[i] = J2_FIND_END;
+                        wcur[i] = w0;
                         clo[i] = qidx[i];
-                        chi[i] = (qidx[i] + C < b->count[i])
-                                     ? qidx[i] + C : b->count[i];
+                        chi[i] = (qidx[i] + wcur[i] < b->count[i])
+                                     ? qidx[i] + wcur[i] : b->count[i];
+                        wcur[i] = (wcur[i] * 2 < C) ? wcur[i] * 2 : C;
                         if (chi[i] <= clo[i])
                             phase[i] = J2_DONE;
                     } else {
                         uint32_t old_lo = base;
-                        uint32_t new_lo = (old_lo > pidx[i] + 1 + C)
-                                              ? old_lo - C : pidx[i] + 1;
+                        uint32_t new_lo = (old_lo > pidx[i] + 1 + wcur[i])
+                                              ? old_lo - wcur[i] : pidx[i] + 1;
                         chi[i] = old_lo;
                         clo[i] = new_lo;
+                        wcur[i] = (wcur[i] * 2 < C) ? wcur[i] * 2 : C;
                     }
                 }
             } else { /* J2_FIND_END */
@@ -527,14 +562,18 @@ static int gh_jump2_scan(struct gh_batch *b, int slot, struct gh_ctx *g,
                         phase[i] = J2_DONE;
                     } else {
                         phase[i] = J2_JUMP_BACK;
-                        uint32_t cl = qidx[i] > C ? qidx[i] - C : 0;
+                        wcur[i] = w0;
+                        uint32_t cl = qidx[i] > wcur[i]
+                                          ? qidx[i] - wcur[i] : 0;
                         clo[i] = (cl > found + 1) ? cl : found + 1;
                         chi[i] = qidx[i];
+                        wcur[i] = (wcur[i] * 2 < C) ? wcur[i] * 2 : C;
                     }
                 } else {
                     clo[i] = chi[i];
-                    chi[i] = (chi[i] + C < b->count[i])
-                                 ? chi[i] + C : b->count[i];
+                    chi[i] = (chi[i] + wcur[i] < b->count[i])
+                                 ? chi[i] + wcur[i] : b->count[i];
+                    wcur[i] = (wcur[i] * 2 < C) ? wcur[i] * 2 : C;
                     if (clo[i] >= b->count[i])
                         phase[i] = J2_DONE;
                 }
@@ -1011,6 +1050,14 @@ int gap_hunt_run(const struct gap_hunt_config *cfg) {
             if (c >= 8 && c <= 512)
                 g_jump2_chunk = c;
         }
+        /* GAP_HUNT_JUMP2_WAVE = first chunk width of the adaptive wave
+           (default 8; 0 forces the fixed chunk; >= the cap is fixed too). */
+        const char *j2w = getenv("GAP_HUNT_JUMP2_WAVE");
+        if (j2w && j2w[0]) {
+            int w = atoi(j2w);
+            if (w >= 0 && w <= 512)
+                g_jump2_wave = w;
+        }
     }
 
     struct crt_runtime rt;
@@ -1314,6 +1361,7 @@ int gap_hunt_run(const struct gap_hunt_config *cfg) {
             "jump=%d "
             "jump2=%d "
             "jump2_chunk=%d "
+            "jump2_wave=%d "
             "kmax=%llu min_merit=%.6f "
             "k0=%llu device=%d\n",            rt.shift, rt.n_primes,
             (double)mpz_sizeinbase(P, 2),
@@ -1331,7 +1379,7 @@ int gap_hunt_run(const struct gap_hunt_config *cfg) {
                                  (uint64_t)gpu_fermat_get_limbs(fermat) * 8U /
                                  1000000U),
             g_quarter,
-            g_jump, g_jump2, g_jump2_chunk,
+            g_jump, g_jump2, g_jump2_chunk, g_jump2_wave,
             (unsigned long long)g_kmax, cfg->min_merit,
             (unsigned long long)k, cfg->device);
 

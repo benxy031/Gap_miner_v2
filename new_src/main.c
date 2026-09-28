@@ -710,14 +710,18 @@ int main(int argc, char *argv[]) {
        Keep the shallow 100K default for the hybrid H2D GPU path: the GPU MR
        test is the bottleneck and smart-scan already trims candidates.  The
        fused pipeline (FUSED_GPU=1) computes residues + marking + extraction
-       entirely on-device; the measured optimum is 2M primes on the
-       production host (shift475 live merit: 500K=3183, 1M=3197, 2M=3324,
-       5M=3205 win/s; older dev-host runs: 1M=3106 vs 5M=2814 at shift258,
-       1M=1971 vs 5M=1905 at shift509).  Deeper than 2M costs more GPU
-       marking time than the MR savings of the shrinking survivor set). */
+       entirely on-device and its optimum sits on a broad 11M-20M plateau:
+       fleet 2026-09-24 (2x RTX 3060, shift720 p98_lex_m42, order-swapped
+       90 s arms): 500K=8628, 2M=9213/9205, 5M=9485, 11M=9571/9616,
+       20M=9658/9547 win/s; dev 2026-09-28 replication over shifts 509-738
+       (fused, threads=2): 11M-20M = +4..7% over 2M on every geometry, then
+       50M is flat, 100M -9% and 500M -55% (26M gpu primes -> host-bound).
+       11M is the conservative edge of the plateau; the older shift475
+       production-host sweep that made 2M the default predates the current
+       fused chain and is superseded. */
     if (!sieve_primes_overridden && crt_mode) {
         if (enable_gpu_fermat) {
-            sieve_primes = main_env_enabled("FUSED_GPU") ? 2000000 : 100000;
+            sieve_primes = main_env_enabled("FUSED_GPU") ? 11000000 : 100000;
         } else {
             sieve_primes = 10000000;
         }

@@ -841,6 +841,58 @@ struct CgbnFermatParams {
     static const uint32_t TPI           = TPI_VAL;
 };
 
+/* Montgomery constants WITHOUT cgbn_bn2mont (which needs CGBN's division path).
+   Division-free, mathematically identical:
+     np0     = -N^{-1} mod 2^32   (5 Newton steps on the low 32 bits)
+     Mont(1) = R mod N            = 2^b - N with (BITS-b) doublings
+               (full-width N >= R/2:  R - N == (0 - N) mod R)
+     Mont(2) = 2*Mont(1) mod N
+   Why it exists: cgbn_bn2mont -> rem_wide -> dlimbs_algs_multi, which NVIDIA
+   never implemented, so every LIMBS>TPI config (e.g. 768-bit TPI=4, LIMBS=6)
+   failed to COMPILE.  With no division in the kernel's call graph that class
+   is never instantiated.  It is also cheaper than bn2mont's wide division at
+   every TPI (one subtract + <=BITS/64 doublings per candidate). */
+template<uint32_t BITS, typename env_t>
+__device__ static __forceinline__
+void cgbn_mont_constants(env_t &env, typename env_t::cgbn_t &mont_one,
+                         typename env_t::cgbn_t &mont_two,
+                         const typename env_t::cgbn_t &N, uint32_t &np0)
+{
+    typedef typename env_t::cgbn_t bn_t;
+    bn_t t;
+
+    uint32_t n0 = cgbn_extract_bits_ui32(env, N, 0, 32);
+    uint32_t inv = 1u;
+    #pragma unroll
+    for (int k = 0; k < 5; k++) inv *= (2u - n0 * inv);
+    np0 = 0u - inv;
+
+    uint32_t clz = cgbn_clz(env, N);
+    if (clz == 0) {
+        cgbn_set_ui32(env, t, 0);
+        cgbn_sub(env, mont_one, t, N);          /* R - N */
+    } else {
+        uint32_t b = (uint32_t)BITS - clz;      /* bitlength(N), in (0,BITS) */
+        cgbn_set_ui32(env, t, 1);
+        cgbn_shift_left(env, mont_one, t, b);   /* 2^b */
+        cgbn_sub(env, mont_one, mont_one, N);   /* 2^b - N */
+        for (uint32_t i = b; i < (uint32_t)BITS; i++) {
+            uint32_t carry = cgbn_add(env, t, mont_one, mont_one);
+            if (carry || cgbn_compare(env, t, N) >= 0)
+                cgbn_sub(env, mont_one, t, N);
+            else
+                cgbn_set(env, mont_one, t);
+        }
+    }
+    {
+        uint32_t carry = cgbn_add(env, t, mont_one, mont_one);
+        if (carry || cgbn_compare(env, t, N) >= 0)
+            cgbn_sub(env, mont_two, t, N);
+        else
+            cgbn_set(env, mont_two, t);
+    }
+}
+
 /* Miller-Rabin base 2 on an already-loaded odd N.  Returns 1 = probable
    prime, 0 = composite.  Shared by the batch kernel and the jump-scan walk
    kernel (Kehrig-style serial chains) so both paths use IDENTICAL math. */
@@ -848,7 +900,7 @@ template<uint32_t BITS, uint32_t TPI_VAL, typename env_t>
 __device__ static __forceinline__
 uint8_t cgbn_mr2(env_t &env, typename env_t::cgbn_t &N)
 {
-    typename env_t::cgbn_t e, d, r, t, base, mont_one, mont_nm1;
+    typename env_t::cgbn_t e, d, r, t, mont_one, mont_nm1;
     uint32_t np0;
     int32_t  pos;
 
@@ -858,8 +910,7 @@ uint8_t cgbn_mr2(env_t &env, typename env_t::cgbn_t &N)
     uint32_t s = cgbn_ctz(env, e);
     cgbn_shift_right(env, d, e, s);              /* d = (n-1) >> s */
 
-    cgbn_set_ui32(env, base, 2);
-    np0 = cgbn_bn2mont(env, r, base, N);         /* r = Mont(2) */
+    cgbn_mont_constants<BITS>(env, mont_one, r, N, np0);   /* r = Mont(2) */
     pos = (int32_t)(BITS - 1) - (int32_t)cgbn_clz(env, d) - 1;
     while (pos >= 0) {
         cgbn_mont_sqr(env, r, r, N, np0);
@@ -875,9 +926,8 @@ uint8_t cgbn_mr2(env_t &env, typename env_t::cgbn_t &N)
         }
         pos--;
     }
-    /* r = Mont(2^d).  Mont(1) = R mod n; Mont(n-1) = -R ≡ n - Mont(1). */
-    cgbn_set_ui32(env, base, 1);
-    cgbn_bn2mont(env, mont_one, base, N);
+    /* r = Mont(2^d).  Mont(1) = R mod n (from cgbn_mont_constants);
+       Mont(n-1) = -R ≡ n - Mont(1). */
     cgbn_sub(env, mont_nm1, N, mont_one);
 
     uint8_t ok = (cgbn_compare(env, r, mont_one) == 0 ||
@@ -939,7 +989,7 @@ void cgbn_fermat_kernel_soa_t(const uint64_t * __restrict__ cands_soa,
 
     ctx_t    ctx(cgbn_no_checks);
     env_t    env(ctx);
-    bn_t     N, e, d, r, t, base, mont_one, mont_nm1;
+    bn_t     N, e, d, r, t, mont_one, mont_nm1;
     uint32_t np0;
     int32_t  pos;
 
@@ -968,8 +1018,7 @@ void cgbn_fermat_kernel_soa_t(const uint64_t * __restrict__ cands_soa,
     uint32_t s = cgbn_ctz(env, e);
     cgbn_shift_right(env, d, e, s);              /* d = (n-1) >> s */
 
-    cgbn_set_ui32(env, base, 2);
-    np0 = cgbn_bn2mont(env, r, base, N);         /* r = Mont(2) */
+    cgbn_mont_constants<BITS>(env, mont_one, r, N, np0);   /* r = Mont(2) */
     pos = (int32_t)(BITS - 1) - (int32_t)cgbn_clz(env, d) - 1;
     while (pos >= 0) {
         cgbn_mont_sqr(env, r, r, N, np0);
@@ -985,10 +1034,9 @@ void cgbn_fermat_kernel_soa_t(const uint64_t * __restrict__ cands_soa,
         pos--;
     }
 
-    /* r = Mont(2^d).  Mont(1) = R mod n; Mont(n-1) = -R ≡ n - Mont(1).
+    /* r = Mont(2^d).  Mont(1) = R mod n (from cgbn_mont_constants);
+       Mont(n-1) = -R ≡ n - Mont(1).
        No early return here — that would break CGBN's warp-uniform sync. */
-    cgbn_set_ui32(env, base, 1);
-    cgbn_bn2mont(env, mont_one, base, N);
     cgbn_sub(env, mont_nm1, N, mont_one);
 
     uint8_t ok = (cgbn_compare(env, r, mont_one) == 0 ||
@@ -1309,6 +1357,25 @@ static __host__ __forceinline__ int cios_supports_al(int al)
     }
 }
 
+/* Parsed once per process: GPU_FERMAT_TPI ∈ {4,8,16,32}; -1 = unset/ignored.
+   Shared by launch_fermat (picks the kernel) and gpu_fermat_kernel_label()
+   so the two can never disagree — the label used to hardcode TPI=8 and
+   misreported a whole A/B until the kernel banner exposed it. */
+static int gpu_fermat_tpi_override(void)
+{
+    static int tpi_override = -2;  /* -2 unparsed, -1 none, else 4/8/16/32 */
+    if (tpi_override == -2) {
+        const char *env = getenv("GPU_FERMAT_TPI");
+        tpi_override = -1;
+        if (env && *env) {
+            int v = atoi(env);
+            if (v == 4 || v == 8 || v == 16 || v == 32)
+                tpi_override = v;
+        }
+    }
+    return tpi_override;
+}
+
 static cudaError_t launch_fermat(int al, cudaStream_t stream,
                                  const uint64_t *d_cands,
                                  const uint64_t *d_cands_soa,
@@ -1350,24 +1417,17 @@ static cudaError_t launch_fermat(int al, cudaStream_t stream,
     }
 #if defined(CGBN_FERMAT_AVAILABLE)
     /* CGBN dispatch for even AL values.
-       TPI=8 for AL%4==0, TPI=4 for AL%2==0 (largest power-of-2 ≤ 8 dividing 2×AL).
+       Auto rule: TPI=8 for AL%4==0, TPI=4 for AL%2==0 (largest power-of-2 ≤ 8
+       dividing 2×AL).  AL=12/16 replace that auto rule with a measured TPI=4
+       default (see CGBN_DISP_WIDE just below); GPU_FERMAT_TPI overrides both.
        Odd AL falls through to the scalar FERMAT_DISPATCH macros below.
        All template instantiations share the same kernel body; nvcc compiles
        only those actually referenced in the switch cases guarded by #if NL>=. */
     {
         static int cgbn_logged = 0;
-        static int tpi_override = -2;  /* -2 unparsed, -1 none, else 4/8/16/32 */
 
         if (!gpu_fermat_no_cgbn()) {
-        if (tpi_override == -2) {
-            const char *env = getenv("GPU_FERMAT_TPI");
-            tpi_override = -1;
-            if (env && *env) {
-                int v = atoi(env);
-                if (v == 4 || v == 8 || v == 16 || v == 32)
-                    tpi_override = v;
-            }
-        }
+        const int tpi_override = gpu_fermat_tpi_override();
 
         #define CGBN_LAUNCH(AL_VAL, TPI_VAL) \
             do { \
@@ -1390,13 +1450,22 @@ static cudaError_t launch_fermat(int al, cudaStream_t stream,
                 return cudaPeekAtLastError(); \
             } while (0)
 
-        /* Wide ALs (768-bit+): TPI ∈ {8,16,32} are all valid (TPI=4 would
-           need >4 limbs/thread → the unimplemented dlimbs_algs_multi path).
-           GPU_FERMAT_TPI selects among them at runtime for A/B tuning. */
-        #define CGBN_DISP_WIDE(AL_VAL) \
+        /* Wide ALs (768-bit+): TPI 4/8/16/32 all compile and run — the MR
+           kernel no longer calls cgbn_bn2mont, so CGBN's unimplemented
+           dlimbs_algs_multi (the old blocker for TPI=4 at these widths) is
+           never instantiated.  TPI=4 trades fewer broadcast rounds for 2x the
+           threads per candidate, so it wins only when the MR batch fills the
+           SMs: measured 2026-09-29 — bench batch 40000 +20% (768-bit) / +25%
+           (1024-bit), batch 2048 -26%/-27% (latency regime), and +8.6%
+           (shift507) / +8.8% (shift720, the fleet cover) in the fused mining
+           chain.  DEF_TPI is the per-width default: 4 for the measured mining
+           widths AL=12/16, 8 elsewhere until each is A/B'd.  GPU_FERMAT_TPI
+           (4/8/16/32) overrides at runtime. */
+        #define CGBN_DISP_WIDE(AL_VAL, DEF_TPI) \
             case AL_VAL: { \
-                int tpi = (tpi_override >= 8) ? tpi_override : 8; \
+                int tpi = (tpi_override >= 4) ? tpi_override : DEF_TPI; \
                 switch (tpi) { \
+                    case 4:  CGBN_LAUNCH(AL_VAL,  4); break; \
                     case 16: CGBN_LAUNCH(AL_VAL, 16); break; \
                     case 32: CGBN_LAUNCH(AL_VAL, 32); break; \
                     default: CGBN_LAUNCH(AL_VAL,  8); break; \
@@ -1410,33 +1479,35 @@ static cudaError_t launch_fermat(int al, cudaStream_t stream,
             case 4:  CGBN_LAUNCH( 4, 8);  break;   /* 256-bit  */
             #endif
             #if NL >= 6
-            case 6:  CGBN_LAUNCH( 6, 4);  break;   /* 384-bit  */
+            case 6: {  /* 384-bit: default TPI=4 (LIMBS=3); TPI=8 (LIMBS=2) via env.
+                          A/B for the "limbs per lane" trend (see TPI<8 project notes). */
+                if (tpi_override == 8) CGBN_LAUNCH( 6, 8); else CGBN_LAUNCH( 6, 4);
+            } break;
             #endif
             #if NL >= 8
-            case 8:  CGBN_LAUNCH( 8, 8);  break;   /* 512-bit  */
+            case 8: {  /* 512-bit: default TPI=8 (LIMBS=2); TPI=4 (LIMBS=4) via env */
+                if (tpi_override == 4) CGBN_LAUNCH( 8, 4); else CGBN_LAUNCH( 8, 8);
+            } break;
             #endif
             #if NL >= 12
-            CGBN_DISP_WIDE(12)                       /* 768-bit  */
+            CGBN_DISP_WIDE(12, 4)                    /* 768-bit  (default TPI=4) */
             #endif
             #if NL >= 16
-            CGBN_DISP_WIDE(16)                       /* 1024-bit */
+            CGBN_DISP_WIDE(16, 4)                    /* 1024-bit (default TPI=4) */
             #endif
             #if NL >= 20
-            CGBN_DISP_WIDE(20)                       /* 1280-bit */
+            CGBN_DISP_WIDE(20, 8)                    /* 1280-bit */
             #endif
-            /* AL=24/28/32 (1536/1792/2048-bit) are TPI=8-ONLY: TPI=4 would
-               need 12/14/16 limbs per thread, beyond CGBN's 4-limb half
-               algorithm (dlimbs_algs_multi is not implemented).  The auto
-               rule above already picks 8 for AL%4==0, so CGBN_DISP_WIDE is
-               safe here; GPU_FERMAT_TPI=4 must NOT be used at these widths. */
+            /* AL=24/28/32 (1536/1792/2048-bit) also accept TPI=4 now (the
+               multi blocker is gone); they run TPI=8 by default (not yet A/B'd). */
             #if NL >= 24
-            CGBN_DISP_WIDE(24)                       /* 1536-bit */
+            CGBN_DISP_WIDE(24, 8)                    /* 1536-bit */
             #endif
             #if NL >= 28
-            CGBN_DISP_WIDE(28)                       /* 1792-bit */
+            CGBN_DISP_WIDE(28, 8)                    /* 1792-bit */
             #endif
             #if NL >= 32
-            CGBN_DISP_WIDE(32)                       /* 2048-bit */
+            CGBN_DISP_WIDE(32, 8)                    /* 2048-bit */
             #endif
             /* All other AL: scalar fermat_kernel_t */
             default: break;
@@ -2125,15 +2196,18 @@ const char *gpu_fermat_kernel_label(int limbs)
         return cios_buf;
     }
     if (cgbn_supports_al(limbs)) {
-        int tpi = ((limbs % 4) == 0) ? 8 : 4;
+        /* Report the TPI the launcher will actually pick for this width:
+           per-width default (4 at AL=12/16, else the auto rule) with the
+           GPU_FERMAT_TPI override on top.  Keep in sync with the
+           CGBN_DISP_WIDE call sites in launch_fermat. */
+        int def = (limbs == 12 || limbs == 16) ? 4 : ((limbs % 4) == 0 ? 8 : 4);
+        int ov  = gpu_fermat_tpi_override();
+        int tpi = (ov >= 4) ? ov : def;
         switch (limbs) {
         case 2:  return "CGBN (128-bit, TPI=4)";
         case 4:  return "CGBN (256-bit, TPI=8)";
-        case 6:  return "CGBN (384-bit, TPI=4)";
-        case 8:  return "CGBN (512-bit, TPI=8)";
-        case 12: return "CGBN (768-bit, TPI=8)";
-        case 16: return "CGBN (1024-bit, TPI=8)";
-        case 20: return "CGBN (1280-bit, TPI=8)";
+        case 6:  return (ov == 8) ? "CGBN (384-bit, TPI=8)" : "CGBN (384-bit, TPI=4)";
+        case 8:  return (ov == 4) ? "CGBN (512-bit, TPI=4)" : "CGBN (512-bit, TPI=8)";
         default: {
             static char buf[64];
             snprintf(buf, sizeof(buf), "CGBN (%d-bit, TPI=%d)", limbs * 64, tpi);

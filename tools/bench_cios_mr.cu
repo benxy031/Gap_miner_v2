@@ -245,6 +245,178 @@ __device__ static int mr_base2(const uint32_t *nin) {
     return 0;
 }
 
+/* ------------------------------------------------- x2: two candidates per thread
+ *
+ * MEASURED VERDICT (2026-09-29, RTX 3070, this tool, mode "x2"): CORRECT but SLOW --
+ * the register file cannot hold two Montgomery chains.  Baseline vs x2:
+ *   big batch (equal fill, pure ILP test): 1,648,370 vs 1,198,978 cand/s = -27%
+ *   8 streams x batch 2048 (production)  : 1,676,485 vs 944,030      = -44%
+ *   batch 512 latency regime             : 115,577   vs 29,447       = -75%
+ *   res-usage: baseline 183 regs / 384 B stack; x2 254 regs / 576 B stack.
+ * => dependency hiding does NOT pay for the doubled live set; the ILP lever is CLOSED
+ * at 24 limbs.  Consequence for any future TPI<8 hand kernel: the per-lane state must
+ * SHRINK (CGBN runs 54 regs at 3 words/lane), not grow.  Kept as documented negative.
+ *
+ * WHY (original hypothesis): the 2026-09-22 chain A/B showed CIOS loses ONLY in
+ * small-batch geometry (a 512-2048 candidate MR launch = too few warps to hide the
+ * Montgomery latency; CGBN's 8 lanes/candidate fills the machine at any batch).
+ * ILP=2 was meant to double the independent dependency chains per thread at the SAME
+ * batch - the same fix TPI=4 would buy, without any cross-lane carry machinery.
+ * The compiler CAN interleave the two mont_mul bodies (no branch between them in the
+ * steady-state loop), but the register pressure defeats it. */
+
+__device__ __forceinline__ static uint32_t cios_n0inv(const uint32_t *n) {
+    uint32_t v = 1u;
+#pragma unroll
+    for (int k = 0; k < 5; k++) v = v * (2u - n[0] * v);
+    return (uint32_t)(0u - v);
+}
+
+__device__ __forceinline__ static int cios_ctz_nm1(const uint32_t *n) {
+    uint32_t w0 = n[0] - 1u;              /* n odd -> no borrow out of word 0 */
+    if (w0 != 0u) return __ffs((int)w0) - 1;
+    int s = 32, j = 1;
+    while (j < NL && n[j] == 0u) { s += 32; j++; }
+    if (j < NL) { uint32_t w = n[j]; while ((w & 1u) == 0u) { w >>= 1; s++; } }
+    return s;
+}
+
+__device__ __forceinline__ static uint32_t cios_nm1_bit(const uint32_t *n, int pos) {
+    if (pos < 32) return ((n[0] - 1u) >> pos) & 1u;
+    return (n[pos >> 5] >> (pos & 31)) & 1u;
+}
+
+__device__ __forceinline__ static int cios_d_bitlen(const uint32_t *n, int s) {
+    int dbits = 768 - s;
+    while (dbits > 0 && cios_nm1_bit(n, dbits - 1 + s) == 0u) dbits--;
+    return dbits;
+}
+
+/* one = R mod n = 2^b - n then (768-b) doublings; two = 2*one = Mont(2). */
+__device__ __forceinline__ static void cios_build_one_two(uint32_t *one, uint32_t *two,
+                                                          const uint32_t *n) {
+    int b = 0;
+#pragma unroll
+    for (int j = NL - 1; j >= 0; j--)
+        if (b == 0 && n[j] != 0u) b = j * 32 + (32 - __clz(n[j]));
+    uint32_t borrow = 0;
+#pragma unroll
+    for (int j = 0; j < NL; j++) {
+        uint32_t v = (j == (b >> 5)) ? (1u << (b & 31)) : 0u;
+        uint64_t d = (uint64_t)v - (uint64_t)n[j] - (uint64_t)borrow;
+        one[j] = (uint32_t)d;
+        borrow = (uint32_t)((d >> 32) & 1u);
+    }
+#pragma unroll 1
+    for (int i = b; i < 768; i++) dbl_mod(one, one, n);
+    dbl_mod(two, one, n);
+}
+
+__device__ __forceinline__ static void cios_neg_of(uint32_t *neg, const uint32_t *n,
+                                                   const uint32_t *one) {
+    uint32_t borrow = 0;
+#pragma unroll
+    for (int j = 0; j < NL; j++) {
+        uint64_t d = (uint64_t)n[j] - (uint64_t)one[j] - (uint64_t)borrow;
+        neg[j] = (uint32_t)d;
+        borrow = (uint32_t)((d >> 32) & 1u);
+    }
+}
+
+/* tail identical to mr_base2: y == +-1 -> pass; else s-1 squarings, -1 -> pass,
+   1 -> fail, none -> fail. */
+__device__ __forceinline__ static int cios_mr_tail(uint32_t *y, const uint32_t *n,
+                                                   uint32_t n0inv, int s,
+                                                   const uint32_t *one, const uint32_t *neg) {
+    int is_one = 1, is_neg = 1;
+#pragma unroll
+    for (int j = 0; j < NL; j++) {
+        if (y[j] != one[j]) is_one = 0;
+        if (y[j] != neg[j]) is_neg = 0;
+    }
+    if (is_one || is_neg) return 1;
+    uint32_t tmp[NL];
+    for (int r = 0; r < s - 1; r++) {
+        mont_mul(tmp, y, y, n, n0inv);
+#pragma unroll
+        for (int j = 0; j < NL; j++) y[j] = tmp[j];
+        int got_neg = 1, got_one = 1;
+#pragma unroll
+        for (int j = 0; j < NL; j++) {
+            if (y[j] != neg[j]) got_neg = 0;
+            if (y[j] != one[j]) got_one = 0;
+        }
+        if (got_neg) return 1;
+        if (got_one) return 0;
+    }
+    return 0;
+}
+
+/* returns bit0 = pass(A), bit1 = pass(B) */
+__device__ static uint32_t mr_base2_2c(const uint32_t *na, const uint32_t *nb) {
+    uint32_t nA[NL], nB[NL], yA[NL], yB[NL], tmp[NL];
+#pragma unroll
+    for (int j = 0; j < NL; j++) { nA[j] = na[j]; nB[j] = nb[j]; }
+
+    uint32_t invA = cios_n0inv(nA), invB = cios_n0inv(nB);
+    int sA = cios_ctz_nm1(nA), sB = cios_ctz_nm1(nB);
+    int eA = cios_d_bitlen(nA, sA) - 2, eB = cios_d_bitlen(nB, sB) - 2;
+
+    cios_build_one_two(tmp, yA, nA);          /* yA = Mont(2)_A */
+    cios_build_one_two(tmp, yB, nB);          /* yB = Mont(2)_B */
+
+    int hi = eA > eB ? eA : eB, lo = eA < eB ? eA : eB;
+    /* prefix: only the longer candidate is active */
+    for (int b = hi; b > lo; b--) {
+        if (b <= eA) {
+            mont_mul(tmp, yA, yA, nA, invA);
+#pragma unroll
+            for (int j = 0; j < NL; j++) yA[j] = tmp[j];
+            if (cios_nm1_bit(nA, b + sA)) dbl_mod(yA, yA, nA);
+        } else {
+            mont_mul(tmp, yB, yB, nB, invB);
+#pragma unroll
+            for (int j = 0; j < NL; j++) yB[j] = tmp[j];
+            if (cios_nm1_bit(nB, b + sB)) dbl_mod(yB, yB, nB);
+        }
+    }
+    /* steady state: both chains, no branch between the two mont_mul bodies */
+    for (int b = lo; b >= 0; b--) {
+        mont_mul(tmp, yA, yA, nA, invA);
+#pragma unroll
+        for (int j = 0; j < NL; j++) yA[j] = tmp[j];
+        mont_mul(tmp, yB, yB, nB, invB);
+#pragma unroll
+        for (int j = 0; j < NL; j++) yB[j] = tmp[j];
+        if (cios_nm1_bit(nA, b + sA)) dbl_mod(yA, yA, nA);
+        if (cios_nm1_bit(nB, b + sB)) dbl_mod(yB, yB, nB);
+    }
+
+    uint32_t one[NL], neg[NL], two[NL];
+    int passA, passB;
+    cios_build_one_two(one, two, nA);
+    cios_neg_of(neg, nA, one);
+    passA = cios_mr_tail(yA, nA, invA, sA, one, neg);
+    cios_build_one_two(one, two, nB);
+    cios_neg_of(neg, nB, one);
+    passB = cios_mr_tail(yB, nB, invB, sB, one, neg);
+    return (uint32_t)passA | ((uint32_t)passB << 1);
+}
+
+__global__ void mr_kernel_x2(const uint32_t *cands, int n_cand, uint8_t *res) {
+    int half = (n_cand + 1) >> 1;
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    int stride = gridDim.x * blockDim.x;
+    for (; i < half; i += stride) {
+        int j = i + half;
+        uint32_t r = (j < n_cand) ? mr_base2_2c(cands + (size_t)i * NL,
+                                                cands + (size_t)j * NL)
+                                  : (uint32_t)(mr_base2(cands + (size_t)i * NL) & 1);
+        res[i] = (uint8_t)(r & 1u);
+        if (j < n_cand) res[j] = (uint8_t)((r >> 1) & 1u);
+    }
+}
+
 __global__ void mr_kernel(const uint32_t *cands, int n_cand, uint8_t *res) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     int stride = gridDim.x * blockDim.x;
@@ -324,16 +496,22 @@ int main(int argc, char **argv) {
     ck("copy", cudaMemcpy(d_cand, h_cand, (size_t)n_cand * NL * sizeof(uint32_t),
                           cudaMemcpyHostToDevice));
 
+    int use_x2 = (argc > 5 && strcmp(argv[5], "x2") == 0);
+    if (use_x2)
+        printf("  MODE x2: 2 candidates/thread (ILP=2); %d threads cover %d candidates\n",
+               (n_cand + 1) / 2, n_cand);
+
     int blocks = 0;
-    ck("occ", cudaOccupancyMaxActiveBlocksPerMultiprocessor(&blocks, mr_kernel,
-                                                            tpb, 0));
+    ck("occ", cudaOccupancyMaxActiveBlocksPerMultiprocessor(
+                  &blocks, use_x2 ? mr_kernel_x2 : mr_kernel, tpb, 0));
     cudaDeviceProp p;
     ck("prop", cudaGetDeviceProperties(&p, 0));
     int grid = p.multiProcessorCount * blocks;
     printf("  launch: %d blocks x %d threads, %d blocks/SM (%d warps/SM), grid=%d\n",
            grid, tpb, blocks, blocks * tpb / 32, grid);
 
-    mr_kernel<<<grid, tpb>>>(d_cand, n_cand, d_res);
+    if (use_x2) mr_kernel_x2<<<grid, tpb>>>(d_cand, n_cand, d_res);
+    else        mr_kernel<<<grid, tpb>>>(d_cand, n_cand, d_res);
     ck("warmup", cudaDeviceSynchronize());
     ck("copyback", cudaMemcpy(h_res, d_res, n_cand, cudaMemcpyDeviceToHost));
 
@@ -364,14 +542,20 @@ int main(int argc, char **argv) {
     int n_timed = n_cand;
     double t0 = now_s();
     if (batch <= 0) {
-        mr_kernel<<<grid, tpb>>>(d_cand, n_cand, d_res);
+        if (use_x2) mr_kernel_x2<<<grid, tpb>>>(d_cand, n_cand, d_res);
+        else        mr_kernel<<<grid, tpb>>>(d_cand, n_cand, d_res);
         ck("run", cudaDeviceSynchronize());
     } else if (streams == 1) {
         int iters = n_cand / batch;
         int bg = (batch + tpb - 1) / tpb;
+        int bg2 = ((batch + 1) / 2 + tpb - 1) / tpb;
         for (int it = 0; it < iters; it++) {
-            mr_kernel<<<bg, tpb>>>(d_cand + (size_t)it * batch * NL, batch,
-                                   d_res + (size_t)it * batch);
+            if (use_x2)
+                mr_kernel_x2<<<bg2, tpb>>>(d_cand + (size_t)it * batch * NL, batch,
+                                           d_res + (size_t)it * batch);
+            else
+                mr_kernel<<<bg, tpb>>>(d_cand + (size_t)it * batch * NL, batch,
+                                       d_res + (size_t)it * batch);
         }
         ck("run", cudaDeviceSynchronize());
         n_timed = iters * batch;
@@ -381,11 +565,16 @@ int main(int argc, char **argv) {
         int per_stream = n_cand / streams;
         int iters = per_stream / batch;
         int bg = (batch + tpb - 1) / tpb;
+        int bg2 = ((batch + 1) / 2 + tpb - 1) / tpb;
         for (int s = 0; s < streams; s++)
             for (int it = 0; it < iters; it++) {
                 size_t off = ((size_t)s * iters + it) * batch;
-                mr_kernel<<<bg, tpb, 0, st[s]>>>(d_cand + off * NL, batch,
-                                                 d_res + off);
+                if (use_x2)
+                    mr_kernel_x2<<<bg2, tpb, 0, st[s]>>>(d_cand + off * NL, batch,
+                                                         d_res + off);
+                else
+                    mr_kernel<<<bg, tpb, 0, st[s]>>>(d_cand + off * NL, batch,
+                                                     d_res + off);
             }
         for (int s = 0; s < streams; s++) {
             ck("sync", cudaStreamSynchronize(st[s]));

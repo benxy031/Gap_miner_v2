@@ -106,6 +106,30 @@ __global__ void bench_dp4a(uint32_t seed, unsigned long long *out, int iter) {
     atomicAdd(out, r);
 }
 
+/* ----------------------------------------------------------------- fp64 FMA */
+/* Consumer GA10x FP64 runs at 1/64 of the FP32 rate (datacenter parts 1:2);
+   the Emmart FP64-DPF Montgomery paper targets the 1:2 datacenter parts.
+   This row gives the carrier rate on THIS card, for the closed-avenue record.
+   b < 1 so the chain converges (no inf/denormal slowdown); the dependency
+   chain is identical to the integer rows, only the carrier differs. */
+__global__ void bench_fma64(uint32_t seed, unsigned long long *out, int iter) {
+    double a[NACC];
+#pragma unroll
+    for (int i = 0; i < NACC; i++)
+        a[i] = 1.0 + (double)(seed & 0xffffu) / 65536.0 + (double)i;
+    double b = 0.9999999;
+    double c = 1e-7;
+    for (int it = 0; it < iter; it++) {
+#pragma unroll
+        for (int i = 0; i < NACC; i++) a[i] = fma(a[i], b, c);   /* DFMA */
+    }
+    double r = 0.0;
+#pragma unroll
+    for (int i = 0; i < NACC; i++) r += a[i];
+    if (r == 1.2345678901234567e300) atomicAdd(out, 1ULL);       /* never true */
+    atomicAdd(out, (unsigned long long)(r * 1e9));
+}
+
 /* -------------------------------------------------------------- int8 MMA   */
 /* mma.sync.aligned.m16n8k16.row.col.satfinite.s32.s8.s8.s32
    GEOMETRY (verified with ptxas 12.4 / sm_86 -- the naive 4/2/4 guess is
@@ -272,8 +296,9 @@ int main(int argc, char **argv) {
         {"dp4a", bench_dp4a, 4, "4 x int8 MAC"},
         {"mma_int8", bench_mma_int8, 2048, "2048 x int8 MAC"},
         {"mma_pack", bench_mma_pack, 2048, "2048 x int8 MAC + repack"},
+        {"fma64", bench_fma64, 1, "1 x FP64 FMA (consumer 1:64 rate)"},
     };
-    const int NROWS = 6;
+    const int NROWS = 7;
 
     double ginstr[8], gunit[8];
     for (int i = 0; i < NROWS; i++) {
@@ -318,6 +343,11 @@ int main(int argc, char **argv) {
     printf("  mma8+pk : %9.2f GMAC/s  (%.2fx scalar; %.2fx of the register-\n"
            "                                   resident mma8 => the repack tax)\n",
            gunit[5], gunit[5] / gunit[0], gunit[5] / gunit[4]);
+    printf("  fma64   : %9.2f GFMA/s  (%.1fx slower than mul32, %.1fx slower than\n"
+           "                                   mul64; consumer GA10x FP64 = 1/64 of\n"
+           "                                   FP32 -- cf. the Emmart FP64-DPF\n"
+           "                                   paper, which needs 1:2 datacenter)\n",
+           gunit[6], gunit[0] / gunit[6], gunit[1] / gunit[6]);
 
     /* RNS-16 Montgomery model.  One 768-bit step in the 2-extension
        Bajard-Imbert-Jullien form costs 3K + 2K' 16-bit products (K = 50

@@ -179,12 +179,17 @@ scripts/ab_shift_compare.sh          # accepted blocks / qualifying gaps per hou
 # ── Arithmetic backend ceilings: would a different multiply carrier pay? ────
 make bin/cuda_int_throughput WITH_CUDA=1   # build (same pattern as bin/bench_mark)
 # or directly: nvcc -O3 -arch=sm_86 -o bin/cuda_int_throughput tools/cuda_int_throughput.cu
-./bin/cuda_int_throughput 400000      # measured integer retire rates of THIS GPU:
+./bin/cuda_int_throughput 400000      # measured retire rates of THIS GPU:
                                      # 32-bit IMAD, 64-bit mul, mul64hi, __dp4a,
-                                     # and int8 mma.m16n8k16 (2048 MAC/instr).
+                                     # int8 mma.m16n8k16 (2048 MAC/instr), and
+                                     # FP64 FMA (`fma64`; consumer 1:64 rate).
                                      # Independent accumulators = THROUGHPUT, not
                                      # latency; event timer is cross-checked
                                      # against wall clock.
+# Montgomery carry-style ceiling (gECC check, 2026-09-29): plain C wins over every
+# hand-written variant (measured, bit-exact):  build/run:
+#   nvcc -O3 -arch=sm_86 -std=c++17 -o bin/bench_mont_ab tools/bench_mont_ab.cu
+#   ./bin/bench_mont_ab 24 20000 256     # C 1210.6 > WIDE -7.6% > SPLIT6 -8.3% G limb-MAC/s
 scripts/arith_ceiling.py             # paper model at our exact sizes (AL per
                                      # shift, modmuls per MR test): CGBN 64-bit
                                      # limbs (current) vs RNS-16 scalar / dp4a /
@@ -480,8 +485,17 @@ negligible.  The gap-distribution health histogram is disabled in this mode
 visible-class candidates only.
 
 In CRT mode `HALF_CLASS` also works: the covering template pre-filters the
-on-demand verification (measured on shift509: fused 1647 → 1888 win/s,
-+14.6%; CPU-only 20 → 28 win/s, +40%).  The back-lookahead region is scanned
+on-demand verification (CPU-only measured on shift509: 20 → 28 win/s, +40%).
+**RE-MEASURED on the current fused chain (2026-09-28): HALF_CLASS is a
+REGRESSION — do not enable it on the mining fleet.**  Shift509
+`p74_covermax_m38` fused: 12,667 → 10,650 win/s (−16%; −11% at the live
+threshold); shift720 `p98_lex_m45`: 7,066 → 5,457 (−23%).  Root cause:
+`candidates/window` is UNCHANGED (70.6 → 71.7; 85.9 → 86.8) — in the
+stop-at-first-pair chain the visible gap closes ~2× farther away, so
+halving the visible-class density keeps the MR test count the same while
+the longer per-window scan costs extra sieve/mark work.  The historic
+"+14.6% fused" figure (1647 → 1888 win/s) predates the chain rework and is
+superseded.  The back-lookahead region is scanned
 in ALL classes so its primes anchor the prefix chain directly; the terminal
 pair (last back prime → first visible prime) is resolved only when its merit
 can qualify:
@@ -1125,7 +1139,9 @@ scripts/          gen_crt_batch.sh, update_merits.sh, ab_shift_compare.sh,
                   hl_natural.py (HL natural baseline; reads forum/*.csv),
                   records_report.py, pool_block_audit.py, arith_ceiling.py
 tools/            cuda_int_throughput.cu (GPU integer rate benchmark; build with
-                  nvcc -O3 -arch=sm_86 -o bin/cuda_int_throughput ...)
+                  nvcc -O3 -arch=sm_86 -o bin/cuda_int_throughput ...),
+                  bench_mont_ab.cu (Montgomery row carry-style A/B: compiler C vs
+                  hand mad.wide vs INT-pipe-heavy; measured verdict in its header)
 gen_crt.md        CRT covering-file generator guide
 docs/             Architecture references, GAP_HUNT plan, closed-fingerprints registry (dead routes and their reopen triggers)
 ```

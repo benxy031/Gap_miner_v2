@@ -1029,6 +1029,31 @@ summed `acc` equals the GPU's total busy time. Interpreting the ratio:
 The metric is only meaningful with GPU MR active and stays `0.000` in pure-CPU
 runs or when the GPU path is disabled.
 
+The block's power line reports the chain's own mining-power metric and ours:
+
+```
+Network power: 77.49M mH/s | Miner power: 410.233 mH/s (owned nAdd/s) = 0.771M primes/s (Gapcoin miningpower)
+```
+
+`Miner power` = `windows/s × adders_per_window / 1e6` — the rate at which the
+miner walks its own `nAdd` space (adders = candidate integers `n = h256<<shift +
+nAdd`). The window is `2 × ceil(merit_req × (256+shift) × ln2)` in CRT mode (the
+per-window scan range at the live threshold) and the owned window
+(`2^clamp(shift−6,12,20)`) in non-CRT mode. The `primes/s` figure converts it to
+the reference miner's unit (`src/PoWCore/Sieve.cpp` `primes_per_sec()`: the
+expected number of primes inside the sieved window, `sievesize / ln(start)`,
+accumulated per window), i.e. exactly `mH/s ÷ ln N` with `N ≈ 2^(256+shift)`
+(the `nAdd` offset is < 2^-200 of the base) — the same quantity a legacy miner
+reports as "primes/s", and the unit Gapcoin's wallet renders as `H/s`…`PH/s`.
+**Do not divide `Miner power` by `Network power`**: the node's
+`networkminingpower` (`src/rpc/mining.cpp` `GetNetworkMiningPower`) is a
+standardized estimate — chain-work delta over the last 120 blocks, calibrated so
+1 corresponds to a minimum-difficulty block every 150 s, proportional to
+`Difficulty^(constellation_len+2.3)` — not a candidate rate. Both figures are
+within-geometry metrics: a different shift/cover/difficulty changes the window
+(and therefore `mH/s` at unchanged win/s), so compare them only at fixed
+geometry.
+
 The same block reports the expensive-test density on a `GPU MR tests` line:
 
 ```

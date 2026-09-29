@@ -1491,6 +1491,19 @@ int main(int argc, char *argv[]) {
                 double miner_power_mhs =
                     throughput * stats_window / 1000000.0;
 
+                /* Reference-miner "primes per second" (Gapcoin src/PoWCore/
+                   Sieve.cpp primes_per_sec(): the expected number of primes
+                   inside the sieved window, sievesize / ln(start), accumulated
+                   per window).  Our mH/s counts every adder, so the same
+                   quantity is mH/s / ln N with N ~= 2^(256+shift) (the nadd
+                   offset is < 2^-200 of the base, i.e. irrelevant).  This is
+                   the unit the Gapcoin wallet renders as H/s/MH/s for
+                   networkminingpower; it stays a WITHIN-geometry metric. */
+                double log_n =
+                    (256.0 + (double)(crt_mode ? crt_rt.shift : user_shift)) * log(2.0);
+                double primes_per_s =
+                    (log_n > 0.0) ? (miner_power_mhs * 1000000.0 / log_n) : 0.0;
+
                 /* GPU-accounted fraction (acc/wall): pure MR-kernel execution
                    time (CUDA-event measured, summed over all workers) divided
                    by the wall-clock stats interval (wall_interval_s, captured
@@ -1520,8 +1533,9 @@ int main(int argc, char *argv[]) {
                   printf("  Network: Height=%u | Difficulty: %.2f | Active Merit Req: %.2f (%s)\n",
                       info->blocks, info->difficulty, merit_threshold,
                       merit_threshold_overridden ? "CLI override" : "live");
-                  printf("  Network power: %.2fM mH/s | Miner power: %.3f mH/s (owned nAdd/s)\n",
-                      info->networkminingpower / 1000000.0, miner_power_mhs);
+                  printf("  Network power: %.2fM mH/s | Miner power: %.3f mH/s (owned nAdd/s) = %.3fM primes/s (Gapcoin miningpower)\n",
+                      info->networkminingpower / 1000000.0, miner_power_mhs,
+                      primes_per_s / 1000000.0);
                   if (throughput >= 1000000.0) {
                       printf("  Throughput: %.2fM windows/s (%.3f ms/window) | Rolling avg: %.2fM/s\n",
                           throughput / 1e6, time_per_nonce, prev_throughput / 1e6);

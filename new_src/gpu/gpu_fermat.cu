@@ -1456,11 +1456,13 @@ static cudaError_t launch_fermat(int al, cudaStream_t stream,
            never instantiated.  TPI=4 trades fewer broadcast rounds for 2x the
            threads per candidate, so it wins only when the MR batch fills the
            SMs: measured 2026-09-29 — bench batch 40000 +20% (768-bit) / +25%
-           (1024-bit), batch 2048 -26%/-27% (latency regime), and +8.6%
-           (shift507) / +8.8% (shift720, the fleet cover) in the fused mining
-           chain.  DEF_TPI is the per-width default: 4 for the measured mining
-           widths AL=12/16, 8 elsewhere until each is A/B'd.  GPU_FERMAT_TPI
-           (4/8/16/32) overrides at runtime. */
+           (1024-bit) / +14% (1280-bit) / +6% (2048-bit), batch 2048 -26%/-27%
+           /-4.5%/-9% (latency regime); the fused mining chain gains +8.6%
+           (shift507) / +8.8% (shift720, the fleet cover); the jump2 hunt walker
+           gains +4.7% windows (shift998/AL=20, K=1024) but is a WASH at
+           shift1784/AL=32 (-2.2%, within spread).  DEF_TPI is the per-width
+           default: 4 for AL=12/16/20 (measured production geometries), 8 for
+           AL>=24 until each is A/B'd.  GPU_FERMAT_TPI (4/8/16/32) overrides. */
         #define CGBN_DISP_WIDE(AL_VAL, DEF_TPI) \
             case AL_VAL: { \
                 int tpi = (tpi_override >= 4) ? tpi_override : DEF_TPI; \
@@ -1496,10 +1498,11 @@ static cudaError_t launch_fermat(int al, cudaStream_t stream,
             CGBN_DISP_WIDE(16, 4)                    /* 1024-bit (default TPI=4) */
             #endif
             #if NL >= 20
-            CGBN_DISP_WIDE(20, 8)                    /* 1280-bit */
+            CGBN_DISP_WIDE(20, 4)                    /* 1280-bit (default TPI=4) */
             #endif
             /* AL=24/28/32 (1536/1792/2048-bit) also accept TPI=4 now (the
-               multi blocker is gone); they run TPI=8 by default (not yet A/B'd). */
+               multi blocker is gone); they run TPI=8 by default (AL=32 hunt is
+               a wash, AL=24/28 not yet A/B'd). */
             #if NL >= 24
             CGBN_DISP_WIDE(24, 8)                    /* 1536-bit */
             #endif
@@ -2197,10 +2200,10 @@ const char *gpu_fermat_kernel_label(int limbs)
     }
     if (cgbn_supports_al(limbs)) {
         /* Report the TPI the launcher will actually pick for this width:
-           per-width default (4 at AL=12/16, else the auto rule) with the
+           per-width default (4 at AL=12/16/20, else the auto rule) with the
            GPU_FERMAT_TPI override on top.  Keep in sync with the
            CGBN_DISP_WIDE call sites in launch_fermat. */
-        int def = (limbs == 12 || limbs == 16) ? 4 : ((limbs % 4) == 0 ? 8 : 4);
+        int def = (limbs == 12 || limbs == 16 || limbs == 20) ? 4 : ((limbs % 4) == 0 ? 8 : 4);
         int ov  = gpu_fermat_tpi_override();
         int tpi = (ov >= 4) ? ov : def;
         switch (limbs) {

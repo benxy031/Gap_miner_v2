@@ -22,12 +22,6 @@
    (1280-bit) with headroom, and the pair-batch mark uploads 2× limbs. */
 #define GPU_SIEVE_MAX_BASE_LIMBS 64
 
-/* Split (chunked) dense row-batch marking — opt-in while it earns its numbers
-   in production.  GPU_MARK_SPLIT=1 enables it (default off); the chunk size in
-   odd slots is GPU_MARK_SPLIT_SLOTS (default 160, clamped to [32, 4096]).
-   Measured in isolation (tools/bench_mark.cu): marks exactly the same slots as
-   the per-prime row walk and is 25-38x faster (21-30 us vs 700-810 us for
-   W=10175, rows=8, 2M primes, RTX 3070). */
 /* Split (chunked) dense row-batch marking.  Default ON (bit-exact vs the
    per-prime row walk; measured +47-55% end-to-end windows/s and 14x less mark
    kernel time in the fused chain, shift512 p75, RTX 3070 -- see README and

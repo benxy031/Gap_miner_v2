@@ -157,7 +157,9 @@ static int g_fast_mr = 1;           /* bitmap-verdict MR pipeline (--legacy-mr d
 static int      g_walk_engine = 0;
 static uint64_t g_walk_gapmin = 0;      /* 0 = derive from merit_min */
 static uint32_t g_walk_primes = 15000;  /* sieve/item primes 17..P */
-static uint32_t g_walk_batch = 32;      /* blocks per super-batch (4..32) */
+static uint32_t g_walk_batch = 64;      /* blocks per super-batch (4..96);
+                                           default 64 since 2026-10-03 (+2.45%
+                                           ABBA vs 32; K=96 no better) */
 static int g_fast_dbg = 0;          /* P0_FAST_DBG=N: dump N fast-walk summaries */
 
 /* wheel {3,5,7,11,13}: one bit per odd-value slot, period WHEEL_P slots.
@@ -1347,7 +1349,7 @@ static int run_walk_engine(void) {
                 (unsigned long long)gapmin);
     uint32_t K = g_walk_batch ? g_walk_batch : 16;
     if (K < 4) K = 4;
-    if (K > 32) K = 32;
+    if (K > 96) K = 96;   /* region = (K+1) x 33.6 MB, x2; K=96 = 6.5 GB */
 
     /* ---- primes 7..P, per-prime tables, item table, wtab ---- */
     uint32_t P = g_walk_primes < 30u ? 30u : g_walk_primes;
@@ -1760,7 +1762,8 @@ static void usage(const char *p) {
         "         it reports every gap >= --gap-min (default ceil(merit-min *\n"
         "         ln(start))) through the same log/records/verify path, with\n"
         "         --walk-primes (sieve depth, default 15000) and --walk-batch\n"
-        "         (blocks per super-batch, default 32, range 4..32).  The range\n"
+        "         (blocks per super-batch, default 64, range 4..96; VRAM =\n"
+        "         2 x (K+1) x 33.6 MB: K=32 2.2 GB, K=64 4.4 GB, K=96 6.5 GB).  The range\n"
         "         must fit one 64-bit window of the block base (true for all\n"
         "         realistic ranges; the check aborts otherwise).  --check,\n"
         "         --gpu-sieve/--cpu-sieve, --legacy-mr and --sieve-limit apply\n"

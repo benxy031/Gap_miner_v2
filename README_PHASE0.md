@@ -74,7 +74,7 @@ Defaults:
 | `--engine sieve\|walk` | `sieve` | `walk` selects the class-30 bitmap sieve + batched jump-walk engine (~10.6x the sieve engine's throughput at the production default: measured 5.2 s vs 55.8 s for 1e12 integers, identical 5-gap output, 2026-10-02; same log/records/verify/top-4/resume path). `--check`, `--gpu-sieve`/`--cpu-sieve`, `--legacy-mr` and `--sieve-limit` apply to the sieve engine only; combining them with `--engine walk` is an error (or ignored where noted) |
 | `--gap-min G` | `ceil(--merit-min * ln(start))` | walk engine only: report every gap >= G (GMP-verified). G in [100, 1e7]; values < 300 print a warning (walk cost scales ~1/G). Passing `--gap-min` explicitly removes the merit gate; an explicit `--merit-min` stays as an additional bar |
 | `--walk-primes P` | `15000` | walk engine: sieve/item primes 17..P (measured optimum at this geometry) |
-| `--walk-batch B` | `32` | walk engine: super-batch = B x 30-blocks (4..32; fewer event syncs and a smaller lookahead fraction at higher B, measured +5% going 16 -> 32); VRAM = 2 regions x (B+1) x 32 MB + gap buffer (~2.2 GB at the default) |
+| `--walk-batch B` | `64` | walk engine: super-batch = B x 30-blocks (**default 64 since 2026-10-03**, was 32; range **4..96**, raised from 4..32 the same day). ABBA on 1e13 at `--gap-min 702` (dev 3070, 4 arms): K32 63.68 s vs **K64 62.12 s = +2.45 %**, K96 62.26 s (+2.23 %, no better than 64 but 6.5 GB); both K64 arms beat both K32 arms and the emitted sets are identical (parity K32==K64==K96 exact, 1624/1624 on 1e12). VRAM = 2 regions x (B+1) x 33.6 MB + gap buffer: default K=64 -> 4.4 GB, K=32 -> 2.2 GB, K=96 -> 6.5 GB (an over-large K fails the bitmap alloc loudly, never silently) |
 | `--log FILE` | none | appended; one `# phase0-gpu session ...` header per run |
 | `--state FILE` / `--state-every S` | none / `30` s | checkpoint for resume; **deleted when the range completes** |
 | `--progress S` | `10` s | progress + ETA line every S seconds (`0` = off) |
@@ -289,6 +289,37 @@ nohup setsid ./bin/phase0_scan_gpu --start 200000000000100000000000 \
   --state data/p0_state_2e20b.txt --state-every 30 --progress 60 \
   --log data/p0_campaign_2e20b.log > data/p0_campaign_2e20b.out 2>&1 &
 ```
+
+**Walk-engine campaign (the fast path, 2026-10-03).**  For a slice, the walk
+engine with `--gap-min G`, `G = ceil(15 x ln(start))`, is EXACTLY equivalent
+to the sieve engine's `--merit-min 15` on that slice (compute the REAL ln:
+`ln(2e20) = 46.7448`, so G = **702** at 2e20 and **696** at 1.33e20; a wrong
+ln costs a probe above/below the gate, see `docs/PHASE0_scan_bench.md` §18).
+Verified 2026-10-03 on a completed 1e14 slice: **653.5 s wall** (1.53e11
+ints/s, 167,789 gaps, 0 verification failures, 8.5x the sieve engine's
+1.545 h) with a full cross-engine audit - every one of the 16,213 rows of
+the co-located sieve run is contained in the walk log and per-segment set
+equality is exact.  The walk engine scans the range CONTIGUOUSLY - its
+state file carries a single `off0`, so a resumed walk never leaves slice
+holes, unlike the sieve engine, whose per-thread slices (`off0..offN`)
+mean a partially done range is a set of short scanned segments:
+
+```bash
+nohup setsid ./bin/phase0_scan_gpu --engine walk \
+  --start 133000000000000000000 --length 100000000000000 --gap-min 696 \
+  --state data/p0_state_1p33e20_walk.txt --state-every 30 \
+  --progress 60 --log data/p0_campaign_1p33e20_walk.log \
+  > data/p0_campaign_1p33e20_walk.out 2>&1 &
+```
+
+Measured on the dev box: 1e12 at `gap-min 696` = 6.67 s (1.50e11 ints/s,
+1688 gaps), a full 1e14 slice = **653.5 s** (10.9 min); VRAM = 2 x (K+1) x
+33.6 MB -> **4.4 GB at the default K=64** (2.2 GB at K=32), no `--walk-batch`
+needed in the recipe.  Audit an engine switch with `p0_setdiff`-style set
+checks: every row of the older engine's log must be contained in the walk
+log, and per-segment set equality must hold wherever both engines covered
+the same integers; and cross-check the derived `--gap-min` against the
+sibling engine's minimum logged gap before comparing sets.
 
 Hygiene: stop any miner on the GPU before a timed run; use a fresh `--log`
 per campaign (the tool appends headers, but per-file datasets keep the

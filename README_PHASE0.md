@@ -236,11 +236,15 @@ covered by `phase0_scan_gpu --check` at varied starts.
 `scripts/phase0_hl_compare.py` - measured merit tail vs models:
 
 ```
-scripts/phase0_hl_compare.py [log] [--out PNG] [--dark] [--m-min 15] [--m-max 27]
+scripts/phase0_hl_compare.py [log] [--out PNG] [--dark] [--m-min 15] [--m-max 30]
 ```
 Default log `data/p0_campaign_2e20.log`; `--dark` also writes
 `*_dark.png`.  The script asserts a gate on the HL-4p table
 (`sum rho_g = 1.0001 x (1/L)`) and prints per-band measured/model ratios.
+`--m-max` default raised 27 -> 30 on 2026-10-03 (the 2e15 walk campaign has
+events up to m>=30; the old 27 cut dated from the 1e14 campaign where m>=27
+was empty).  Rows with single-digit measured counts are Poisson noise — the
+model test lives where the counts are >= ~10 (m <= ~25 at 2e15).
 
 ---
 

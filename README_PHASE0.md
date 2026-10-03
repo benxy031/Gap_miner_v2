@@ -325,6 +325,35 @@ log, and per-segment set equality must hold wherever both engines covered
 the same integers; and cross-check the derived `--gap-min` against the
 sibling engine's minimum logged gap before comparing sets.
 
+**Continuum chain (`scripts/p0_walk_chain.py`, 2026-10-03).**  Runs walk
+slices back-to-back over an open-ended range: after every completed slice
+`start += length`, with per-slice `--state/--log/--out`
+(`p0_walk_<tag>_c<k>_g<G>.*`).  `--devices 0,1` runs one scan PER GPU, each
+taking the next slice from a shared queue (the ledger records the device).
+Existing slices are detected at start: completed ones are skipped,
+unfinished ones (e.g. after a kill) are requeued first, so rerunning the
+same command restarts the continuum (`data/p0_walk_<tag>_chain.state` keeps
+the fixed `start0/index0`).  A slice that does not complete drains the
+chain (no new launches, exit 1); a lock file and a live-scanner check
+refuse a second chain on the same tag.  Before every slice it re-derives
+the shortest WINNABLE length at that start (shortest even `g` with
+`g/ln(start) > table(g)` - the shortest length that would beat the record
+table) and warns in BOTH directions: `--gap-min` below it only adds
+non-record rows, above it MISSES the winnable band `[g, gap-min)`.  Note
+`--gap-min` must be a winnable length, not an arbitrary round number: at
+1.33e20 the shortest is 1586 (1576 is *not* winnable - its table entry is
+merit 35.08 vs 34.01 achievable).  Per-slice ledger:
+`data/p0_walk_<tag>_chain.log` (ts, slice, dev, start, len, gap_min, rc,
+wall, gaps, walk_batch, complete).
+
+```bash
+# one GPU / two GPUs (fleet box):  add --devices 0,1
+nohup setsid python3 scripts/p0_walk_chain.py \
+    --start 133001070000720000000 --length 1070000000000000 \
+    --gap-min 1586 --tag 1p33e20 --index-start 3 --devices 0,1 \
+    > data/p0_walk_1p33e20_chain.out 2>&1 &
+```
+
 Hygiene: stop any miner on the GPU before a timed run; use a fresh `--log`
 per campaign (the tool appends headers, but per-file datasets keep the
 analysis simple); keep `--state` file names unique per campaign geometry.

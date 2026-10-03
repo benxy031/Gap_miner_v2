@@ -12,6 +12,7 @@
 # Normally driven by windows/build_host.sh.
 
 CC      ?= gcc
+CXX     ?= g++
 BIN_DIR  = bin
 OBJ_DIR  = build-win
 SRC_DIR  = new_src
@@ -59,15 +60,32 @@ GPU_TESTS = test_gpu_fermat test_gpu_sieve test_gpu_resolve
 CPU_TEST_BINS = $(CPU_TESTS:%=$(BIN_DIR)/%.exe)
 GPU_TEST_BINS = $(GPU_TESTS:%=$(BIN_DIR)/%.exe)
 
-.PHONY: all tests clean
+# Dev tools (Phase-0 toolkit; see README_PHASE0.md / README_WINDOWS.md).
+# bench_fermat goes through the gapgpu.dll API exactly like the miner; phase0_scan
+# is the CPU-only reference scanner (GMP + pthreads, no CUDA/DLL at all).
+TOOL_BINS = $(BIN_DIR)/bench_fermat.exe $(BIN_DIR)/phase0_scan.exe
 
-all: $(BIN_DIR)/gapminer.exe tests
+# Phase-0 GPU tools, built by the Windows kernel-DLL split: the kernels come
+# from bin\phase0gpu.dll (windows\build_phase0.bat, nvcc + MSVC) and these
+# MinGW g++ host programs compile with -DPHASE0_KERNEL_DLL against the plain-C
+# API in tools/phase0gpu_api.h (POSIX threads + GMP stay on this side).
+PHASE0_BINS = $(BIN_DIR)/phase0_scan_gpu.exe $(BIN_DIR)/bench_p0sieve.exe \
+              $(BIN_DIR)/mr68_gpu.exe
+
+.PHONY: all tests tools phase0 clean
+
+all: $(BIN_DIR)/gapminer.exe $(TOOL_BINS) $(PHASE0_BINS) tests
+
+tools: $(TOOL_BINS)
+
+phase0: $(PHASE0_BINS)
 
 tests: $(CPU_TEST_BINS) $(GPU_TEST_BINS)
 
 $(BIN_DIR)/gapgpu.dll:
 	@echo "ERROR: $@ is missing - run windows\\build_gpu_dll.bat first" && exit 1
-
+$(BIN_DIR)/phase0gpu.dll:
+	@echo "ERROR: $@ is missing - run windows\build_phase0.bat first" && exit 1
 $(OBJ_DIR)/%.o: %.c
 	@mkdir -p $(dir $@)
 	$(CC) $(CFLAGS) -c $< -o $@
@@ -90,6 +108,40 @@ $(CPU_TEST_BINS): $(BIN_DIR)/%.exe: $(OBJECTS) $(OBJ_DIR)/$(TEST_DIR)/%.o $(BIN_
 # runtime instance and device pointers are interchangeable.
 $(GPU_TEST_BINS): $(BIN_DIR)/%.exe: $(OBJECTS) $(OBJ_DIR)/$(TEST_DIR)/%.o $(BIN_DIR)/gapgpu.dll
 	$(CC) -o $@ $(OBJECTS) $(OBJ_DIR)/$(TEST_DIR)/$*.o $(LDLIBS) $(CUDART_DLL)
+	@echo "Built: $@"
+
+# bench_fermat: GPU Fermat kernel throughput benchmark (dev tool).  Mirrors the
+# Linux rule: the full module set + the tool object, through the DLL (it only
+# calls the exported gpu_fermat_* API, so no CUDA headers are needed).
+$(BIN_DIR)/bench_fermat.exe: $(OBJECTS) $(OBJ_DIR)/tools/bench_fermat.o $(BIN_DIR)/gapgpu.dll
+	$(CC) -o $@ $(OBJECTS) $(OBJ_DIR)/tools/bench_fermat.o $(LDLIBS)
+	@echo "Built: $@"
+
+# Phase-0 CPU reference scanner: GMP + pthreads only, deliberately NOT linked
+# against the GPU DLL (it must run on machines without CUDA).
+$(BIN_DIR)/phase0_scan.exe: $(OBJ_DIR)/tools/phase0_scan.o
+	$(CC) -o $@ $(OBJ_DIR)/tools/phase0_scan.o -lm -lgmp -pthread
+	@echo "Built: $@"
+
+# Phase-0 GPU tools (kernel-DLL split).  The .cu files are compiled as C++ by
+# MinGW with the kernel API declared in tools/phase0gpu_api.h; all device code
+# lives in bin\phase0gpu.dll.  ccache-friendly and fast (no nvcc here).
+$(OBJ_DIR)/tools/%.o: tools/%.cu
+	@mkdir -p $(dir $@)
+	$(CXX) -x c++ -O2 -std=gnu++17 -MMD -MP -D__USE_MINGW_ANSI_STDIO=1 \
+	      -DPHASE0_KERNEL_DLL -include $(SRC_DIR)/win_compat.h -Itools \
+	      -I"$(CUDA_INC)" -c $< -o $@
+
+$(BIN_DIR)/phase0_scan_gpu.exe: $(OBJ_DIR)/tools/phase0_scan_gpu.o $(BIN_DIR)/phase0gpu.dll
+	$(CXX) -o $@ $< $(BIN_DIR)/phase0gpu.dll $(CUDART_DLL) -lgmp -pthread -lm
+	@echo "Built: $@"
+
+$(BIN_DIR)/bench_p0sieve.exe: $(OBJ_DIR)/tools/bench_p0sieve.o $(BIN_DIR)/phase0gpu.dll
+	$(CXX) -o $@ $< $(BIN_DIR)/phase0gpu.dll $(CUDART_DLL) -lm
+	@echo "Built: $@"
+
+$(BIN_DIR)/mr68_gpu.exe: $(OBJ_DIR)/tools/mr68_gpu.o $(BIN_DIR)/phase0gpu.dll
+	$(CXX) -o $@ $< $(BIN_DIR)/phase0gpu.dll $(CUDART_DLL) -lgmp -lm
 	@echo "Built: $@"
 
 clean:

@@ -152,7 +152,9 @@ struct gpu_sieve_ctx {
     /* Optional per-stage kernel accounting (GPU_SIEVE_TIMING=1): CUDA events
        around the mark and extract launches.  stage 0 = none, 1 = mark,
        2 = extract; the elapsed time is drained right after the stream sync
-       those paths already perform. */
+       those paths already perform.  A second event pair times the residue
+       preparation kernels (full base-mod-p reduction and the one-step CRT
+       increment), which are otherwise hidden inside the mark call. */
     int timing_on;
     int t_inited;
     int t_stage;
@@ -160,6 +162,26 @@ struct gpu_sieve_ctx {
     cudaEvent_t t_end;
     uint64_t accounted_mark_us;
     uint64_t accounted_extract_us;
+    int t_res_stage;
+    cudaEvent_t t_res_start;
+    cudaEvent_t t_res_end;
+    uint64_t accounted_residues_us;
+    /* Cached CRT step (d_step_mod_p = P mod p): valid for step_ready_count
+       primes after a successful gpu_sieve_set_residue_step().  step_m_limit
+       is the largest safe window offset m for the folded-step mark
+       (residue = cache + m*step, see gpu_sieve_window_residue). */
+    size_t step_ready_count;
+    uint64_t step_m_limit;
+    /* WS-B (miner rows path): host copy of the cached step limbs so every
+       row batch can verify its `step_limbs` against the cache before taking
+       the base-only fast path; a mismatch falls back to the double
+       reduction and refreshes this copy after a successful sync. */
+    uint64_t step_limbs_copy[GPU_SIEVE_MAX_BASE_LIMBS];
+    int step_limb_count_copy;
+    int rows_step_cache;        /* GPU_SIEVE_STEP_CACHE=0 disables */
+    /* Verification scratch for gpu_sieve_residues_check (allocated lazily). */
+    uint64_t *d_residues_scratch;
+    unsigned long long *d_mismatch;
 };
 
 /* ── Per-stage kernel accounting helpers (no-op unless GPU_SIEVE_TIMING=1) ── */
@@ -201,6 +223,43 @@ uint64_t gpu_sieve_accounted_extract_us(gpu_sieve_ctx *ctx) {
     return __atomic_load_n(&ctx->accounted_extract_us, __ATOMIC_RELAXED);
 }
 
+/* Residue-preparation accounting: own event pair, same drain-after-sync
+   discipline as the mark/extract stages. */
+static void sieve_res_timing_begin(struct gpu_sieve_ctx *ctx) {
+    if (!ctx->timing_on || !ctx->t_inited || ctx->t_res_stage != 0) return;
+    if (cudaEventRecord(ctx->t_res_start, ctx->stream) != cudaSuccess) return;
+    ctx->t_res_stage = 1;
+}
+
+static void sieve_res_timing_end(struct gpu_sieve_ctx *ctx) {
+    if (ctx->t_res_stage == 0) return;
+    if (cudaEventRecord(ctx->t_res_end, ctx->stream) != cudaSuccess) {
+        ctx->t_res_stage = 0;
+        return;
+    }
+}
+
+static void sieve_res_timing_drain(struct gpu_sieve_ctx *ctx) {
+    if (ctx->t_res_stage == 0) return;
+    float ms = 0.0f;
+    if (cudaEventElapsedTime(&ms, ctx->t_res_start, ctx->t_res_end) ==
+            cudaSuccess && ms > 0.0f) {
+        uint64_t us = (uint64_t)(ms * 1000.0f + 0.5f);
+        __atomic_fetch_add(&ctx->accounted_residues_us, us, __ATOMIC_RELAXED);
+    }
+    ctx->t_res_stage = 0;
+}
+
+uint64_t gpu_sieve_accounted_residues_us(gpu_sieve_ctx *ctx) {
+    if (!ctx) return 0;
+    return __atomic_load_n(&ctx->accounted_residues_us, __ATOMIC_RELAXED);
+}
+
+uint64_t gpu_sieve_residue_m_limit(const gpu_sieve_ctx *ctx) {
+    if (!ctx) return 0;
+    return ctx->step_m_limit;
+}
+
 static uint64_t gpu_sieve_clock_us(void) {
     struct timespec ts;
     if (clock_gettime(CLOCK_MONOTONIC, &ts) != 0) return 0;
@@ -239,6 +298,25 @@ __device__ static void gpu_sieve_mark_progression(uint64_t *wb,
     }
 }
 
+/* Residue of one prime for a window that sits `m_steps` CRT steps ahead of
+   the cached anchor: (cache + m_steps * step) mod p.  With m_steps == 0 this
+   is the cached value itself and neither step_mod_p nor inv_p is
+   dereferenced.  TWO conditional subtracts make the Barrett form exact for
+   any q in [floor(v/p)-2, floor(v/p)] (the one-subtract form relies on the
+   Horner loop's narrower value structure and is not enough here).
+   Host side guards (m_steps + 1) * p < 2^63 via ctx->step_m_limit. */
+__device__ static __forceinline__ uint64_t gpu_sieve_window_residue(
+        uint64_t r0, const uint64_t *step_mod_p, const uint64_t *inv_p,
+        uint64_t idx, uint64_t p, uint64_t m_steps) {
+    if (m_steps == 0) return r0;
+    uint64_t v = r0 + m_steps * step_mod_p[idx];
+    uint64_t q = __umul64hi(v, inv_p[idx]);
+    uint64_t r = v - q * p;
+    if (r >= p) r -= p;
+    if (r >= p) r -= p;
+    return r;
+}
+
 __global__ static void gpu_sieve_mark_kernel_batch(uint64_t *bitmap,
                                                    uint64_t bitmap_words,
                                                    uint64_t odd_interval_size,
@@ -247,6 +325,9 @@ __global__ static void gpu_sieve_mark_kernel_batch(uint64_t *bitmap,
                                                    uint64_t batch_count,
                                                    const uint64_t *primes,
                                                    const uint64_t *base_mod_p,
+                                                   const uint64_t *step_mod_p,
+                                                   const uint64_t *inv_p,
+                                                   uint64_t m_steps,
                                                    uint64_t prime_count) {
     uint64_t flat_idx = (uint64_t)blockIdx.x * (uint64_t)blockDim.x +
                         (uint64_t)threadIdx.x;
@@ -262,7 +343,9 @@ __global__ static void gpu_sieve_mark_kernel_batch(uint64_t *bitmap,
     uint64_t base_offset = base_offsets[window_idx];
     uint64_t *window_bitmap = bitmap + window_idx * bitmap_words;
 
-    uint64_t remainder = base_mod_p[prime_idx] + (base_offset % p);
+    uint64_t remainder = gpu_sieve_window_residue(
+        base_mod_p[prime_idx], step_mod_p, inv_p, prime_idx, p, m_steps);
+    remainder += base_offset % p;
     if (remainder >= p) remainder -= p;
 
     remainder += first_odd_offset % p;
@@ -348,6 +431,13 @@ gpu_sieve_ctx *gpu_sieve_init(int device_id,
     ctx->cand_cap_measured = 0;
     ctx->cand_cap_calibrated = 0;
     ctx->cand_cap_reported = 0;
+    /* WS-B: allow the miner rows path to reuse cached step residues
+       (GPU_SIEVE_STEP_CACHE=0 disables -> the old double reduction). */
+    ctx->rows_step_cache = 1;
+    {
+        const char *sc = getenv("GPU_SIEVE_STEP_CACHE");
+        if (sc && sc[0] == '0') ctx->rows_step_cache = 0;
+    }
     {
         const char *cc = getenv("GPU_EXTRACT_CAND_CAP");
         long v = (cc && *cc) ? strtol(cc, NULL, 10) : 0;
@@ -471,7 +561,9 @@ gpu_sieve_ctx *gpu_sieve_init(int device_id,
         const char *tv = getenv("GPU_SIEVE_TIMING");
         if (tv && *tv && tv[0] != '0') {
             if (cudaEventCreate(&ctx->t_start) == cudaSuccess &&
-                cudaEventCreate(&ctx->t_end) == cudaSuccess) {
+                cudaEventCreate(&ctx->t_end) == cudaSuccess &&
+                cudaEventCreate(&ctx->t_res_start) == cudaSuccess &&
+                cudaEventCreate(&ctx->t_res_end) == cudaSuccess) {
                 ctx->t_inited = 1;
                 ctx->timing_on = 1;
             }
@@ -594,6 +686,7 @@ int gpu_sieve_mark_high_primes_batch(gpu_sieve_ctx *ctx,
                                                  batch_count_u64,
                                                  ctx->d_primes,
                                                  ctx->d_base_mod_p,
+                                                 NULL, NULL, 0,
                                                  prime_count_u64);
 
     err = cudaGetLastError();
@@ -676,6 +769,56 @@ __global__ static void gpu_sieve_residues_kernel(const uint64_t *base_limbs,
     base_mod_p[idx] = r;
 }
 
+/* CRT walk residue INCREMENT: base -> base + step.  One add mod p per prime
+   (both operands are already reduced, so a single conditional subtract is
+   exact).  Requires every prime < 2^62 so r + s cannot overflow 64 bits. */
+__global__ static void gpu_sieve_residues_step_kernel(
+        const uint64_t *primes,
+        const uint64_t *step_mod_p,
+        uint64_t *base_mod_p,
+        uint64_t prime_count) {
+    uint64_t idx = (uint64_t)blockIdx.x * (uint64_t)blockDim.x +
+                   (uint64_t)threadIdx.x;
+    if (idx >= prime_count) return;
+    uint64_t p = primes[idx];
+    /* p < 3: the even prime; its residue is never read by the mark kernels
+       (they skip it) and its Barrett reciprocal is degenerate by design. */
+    if (p < 3U) return;
+    uint64_t r = base_mod_p[idx] + step_mod_p[idx];
+    if (r >= p) r -= p;
+    base_mod_p[idx] = r;
+}
+
+/* Verification only: count primes whose EFFECTIVE residue for this window
+   differs from a freshly recomputed one (gpu_sieve_residues_check) and
+   record the first mismatching index.  a_mod_p = full recompute of the
+   window's base; b_mod_p = cached anchor; with m_steps > 0 the check mirrors
+   the folded-step formula of the mark kernels (cache + m*step mod p). */
+__global__ static void gpu_sieve_residues_compare_kernel(
+        const uint64_t *a_mod_p,
+        const uint64_t *b_mod_p,
+        const uint64_t *step_mod_p,
+        const uint64_t *inv_p,
+        uint64_t m_steps,
+        const uint64_t *primes,
+        uint64_t prime_count,
+        unsigned long long *mismatch_count,
+        unsigned long long *first_index) {
+    uint64_t idx = (uint64_t)blockIdx.x * (uint64_t)blockDim.x +
+                   (uint64_t)threadIdx.x;
+    if (idx >= prime_count) return;
+    /* p < 3: not maintained (step kernel skips it) and not read (mark
+       kernels skip it), so it must not count as a desync. */
+    uint64_t p = primes[idx];
+    if (p < 3U) return;
+    uint64_t predicted = gpu_sieve_window_residue(
+        b_mod_p[idx], step_mod_p, inv_p, idx, p, m_steps);
+    if (a_mod_p[idx] != predicted) {
+        atomicAdd(mismatch_count, 1ULL);
+        atomicMin(first_index, (unsigned long long)idx);
+    }
+}
+
 /* Row-batch fused mark (CRT row-walk): compute base mod p AND step mod p
    (step = P, the CRT row stride) in ONE sweep, then mark row_count bitmaps.
    d_base_limbs holds base limbs at [0, base_limb_count) and step limbs at
@@ -717,6 +860,37 @@ __global__ static void gpu_sieve_rows_residues_kernel(
         if (s >= p) s -= p;
     }
     step_mod_p[idx] = s;
+}
+
+/* Base-only half of the row residues pass (WS-B): used when the step
+   residues are already cached in d_step_mod_p (the row stride P is fixed
+   for the whole run).  Identical Horner reduction to the base half of
+   gpu_sieve_rows_residues_kernel. */
+__global__ static void gpu_sieve_rows_base_residues_kernel(
+    const uint64_t *base_limbs,
+    int base_limb_count,
+    const uint64_t *primes,
+    const uint64_t *inv_p,
+    uint64_t *base_mod_p,
+    uint64_t prime_count)
+{
+    uint64_t idx = (uint64_t)blockIdx.x * (uint64_t)blockDim.x +
+                   (uint64_t)threadIdx.x;
+    if (idx >= prime_count) return;
+
+    uint64_t p = primes[idx];
+    uint64_t inv = inv_p[idx];
+    int chunks = base_limb_count * 2;
+
+    const uint32_t *base32 = (const uint32_t *)base_limbs;
+    uint64_t r = 0;
+    for (int i = chunks - 1; i >= 0; i--) {
+        uint64_t v = (r << 32) | base32[i];
+        uint64_t q = __umul64hi(v, inv);
+        r = v - q * p;
+        if (r >= p) r -= p;
+    }
+    base_mod_p[idx] = r;
 }
 
 /* Euclid modulo-event skip (port of Horizon
@@ -1082,6 +1256,9 @@ __global__ static void gpu_sieve_mark_dense_split_kernel(
     uint64_t first_odd_offset,
     const uint64_t *primes,
     const uint64_t *base_mod_p,
+    const uint64_t *step_mod_p,
+    const uint64_t *inv_p,
+    uint64_t m_steps,
     uint64_t n_small,
     uint32_t chunks,
     uint64_t chunk_slots)
@@ -1101,7 +1278,9 @@ __global__ static void gpu_sieve_mark_dense_split_kernel(
     uint64_t end = begin + chunk_slots;
     if (end > odd_interval_size) end = odd_interval_size;
 
-    uint64_t remainder = base_mod_p[i] + first_odd_offset;
+    uint64_t remainder = gpu_sieve_window_residue(
+        base_mod_p[i], step_mod_p, inv_p, i, p, m_steps);
+    remainder += first_odd_offset;
     if (remainder >= p) remainder -= p;
     uint64_t inverse_two = (p + 1U) >> 1;
     uint64_t rem = (((p - remainder) % p) * inverse_two) % p;
@@ -1416,23 +1595,46 @@ int gpu_sieve_mark_batch_from_bases(gpu_sieve_ctx *ctx,
     return 1;
 }
 
-int gpu_sieve_mark_from_base(gpu_sieve_ctx *ctx,
-                             uint64_t odd_interval_size,
-                             uint64_t first_odd_offset,
-                             const uint64_t *base_limbs,
-                             int base_limb_count,
-                             int buf,
-                             const uint64_t *primes,
-                             const uint64_t *inv_p,
-                             size_t prime_count,
-                             uint64_t *host_bitmap,
-                             size_t host_bitmap_words) {
+/* Shared implementation of the gpu_sieve_mark_from_base variants: identical
+   in every respect except how base_mod_p is obtained for this window.
+     residue_mode = 0: upload base_limbs and run the full O(limbs)-per-prime
+                       reduction (stateless, the default).
+     residue_mode = 1: skip the base upload and advance the cached residues
+                       by one stored CRT step (per-window increment kernel).
+     residue_mode = 2: leave the cache alone and let the mark kernels fold
+                       the step in themselves (residue = cache + m_steps *
+                       step, see gpu_sieve_window_residue) - no residue
+                       kernel at all; the cache is re-anchored by a full
+                       reduction whenever m_steps hits ctx->step_m_limit.
+   Modes 1 and 2 require a successful gpu_sieve_set_residue_step() for the
+   same prime table; mode 2 additionally requires m_steps <= step_m_limit. */
+static int gpu_sieve_mark_from_base_impl(gpu_sieve_ctx *ctx,
+                                         uint64_t odd_interval_size,
+                                         uint64_t first_odd_offset,
+                                         const uint64_t *base_limbs,
+                                         int base_limb_count,
+                                         int residue_mode,
+                                         uint64_t m_steps,
+                                         int buf,
+                                         const uint64_t *primes,
+                                         const uint64_t *inv_p,
+                                         size_t prime_count,
+                                         uint64_t *host_bitmap,
+                                         size_t host_bitmap_words) {
     uint64_t start_time = gpu_sieve_clock_us();
-    if (!ctx || !base_limbs || !primes || !inv_p) return 0;
+    if (!ctx || !primes || !inv_p) return 0;
+    if (residue_mode == 0 &&
+        (!base_limbs || base_limb_count < 1 ||
+         base_limb_count > ctx->base_limbs_capacity)) {
+        return 0;
+    }
+    if ((residue_mode == 1 || residue_mode == 2) &&
+        ctx->step_ready_count != prime_count) {
+        return 0;
+    }
+    if (residue_mode == 2 && m_steps > ctx->step_m_limit) return 0;
     if (odd_interval_size == 0 || prime_count == 0) return 0;
     if (first_odd_offset > 1U) return 0;
-    if (base_limb_count < 1 ||
-        base_limb_count > ctx->base_limbs_capacity) return 0;
     if (prime_count > ctx->max_primes) return 0;
 
     size_t required_words = (size_t)((odd_interval_size + 63U) >> 6);
@@ -1463,13 +1665,15 @@ int gpu_sieve_mark_from_base(gpu_sieve_ctx *ctx,
         ctx->primes_uploaded_count = prime_count;
     }
 
-    err = cudaMemcpyAsync(ctx->d_base_limbs, base_limbs,
-                          (size_t)base_limb_count * sizeof(*base_limbs),
-                          cudaMemcpyHostToDevice, ctx->stream);
-    if (err != cudaSuccess) {
-        fprintf(stderr, "gpu_sieve: H2D base_limbs failed: %s\n",
-                cudaGetErrorString(err));
-        return 0;
+    if (!residue_mode) {
+        err = cudaMemcpyAsync(ctx->d_base_limbs, base_limbs,
+                              (size_t)base_limb_count * sizeof(*base_limbs),
+                              cudaMemcpyHostToDevice, ctx->stream);
+        if (err != cudaSuccess) {
+            fprintf(stderr, "gpu_sieve: H2D base_limbs failed: %s\n",
+                    cudaGetErrorString(err));
+            return 0;
+        }
     }
 
     uint64_t zero_offset = 0;
@@ -1496,9 +1700,21 @@ int gpu_sieve_mark_from_base(gpu_sieve_ctx *ctx,
     uint64_t blocks = (prime_count_u64 + tpb - 1U) / tpb;
     if (blocks > (uint64_t)UINT_MAX) return 0;
 
-    gpu_sieve_residues_kernel<<<(unsigned int)blocks, tpb, 0, ctx->stream>>>(
-        ctx->d_base_limbs, base_limb_count, ctx->d_primes, ctx->d_inv_p,
-        ctx->d_base_mod_p, prime_count_u64);
+    if (residue_mode != 2) {
+        sieve_res_timing_begin(ctx);
+        if (residue_mode == 1) {
+            gpu_sieve_residues_step_kernel<<<(unsigned int)blocks, tpb, 0,
+                                             ctx->stream>>>(
+                ctx->d_primes, ctx->d_step_mod_p, ctx->d_base_mod_p,
+                prime_count_u64);
+        } else {
+            gpu_sieve_residues_kernel<<<(unsigned int)blocks, tpb, 0,
+                                        ctx->stream>>>(
+                ctx->d_base_limbs, base_limb_count, ctx->d_primes,
+                ctx->d_inv_p, ctx->d_base_mod_p, prime_count_u64);
+        }
+        sieve_res_timing_end(ctx);
+    }
 
     sieve_timing_begin(ctx, 1);
 
@@ -1528,7 +1744,8 @@ int gpu_sieve_mark_from_base(gpu_sieve_ctx *ctx,
             gpu_sieve_mark_dense_split_kernel<<<(unsigned)iblocks, tpb, 0,
                                                 ctx->stream>>>(
                 ctx->d_bitmap[buf & 1], odd_interval_size, first_odd_offset,
-                ctx->d_primes, ctx->d_base_mod_p, n_small, (uint32_t)chunks,
+                ctx->d_primes, ctx->d_base_mod_p, ctx->d_step_mod_p,
+                ctx->d_inv_p, m_steps, n_small, (uint32_t)chunks,
                 slots);
         } else {
             n_small = 0;
@@ -1542,7 +1759,9 @@ int gpu_sieve_mark_from_base(gpu_sieve_ctx *ctx,
                                       ctx->stream>>>(
             ctx->d_bitmap[buf & 1], (uint64_t)required_words,
             odd_interval_size, first_odd_offset, ctx->d_base_offsets, 1,
-            ctx->d_primes + n_small, ctx->d_base_mod_p + n_small, rest_count);
+            ctx->d_primes + n_small, ctx->d_base_mod_p + n_small,
+            ctx->d_step_mod_p + n_small, ctx->d_inv_p + n_small, m_steps,
+            rest_count);
     }
     sieve_timing_end(ctx);
 
@@ -1551,6 +1770,7 @@ int gpu_sieve_mark_from_base(gpu_sieve_ctx *ctx,
         fprintf(stderr, "gpu_sieve: kernel launch (from base) failed: %s\n",
                 cudaGetErrorString(err));
         ctx->t_stage = 0;
+        ctx->t_res_stage = 0;
         return 0;
     }
 
@@ -1561,12 +1781,15 @@ int gpu_sieve_mark_from_base(gpu_sieve_ctx *ctx,
         if (err != cudaSuccess) {
             fprintf(stderr, "gpu_sieve: D2H bitmap (from base) failed: %s\n",
                     cudaGetErrorString(err));
+            ctx->t_stage = 0;
+            ctx->t_res_stage = 0;
             return 0;
         }
     }
 
     err = cudaStreamSynchronize(ctx->stream);
     sieve_timing_drain(ctx);
+    sieve_res_timing_drain(ctx);
     if (err != cudaSuccess) {
         fprintf(stderr, "gpu_sieve: stream sync failed: %s\n",
                 cudaGetErrorString(err));
@@ -1575,6 +1798,266 @@ int gpu_sieve_mark_from_base(gpu_sieve_ctx *ctx,
 
     uint64_t end_time = gpu_sieve_clock_us();
     ctx->last_elapsed_us = end_time >= start_time ? end_time - start_time : 0;
+    return 1;
+}
+
+/* Stateless window mark (default): base mod p recomputed from the limbs. */
+int gpu_sieve_mark_from_base(gpu_sieve_ctx *ctx,
+                             uint64_t odd_interval_size,
+                             uint64_t first_odd_offset,
+                             const uint64_t *base_limbs,
+                             int base_limb_count,
+                             int buf,
+                             const uint64_t *primes,
+                             const uint64_t *inv_p,
+                             size_t prime_count,
+                             uint64_t *host_bitmap,
+                             size_t host_bitmap_words) {
+    return gpu_sieve_mark_from_base_impl(ctx, odd_interval_size,
+                                         first_odd_offset, base_limbs,
+                                         base_limb_count, 0, 0, buf, primes,
+                                         inv_p, prime_count, host_bitmap,
+                                         host_bitmap_words);
+}
+
+/* CRT-periodic window mark: advance cached residues by one step, then mark
+   (consecutive walk windows differ by exactly the cached step P). */
+int gpu_sieve_mark_from_base_incr(gpu_sieve_ctx *ctx,
+                                  uint64_t odd_interval_size,
+                                  uint64_t first_odd_offset,
+                                  int buf,
+                                  const uint64_t *primes,
+                                  const uint64_t *inv_p,
+                                  size_t prime_count,
+                                  uint64_t *host_bitmap,
+                                  size_t host_bitmap_words) {
+    return gpu_sieve_mark_from_base_impl(ctx, odd_interval_size,
+                                         first_odd_offset, NULL, 0, 1, 0, buf,
+                                         primes, inv_p, prime_count,
+                                         host_bitmap, host_bitmap_words);
+}
+
+/* Folded-step window mark (WS-A2): the cached residue array stays anchored
+   at some earlier window k_anchor and the mark kernels compute
+   residue = cache + m_steps * step themselves - no residue kernel at all.
+   The caller re-anchors (gpu_sieve_mark_from_base) whenever
+   m_steps would exceed gpu_sieve_residue_m_limit(). */
+int gpu_sieve_mark_from_base_mw(gpu_sieve_ctx *ctx,
+                                uint64_t odd_interval_size,
+                                uint64_t first_odd_offset,
+                                int buf,
+                                uint64_t m_steps,
+                                const uint64_t *primes,
+                                const uint64_t *inv_p,
+                                size_t prime_count,
+                                uint64_t *host_bitmap,
+                                size_t host_bitmap_words) {
+    return gpu_sieve_mark_from_base_impl(ctx, odd_interval_size,
+                                         first_odd_offset, NULL, 0, 2,
+                                         m_steps, buf, primes, inv_p,
+                                         prime_count, host_bitmap,
+                                         host_bitmap_words);
+}
+
+/* Cache d_step_mod_p = step mod p for every prime (the CRT row stride P).
+   One residue sweep per RUN instead of one per window; afterwards every
+   window whose base is `previous + step` can be marked with
+   gpu_sieve_mark_from_base_incr() (one add mod p per prime).
+   Returns 1 on success, 0 fail-closed (caller keeps the full reduction). */
+int gpu_sieve_set_residue_step(gpu_sieve_ctx *ctx,
+                               const uint64_t *step_limbs,
+                               int step_limb_count,
+                               const uint64_t *primes,
+                               const uint64_t *inv_p,
+                               size_t prime_count) {
+    if (!ctx || !step_limbs || !primes || !inv_p) return 0;
+    if (step_limb_count < 1 ||
+        step_limb_count > ctx->base_limbs_capacity) {
+        return 0;
+    }
+    if (prime_count == 0 || prime_count > ctx->max_primes) return 0;
+
+    /* The increment kernel adds two reduced residues in 64-bit: the sum is
+       exact only while 2*(p-1) < 2^64.  Real sieve tables stop around 1e9;
+       a table that violates this refuses the mode (full path stays).  pmax
+       also bounds the folded-step window (step_m_limit) below. */
+    uint64_t pmax = 0;
+    for (size_t i = 0; i < prime_count; i++) {
+        if (primes[i] >= (1ULL << 62)) return 0;
+        if (primes[i] > pmax) pmax = primes[i];
+    }
+
+    cudaError_t err = gpu_sieve_ensure_device(ctx->device_id);
+    if (err != cudaSuccess) return 0;
+
+    /* The prime table is fixed for the sieve lifetime: upload once. */
+    if (ctx->primes_uploaded_count != prime_count) {
+        err = cudaMemcpyAsync(ctx->d_primes, primes,
+                              prime_count * sizeof(*primes),
+                              cudaMemcpyHostToDevice, ctx->stream);
+        if (err != cudaSuccess) {
+            fprintf(stderr, "gpu_sieve: H2D primes (step) failed: %s\n",
+                    cudaGetErrorString(err));
+            return 0;
+        }
+        err = cudaMemcpyAsync(ctx->d_inv_p, inv_p,
+                              prime_count * sizeof(*inv_p),
+                              cudaMemcpyHostToDevice, ctx->stream);
+        if (err != cudaSuccess) {
+            fprintf(stderr, "gpu_sieve: H2D inv_p (step) failed: %s\n",
+                    cudaGetErrorString(err));
+            return 0;
+        }
+        ctx->primes_uploaded_count = prime_count;
+    }
+
+    err = cudaMemcpyAsync(ctx->d_base_limbs, step_limbs,
+                          (size_t)step_limb_count * sizeof(*step_limbs),
+                          cudaMemcpyHostToDevice, ctx->stream);
+    if (err != cudaSuccess) {
+        fprintf(stderr, "gpu_sieve: H2D step_limbs failed: %s\n",
+                cudaGetErrorString(err));
+        return 0;
+    }
+
+    const int tpb = 128;
+    uint64_t prime_count_u64 = (uint64_t)prime_count;
+    uint64_t blocks = (prime_count_u64 + tpb - 1U) / tpb;
+    if (blocks > (uint64_t)UINT_MAX) return 0;
+
+    sieve_res_timing_begin(ctx);
+    gpu_sieve_residues_kernel<<<(unsigned int)blocks, tpb, 0, ctx->stream>>>(
+        ctx->d_base_limbs, step_limb_count, ctx->d_primes, ctx->d_inv_p,
+        ctx->d_step_mod_p, prime_count_u64);
+    sieve_res_timing_end(ctx);
+
+    err = cudaGetLastError();
+    if (err != cudaSuccess) {
+        fprintf(stderr, "gpu_sieve: set_residue_step launch failed: %s\n",
+                cudaGetErrorString(err));
+        ctx->t_res_stage = 0;
+        return 0;
+    }
+
+    err = cudaStreamSynchronize(ctx->stream);
+    sieve_res_timing_drain(ctx);
+    if (err != cudaSuccess) return 0;
+
+    ctx->step_ready_count = prime_count;
+    memset(ctx->step_limbs_copy, 0, sizeof(ctx->step_limbs_copy));
+    memcpy(ctx->step_limbs_copy, step_limbs,
+           (size_t)step_limb_count * sizeof(uint64_t));
+    ctx->step_limb_count_copy = step_limb_count;
+    /* Folded-step window bound (WS-A2): gpu_sieve_window_residue computes
+       v = cache + m*step and needs (m + 1) * p < 2^63.  Real tables give a
+       limit far beyond any walk span; tiny limits just disable the mode. */
+    if (pmax == 0) pmax = 1;
+    {
+        uint64_t lim = (1ULL << 63) / pmax;
+        if (lim > (1ULL << 20)) lim = 1ULL << 20;
+        ctx->step_m_limit = lim > 0 ? lim - 1 : 0;
+    }
+    return 1;
+}
+
+/* Verification (debug): recompute base mod p for every prime into scratch
+   storage and count how many cached residues differ.  The cached residues
+   are NOT touched, so this runs between two incremental windows. */
+int gpu_sieve_residues_check(gpu_sieve_ctx *ctx,
+                             const uint64_t *base_limbs,
+                             int base_limb_count,
+                             const uint64_t *primes,
+                             const uint64_t *inv_p,
+                             size_t prime_count,
+                             uint64_t m_steps,
+                             uint64_t *mismatch_out) {
+    if (mismatch_out) *mismatch_out = 0;
+    if (!ctx || !base_limbs || !primes || !inv_p || !mismatch_out) return 0;
+    if (base_limb_count < 1 ||
+        base_limb_count > ctx->base_limbs_capacity) {
+        return 0;
+    }
+    if (prime_count == 0 || prime_count > ctx->max_primes) return 0;
+    if (ctx->step_ready_count != prime_count) return 0;
+    if (m_steps > ctx->step_m_limit) return 0;
+
+    cudaError_t err = gpu_sieve_ensure_device(ctx->device_id);
+    if (err != cudaSuccess) return 0;
+
+    if (!ctx->d_residues_scratch) {
+        err = cudaMalloc(&ctx->d_residues_scratch,
+                         ctx->max_primes * sizeof(uint64_t));
+        if (err != cudaSuccess) {
+            ctx->d_residues_scratch = NULL;
+            return 0;
+        }
+    }
+    if (!ctx->d_mismatch) {
+        err = cudaMalloc(&ctx->d_mismatch, 2U * sizeof(*ctx->d_mismatch));
+        if (err != cudaSuccess) {
+            ctx->d_mismatch = NULL;
+            return 0;
+        }
+    }
+
+    err = cudaMemcpyAsync(ctx->d_base_limbs, base_limbs,
+                          (size_t)base_limb_count * sizeof(*base_limbs),
+                          cudaMemcpyHostToDevice, ctx->stream);
+    if (err != cudaSuccess) return 0;
+
+    const int tpb = 128;
+    uint64_t prime_count_u64 = (uint64_t)prime_count;
+    uint64_t blocks = (prime_count_u64 + tpb - 1U) / tpb;
+    if (blocks > (uint64_t)UINT_MAX) return 0;
+
+    unsigned long long init[2];
+    init[0] = 0;
+    init[1] = ~0ULL;
+    err = cudaMemcpyAsync(ctx->d_mismatch, init, sizeof(init),
+                          cudaMemcpyHostToDevice, ctx->stream);
+    if (err != cudaSuccess) return 0;
+
+    sieve_res_timing_begin(ctx);
+    gpu_sieve_residues_kernel<<<(unsigned int)blocks, tpb, 0, ctx->stream>>>(
+        ctx->d_base_limbs, base_limb_count, ctx->d_primes, ctx->d_inv_p,
+        ctx->d_residues_scratch, prime_count_u64);
+    gpu_sieve_residues_compare_kernel<<<(unsigned int)blocks, tpb, 0,
+                                        ctx->stream>>>(
+        ctx->d_residues_scratch, ctx->d_base_mod_p, ctx->d_step_mod_p,
+        ctx->d_inv_p, m_steps, ctx->d_primes, prime_count_u64,
+        ctx->d_mismatch, ctx->d_mismatch + 1);
+    sieve_res_timing_end(ctx);
+
+    err = cudaGetLastError();
+    if (err != cudaSuccess) {
+        fprintf(stderr, "gpu_sieve: residues_check launch failed: %s\n",
+                cudaGetErrorString(err));
+        ctx->t_res_stage = 0;
+        return 0;
+    }
+
+    unsigned long long out[2];
+    out[0] = 0;
+    out[1] = ~0ULL;
+    err = cudaMemcpyAsync(out, ctx->d_mismatch, sizeof(out),
+                          cudaMemcpyDeviceToHost, ctx->stream);
+    if (err != cudaSuccess) return 0;
+
+    err = cudaStreamSynchronize(ctx->stream);
+    sieve_res_timing_drain(ctx);
+    if (err != cudaSuccess) return 0;
+
+    if (out[0] != 0 && out[1] < (unsigned long long)prime_count) {
+        const char *dbg = getenv("GPU_SIEVE_RESIDUES_DEBUG");
+        if (dbg && dbg[0] && dbg[0] != '0') {
+            fprintf(stderr,
+                    "gpu_sieve: first residue mismatch at prime #%llu "
+                    "(p=%llu)\n", out[1],
+                    (unsigned long long)primes[out[1]]);
+        }
+    }
+
+    *mismatch_out = (uint64_t)out[0];
     return 1;
 }
 
@@ -1650,7 +2133,20 @@ int gpu_sieve_mark_rows_from_base(gpu_sieve_ctx *ctx,
         ctx->primes_uploaded_count = prime_count;
     }
 
-    /* base into d_base_limbs[0..n), step into d_base_limbs[n..2n). */
+    /* WS-B step cache: take the base-only fast path when the cached
+       step_mod_p belongs to EXACTLY these step limbs (byte compare of the
+       host copy).  Any mismatch (or GPU_SIEVE_STEP_CACHE=0) keeps the old
+       double reduction and refreshes the cache after a successful sync. */
+    int use_cached_step = 0;
+    if (ctx->rows_step_cache && ctx->step_ready_count == prime_count &&
+        ctx->step_limb_count_copy == base_limb_count &&
+        memcmp(ctx->step_limbs_copy, step_limbs,
+               (size_t)base_limb_count * sizeof(uint64_t)) == 0) {
+        use_cached_step = 1;
+    }
+
+    /* base into d_base_limbs[0..n); the step half is uploaded only when the
+       step residues are not cached (then step into d_base_limbs[n..2n)). */
     err = cudaMemcpyAsync(ctx->d_base_limbs, base_limbs,
                           (size_t)base_limb_count * sizeof(uint64_t),
                           cudaMemcpyHostToDevice, ctx->stream);
@@ -1659,13 +2155,15 @@ int gpu_sieve_mark_rows_from_base(gpu_sieve_ctx *ctx,
                 cudaGetErrorString(err));
         return 0;
     }
-    err = cudaMemcpyAsync(ctx->d_base_limbs + base_limb_count, step_limbs,
-                          (size_t)base_limb_count * sizeof(uint64_t),
-                          cudaMemcpyHostToDevice, ctx->stream);
-    if (err != cudaSuccess) {
-        fprintf(stderr, "gpu_sieve: row H2D step_limbs failed: %s\n",
-                cudaGetErrorString(err));
-        return 0;
+    if (!use_cached_step) {
+        err = cudaMemcpyAsync(ctx->d_base_limbs + base_limb_count, step_limbs,
+                              (size_t)base_limb_count * sizeof(uint64_t),
+                              cudaMemcpyHostToDevice, ctx->stream);
+        if (err != cudaSuccess) {
+            fprintf(stderr, "gpu_sieve: row H2D step_limbs failed: %s\n",
+                    cudaGetErrorString(err));
+            return 0;
+        }
     }
 
     err = cudaMemsetAsync(ctx->d_row_bitmaps, 0,
@@ -1683,11 +2181,20 @@ int gpu_sieve_mark_rows_from_base(gpu_sieve_ctx *ctx,
     uint64_t blocks = (prime_count_u64 + tpb - 1U) / tpb;
     if (blocks > (uint64_t)UINT_MAX) return 0;
 
-    gpu_sieve_rows_residues_kernel<<<(unsigned int)blocks, tpb, 0,
-                                     ctx->stream>>>(
-        ctx->d_base_limbs, ctx->d_base_limbs + base_limb_count,
-        base_limb_count, ctx->d_primes, ctx->d_inv_p, ctx->d_base_mod_p,
-        ctx->d_step_mod_p, prime_count_u64);
+    sieve_res_timing_begin(ctx);
+    if (use_cached_step) {
+        gpu_sieve_rows_base_residues_kernel<<<(unsigned int)blocks, tpb, 0,
+                                              ctx->stream>>>(
+            ctx->d_base_limbs, base_limb_count, ctx->d_primes, ctx->d_inv_p,
+            ctx->d_base_mod_p, prime_count_u64);
+    } else {
+        gpu_sieve_rows_residues_kernel<<<(unsigned int)blocks, tpb, 0,
+                                         ctx->stream>>>(
+            ctx->d_base_limbs, ctx->d_base_limbs + base_limb_count,
+            base_limb_count, ctx->d_primes, ctx->d_inv_p, ctx->d_base_mod_p,
+            ctx->d_step_mod_p, prime_count_u64);
+    }
+    sieve_res_timing_end(ctx);
 
     /* Arena stride: rows are laid out at max_bitmap_words intervals (the
        extractor reads row r at row_bitmaps + r*max_bitmap_words). */
@@ -1752,15 +2259,32 @@ int gpu_sieve_mark_rows_from_base(gpu_sieve_ctx *ctx,
         fprintf(stderr, "gpu_sieve: row mark kernel launch failed: %s\n",
                 cudaGetErrorString(err));
         ctx->t_stage = 0;
+        ctx->t_res_stage = 0;
+        /* d_step_mod_p state is unknown: never let the cache trust it. */
+        ctx->step_ready_count = 0;
+        ctx->step_limb_count_copy = 0;
         return 0;
     }
 
     err = cudaStreamSynchronize(ctx->stream);
     sieve_timing_drain(ctx);
+    sieve_res_timing_drain(ctx);
     if (err != cudaSuccess) {
         fprintf(stderr, "gpu_sieve: row mark stream sync failed: %s\n",
                 cudaGetErrorString(err));
+        ctx->step_ready_count = 0;
+        ctx->step_limb_count_copy = 0;
         return 0;
+    }
+    if (!use_cached_step) {
+        /* The double-reduction pass just wrote fresh step residues: refresh
+           the host-side cache so later batches with the same step take the
+           base-only fast path. */
+        memset(ctx->step_limbs_copy, 0, sizeof(ctx->step_limbs_copy));
+        memcpy(ctx->step_limbs_copy, step_limbs,
+               (size_t)base_limb_count * sizeof(uint64_t));
+        ctx->step_limb_count_copy = base_limb_count;
+        ctx->step_ready_count = prime_count;
     }
 
     uint64_t end_time = gpu_sieve_clock_us();
@@ -2493,6 +3017,14 @@ void gpu_sieve_destroy(gpu_sieve_ctx *ctx) {
     if (ctx->d_count) cudaFree(ctx->d_count);
     if (ctx->d_row_bitmaps) cudaFree(ctx->d_row_bitmaps);
     if (ctx->d_step_mod_p) cudaFree(ctx->d_step_mod_p);
+    if (ctx->d_residues_scratch) cudaFree(ctx->d_residues_scratch);
+    if (ctx->d_mismatch) cudaFree(ctx->d_mismatch);
+    if (ctx->t_inited) {
+        cudaEventDestroy(ctx->t_start);
+        cudaEventDestroy(ctx->t_end);
+        cudaEventDestroy(ctx->t_res_start);
+        cudaEventDestroy(ctx->t_res_end);
+    }
     if (ctx->stream) cudaStreamDestroy(ctx->stream);
 
     free(ctx);

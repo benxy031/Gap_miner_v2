@@ -506,6 +506,269 @@ static int run_one_pair_batch(gpu_sieve_ctx *ctx, const mpz_t base0,
     return pass;
 }
 
+/* Incremental CRT residue amortization (GAP_HUNT_RESIDUE_INCR / plan WS-A):
+   marking the NEXT window base (b + P) through gpu_sieve_mark_from_base_incr
+   (one add mod p per prime) must reproduce the FULL per-window reduction
+   bit-for-bit, across several consecutive steps and both step parities, and
+   gpu_sieve_residues_check must agree (0 mismatches).  The negative control
+   proves the checker can actually fail. */
+static int run_residue_incr_test(gpu_sieve_ctx *ctx) {
+    printf("[TEST] GPU sieve incremental CRT residues (WS-A)...\n");
+
+    const uint64_t prime_limit = 20000U;
+    const size_t prime_cap = 4096;
+    uint64_t *primes = (uint64_t *)malloc(prime_cap * sizeof(uint64_t));
+    uint64_t *inv_p = (uint64_t *)malloc(prime_cap * sizeof(uint64_t));
+    if (!primes || !inv_p) {
+        fprintf(stderr, "  FAIL: out of memory\n");
+        free(primes); free(inv_p);
+        return 0;
+    }
+    size_t prime_count = gen_primes(prime_limit, primes, prime_cap);
+    for (size_t i = 0; i < prime_count; i++) {
+        inv_p[i] = (primes[i] >= 3U) ? (UINT64_MAX / primes[i]) : 0U;
+    }
+
+    const int limbs = 12;
+    const uint64_t interval = 32768U;
+    enum { STEPS = 4 };
+    size_t words = ((interval / 2U + 1U + 63U) >> 6);
+    uint64_t *full[STEPS + 1];
+    uint64_t *incr[STEPS + 1];
+    for (int k = 0; k <= STEPS; k++) { full[k] = NULL; incr[k] = NULL; }
+    uint64_t *zero = (uint64_t *)calloc(words ? words : 1,
+                                        sizeof(uint64_t));
+    int pass = 1;
+
+    mpz_t step, b0, bk;
+    mpz_init(step); mpz_init(b0); mpz_init(bk);
+
+    static const unsigned step_factors[] = {3U, 5U, 7U, 11U, 13U, 17U, 19U,
+                                            23U, 29U, 31U, 37U, 41U, 43U,
+                                            47U, 53U};
+    for (int sp = 0; sp < 2 && pass; sp++) {
+        /* Step: product of small odd primes -> odd (the usual cover),
+           doubled -> even (a cover prime dividing 2 keeps one odd grid). */
+        mpz_set_ui(step, 1U);
+        for (size_t f = 0;
+             f < sizeof(step_factors) / sizeof(step_factors[0]); f++) {
+            mpz_mul_ui(step, step, step_factors[f]);
+        }
+        if (sp == 1) mpz_mul_ui(step, step, 2U);
+
+        /* Deterministic base with plenty of headroom in `limbs` limbs. */
+        mpz_set_ui(b0, 1U);
+        mpz_mul_2exp(b0, b0, (mp_bitcnt_t)(64 * limbs - 40));
+        mpz_add_ui(b0, b0, 12345U);
+        if (sp == 0) mpz_setbit(b0, 0); else mpz_clrbit(b0, 0);
+
+        /* Fail-closed guard: both amortized paths must refuse without a
+           cached step (step_ready_count starts at 0). */
+        if (sp == 0) {
+            if (gpu_sieve_mark_from_base_incr(ctx, interval / 2U, 0U, 1,
+                                              primes, inv_p, prime_count,
+                                              zero, words)) {
+                fprintf(stderr, "  FAIL: incr mark without cached step "
+                        "returned success\n");
+                pass = 0;
+            }
+            if (gpu_sieve_mark_from_base_mw(ctx, interval / 2U, 0U, 1, 1ULL,
+                                            primes, inv_p, prime_count,
+                                            zero, words)) {
+                fprintf(stderr, "  FAIL: folded mark without cached step "
+                        "returned success\n");
+                pass = 0;
+            }
+        }
+
+        /* Full-path reference bitmaps for k = 0..STEPS. */
+        for (int k = 0; k <= STEPS && pass; k++) {
+            mpz_set(bk, b0);
+            if (k > 0) mpz_addmul_ui(bk, step, (unsigned long)k);
+            uint64_t first_odd = mpz_tstbit(bk, 0) ? 0U : 1U;
+            uint64_t odd_count = (interval - first_odd + 1U) >> 1;
+            uint64_t base_limbs[64];
+            mpz_to_limbs(bk, base_limbs, (size_t)limbs);
+            full[k] = (uint64_t *)calloc(words ? words : 1,
+                                         sizeof(uint64_t));
+            if (!full[k] ||
+                !gpu_sieve_mark_from_base(ctx, odd_count, first_odd,
+                                          base_limbs, limbs, 0, primes,
+                                          inv_p, prime_count, full[k],
+                                          words)) {
+                fprintf(stderr, "  FAIL: full mark (sp=%d k=%d)\n", sp, k);
+                pass = 0;
+            }
+        }
+
+        if (pass) {
+            uint64_t step_limbs[64];
+            mpz_to_limbs(step, step_limbs, (size_t)limbs);
+            if (!gpu_sieve_set_residue_step(ctx, step_limbs, limbs, primes,
+                                            inv_p, prime_count)) {
+                fprintf(stderr, "  FAIL: set_residue_step (sp=%d)\n", sp);
+                pass = 0;
+            }
+        }
+
+        /* Re-seed the cache with a FULL mark at b0, then walk STEPS windows
+           through the incremental path. */
+        if (pass) {
+            uint64_t first_odd = mpz_tstbit(b0, 0) ? 0U : 1U;
+            uint64_t odd_count = (interval - first_odd + 1U) >> 1;
+            uint64_t base_limbs[64];
+            mpz_to_limbs(b0, base_limbs, (size_t)limbs);
+            if (!gpu_sieve_mark_from_base(ctx, odd_count, first_odd,
+                                          base_limbs, limbs, 1, primes,
+                                          inv_p, prime_count, zero,
+                                          words)) {
+                fprintf(stderr, "  FAIL: reseed mark (sp=%d)\n", sp);
+                pass = 0;
+            }
+        }
+        for (int k = 1; k <= STEPS && pass; k++) {
+            mpz_set(bk, b0);
+            mpz_addmul_ui(bk, step, (unsigned long)k);
+            uint64_t first_odd = mpz_tstbit(bk, 0) ? 0U : 1U;
+            uint64_t odd_count = (interval - first_odd + 1U) >> 1;
+            incr[k] = (uint64_t *)calloc(words ? words : 1,
+                                         sizeof(uint64_t));
+            if (!incr[k] ||
+                !gpu_sieve_mark_from_base_incr(ctx, odd_count, first_odd, 0,
+                                               primes, inv_p, prime_count,
+                                               incr[k], words)) {
+                fprintf(stderr, "  FAIL: incr mark (sp=%d k=%d)\n", sp, k);
+                pass = 0;
+                break;
+            }
+            if (memcmp(incr[k], full[k], words * sizeof(uint64_t)) != 0) {
+                fprintf(stderr, "  FAIL: bitmap mismatch (sp=%d k=%d)\n",
+                        sp, k);
+                pass = 0;
+                break;
+            }
+            uint64_t mism = 99;
+            uint64_t base_limbs[64];
+            mpz_to_limbs(bk, base_limbs, (size_t)limbs);
+            if (!gpu_sieve_residues_check(ctx, base_limbs, limbs, primes,
+                                          inv_p, prime_count, 0, &mism) ||
+                mism != 0) {
+                fprintf(stderr, "  FAIL: residues_check mism=%llu "
+                        "(sp=%d k=%d)\n", (unsigned long long)mism,
+                        sp, k);
+                pass = 0;
+                break;
+            }
+        }
+
+        /* Negative control: with the cache at b0 + STEPS*step, checking the
+           ORIGINAL base must report mismatches (checker not vacuous). */
+        if (pass) {
+            uint64_t mism = 0;
+            uint64_t base_limbs[64];
+            mpz_to_limbs(b0, base_limbs, (size_t)limbs);
+            if (!gpu_sieve_residues_check(ctx, base_limbs, limbs, primes,
+                                          inv_p, prime_count, 0, &mism) ||
+                mism == 0) {
+                fprintf(stderr, "  FAIL: negative control mism=%llu "
+                        "(sp=%d)\n", (unsigned long long)mism, sp);
+                pass = 0;
+            }
+        }
+
+        /* WS-A2 folded-step scenario: the cache stays anchored at b0 while
+           the mark kernels fold m*step in themselves. */
+        if (pass) {
+            uint64_t first_odd = mpz_tstbit(b0, 0) ? 0U : 1U;
+            uint64_t odd_count = (interval - first_odd + 1U) >> 1;
+            uint64_t base_limbs[64];
+            mpz_to_limbs(b0, base_limbs, (size_t)limbs);
+            if (!gpu_sieve_mark_from_base(ctx, odd_count, first_odd,
+                                          base_limbs, limbs, 1, primes,
+                                          inv_p, prime_count, zero, words)) {
+                fprintf(stderr, "  FAIL: folded reseed mark (sp=%d)\n",
+                        sp);
+                pass = 0;
+            }
+        }
+        for (int k = 1; k <= STEPS && pass; k++) {
+            mpz_set(bk, b0);
+            mpz_addmul_ui(bk, step, (unsigned long)k);
+            uint64_t first_odd = mpz_tstbit(bk, 0) ? 0U : 1U;
+            uint64_t odd_count = (interval - first_odd + 1U) >> 1;
+            if (!gpu_sieve_mark_from_base_mw(ctx, odd_count, first_odd, 0,
+                                             (uint64_t)k, primes, inv_p,
+                                             prime_count, incr[k], words)) {
+                fprintf(stderr, "  FAIL: folded mark (sp=%d k=%d)\n",
+                        sp, k);
+                pass = 0;
+                break;
+            }
+            if (memcmp(incr[k], full[k], words * sizeof(uint64_t)) != 0) {
+                fprintf(stderr, "  FAIL: folded bitmap mismatch "
+                        "(sp=%d k=%d)\n", sp, k);
+                pass = 0;
+                break;
+            }
+            uint64_t mism = 99;
+            uint64_t base_limbs[64];
+            mpz_to_limbs(bk, base_limbs, (size_t)limbs);
+            if (!gpu_sieve_residues_check(ctx, base_limbs, limbs, primes,
+                                          inv_p, prime_count, (uint64_t)k,
+                                          &mism) || mism != 0) {
+                fprintf(stderr, "  FAIL: folded residues_check mism=%llu "
+                        "(sp=%d k=%d)\n", (unsigned long long)mism,
+                        sp, k);
+                pass = 0;
+                break;
+            }
+        }
+        /* Folded negative control: a WRONG m must be detected. */
+        if (pass) {
+            uint64_t mism = 0;
+            uint64_t base_limbs[64];
+            mpz_set(bk, b0);
+            mpz_addmul_ui(bk, step, (unsigned long)STEPS);
+            mpz_to_limbs(bk, base_limbs, (size_t)limbs);
+            if (!gpu_sieve_residues_check(ctx, base_limbs, limbs, primes,
+                                          inv_p, prime_count,
+                                          (uint64_t)STEPS + 1ULL, &mism) ||
+                mism == 0) {
+                fprintf(stderr, "  FAIL: folded negative control "
+                        "mism=%llu (sp=%d)\n",
+                        (unsigned long long)mism, sp);
+                pass = 0;
+            }
+        }
+        /* Folded boundary: m beyond the device limit must be refused. */
+        if (pass) {
+            uint64_t lim = gpu_sieve_residue_m_limit(ctx);
+            if (lim == 0 ||
+                gpu_sieve_mark_from_base_mw(ctx, interval / 2U, 0U, 0,
+                                            lim + 1ULL, primes, inv_p,
+                                            prime_count, zero, words)) {
+                fprintf(stderr, "  FAIL: folded m beyond limit accepted "
+                        "(lim=%llu, sp=%d)\n",
+                        (unsigned long long)lim, sp);
+                pass = 0;
+            }
+        }
+    }
+
+    for (int k = 0; k <= STEPS; k++) { free(full[k]); free(incr[k]); }
+    free(zero);
+    free(primes);
+    free(inv_p);
+    mpz_clear(step); mpz_clear(b0); mpz_clear(bk);
+
+    if (pass) {
+        printf("  OK  incremental residues: %d steps x 2 parities, "
+               "step + folded modes identical, checker clean\n",
+               (int)STEPS);
+    }
+    return pass;
+}
+
 static int run_gpu_sieve_parity_test(void) {
     printf("[TEST] GPU sieve extract+pack parity vs CPU reference...\n");
 
@@ -544,6 +807,12 @@ static int run_gpu_sieve_parity_test(void) {
 
     int pass = 1;
     char label[64];
+
+    /* The incremental/folded residue tests run FIRST: their fail-closed
+       guards ("refuses without a cached step") require an EMPTY step cache,
+       and the row-batch tests below intentionally leave valid cache entries
+       behind (WS-B). */
+    if (pass) pass = run_residue_incr_test(ctx);
 
     static const int limb_cases[] = {1, 2, 6, 12, 20};
     static const uint64_t interval_cases[] = {16384U, 1U << 16};
@@ -592,6 +861,43 @@ static int run_gpu_sieve_parity_test(void) {
             }
         }
         mpz_clear(step);
+    }
+
+    /* WS-B: step-cached row batches.  After gpu_sieve_set_residue_step()
+       with the SAME step, run_one_row_batch must still match the CPU
+       reference (base-only fast path); a different step must fall back to
+       the double reduction and also match. */
+    {
+        mpz_t step, step2;
+        mpz_init(step);
+        mpz_init(step2);
+        mpz_urandomb(step, rng, 506UL);
+        mpz_setbit(step, 0);
+        mpz_urandomb(step2, rng, 506UL);
+        mpz_setbit(step2, 0);
+        mpz_urandomb(base, rng, 64UL * 20UL - 32UL);
+        mpz_clrbit(base, 0);
+        uint64_t step_limbs[64];
+        mpz_to_limbs(step, step_limbs, 20);
+        if (!gpu_sieve_set_residue_step(ctx, step_limbs, 20, primes,
+                                        inv_p, prime_count)) {
+            fprintf(stderr, "  FAIL: set_residue_step (rows cache)\n");
+            pass = 0;
+        }
+        if (pass &&
+            !run_one_row_batch(ctx, base, step, 20, 32768U, 4, primes,
+                               prime_count, inv_p,
+                               "cached-rows same step")) {
+            pass = 0;
+        }
+        if (pass &&
+            !run_one_row_batch(ctx, base, step2, 20, 32768U, 4, primes,
+                               prime_count, inv_p,
+                               "cached-rows other step (fallback)")) {
+            pass = 0;
+        }
+        mpz_clear(step);
+        mpz_clear(step2);
     }
 
     /* Production-like geometry: 20-limb base (CRT window ~2^762), step like

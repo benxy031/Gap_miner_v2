@@ -79,6 +79,7 @@ struct farm_stats {
     /* Sieve kernel accounting (GPU_SIEVE_TIMING=1 only). */
     uint64_t total_sieve_mark_us;
     uint64_t total_sieve_extract_us;
+    uint64_t total_sieve_resid_us;
 };
 
 void miner_farm_get_stats(struct miner_farm *farm, struct farm_stats *stats);

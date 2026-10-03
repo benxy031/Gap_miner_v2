@@ -37,6 +37,8 @@ int main(int argc, char **argv) {
     int al = (argc > 1) ? atoi(argv[1]) : 12;
     int batch = (argc > 2) ? atoi(argv[2]) : 10000;
     int iters = (argc > 3) ? atoi(argv[3]) : 20;
+    int bits  = (argc > 4) ? atoi(argv[4]) : 0;   /* 0 = full AL*64 width */
+    if (bits < 0 || bits > al * 64) bits = 0;
 
     if (al < 1 || al > GPU_NLIMBS) {
         fprintf(stderr, "AL out of range [1,%d]\n", GPU_NLIMBS);
@@ -62,8 +64,16 @@ int main(int argc, char **argv) {
         uint64_t *c = &cands[(size_t)i * (size_t)al];
         for (int j = 0; j < al; j++)
             c[j] = rng64();
+        if (bits > 0) {
+            /* limit magnitude to `bits` (top bit forced), e.g. 68 bits ~ 2e20 */
+            int top = (bits - 1) / 64, tb = (bits - 1) % 64;
+            for (int j = top + 1; j < al; j++) c[j] = 0;
+            c[top] &= (tb == 63) ? ~0ULL : ((1ULL << (tb + 1)) - 1);
+            c[top] |= (1ULL << tb);
+        } else {
+            c[al - 1] |= (1ULL << 62);  /* keep top bits wide (~full AL*64 bits) */
+        }
         c[0] |= 1ULL;               /* force odd */
-        c[al - 1] |= (1ULL << 62);  /* keep top bits wide (~full AL*64 bits) */
     }
 
     /* Warm up */
@@ -83,6 +93,8 @@ int main(int argc, char **argv) {
 
     double total = (double)batch * (double)iters;
     double dt = t1 - t0;
+    if (bits > 0)
+        printf("candidate magnitude: %d bits (top bit forced)\n", bits);
     printf("AL=%d (%d-bit)  kernel=%s  batch=%d  iters=%d  primes=%d\n",
            al, al * 64, gpu_fermat_kernel_label(al), batch, iters, primes);
     printf("  total time   : %.4f s\n", dt);

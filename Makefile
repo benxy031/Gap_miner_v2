@@ -117,8 +117,12 @@ TEST_GAP_HUNT = $(BIN_DIR)/test_gap_hunt
 TEST_STRATUM = $(BIN_DIR)/test_stratum
 BENCH_FERMAT = $(BIN_DIR)/bench_fermat
 BENCH_MARK = $(BIN_DIR)/bench_mark
+BENCH_P0SIEVE = $(BIN_DIR)/bench_p0sieve
 CUDA_INT = $(BIN_DIR)/cuda_int_throughput
 COVER_MAX = $(BIN_DIR)/cover_max
+PHASE0_SCAN = $(BIN_DIR)/phase0_scan
+PHASE0_SCAN_GPU = $(BIN_DIR)/phase0_scan_gpu
+MR68_GPU = $(BIN_DIR)/mr68_gpu
 
 # Phony targets
 .PHONY: all clean test help update-merits
@@ -211,10 +215,48 @@ $(BENCH_FERMAT): $(OBJECTS) $(BUILD_DIR)/tools/bench_fermat.o | $(BIN_DIR)
 	$(CC) $(CFLAGS) $^ $(LDFLAGS) -lpthread -o $@
 	@echo "✓ Built: $@"
 
+# Dedicated 68-bit-class Miller-Rabin kernel for the Phase-0 exhaustive scan
+# (standalone CUDA TU; no gapminer/gap_hunt objects; GMP is linked host-side
+# ONLY for the --validate gate against mpz_probab_prime_p).
+$(MR68_GPU): $(BUILD_DIR)/tools/mr68_gpu.o | $(BIN_DIR)
+	$(NVCC) $(BUILD_DIR)/tools/mr68_gpu.o -L$(CUDA_LIBDIR) -lcudart -lgmp -lm -o $@
+	@echo "✓ Built: $@"
+
+# GPU live Phase-0 scanner: CPU bucketed sieve + the shared mr68 kernel;
+# GMP host-side for --check and for verifying every reported gap.
+# Build: make bin/phase0_scan_gpu WITH_CUDA=1
+$(PHASE0_SCAN_GPU): $(BUILD_DIR)/tools/phase0_scan_gpu.o | $(BIN_DIR)
+	$(NVCC) $(BUILD_DIR)/tools/phase0_scan_gpu.o -L$(CUDA_LIBDIR) -lcudart -lgmp -lm -lpthread -o $@
+	@echo "✓ Built: $@"
+
+# Split-mode build of the same scanner (Linux gate for the Windows kernel-DLL
+# architecture of README_WINDOWS.md): tools/phase0gpu_dll.o is the DLL
+# translation unit (the exact source windows\build_phase0.bat compiles with
+# nvcc+MSVC), linked against the host TU compiled as C++ with
+# -DPHASE0_KERNEL_DLL.  A fixed-range walk/sieve run of this binary must be
+# byte-identical to bin/phase0_scan_gpu (README_PHASE0.md, gates).
+PHASE0_SCAN_GPU_SPLIT = $(BIN_DIR)/phase0_scan_gpu_split
+
+$(PHASE0_SCAN_GPU_SPLIT): $(BUILD_DIR)/tools/phase0_scan_gpu_hdll.o $(BUILD_DIR)/tools/phase0gpu_dll.o | $(BIN_DIR)
+	$(CXX) $^ -L$(CUDA_LIBDIR) -lcudart -lgmp -lm -lpthread -o $@
+	@echo "✓ Built: $@"
+
+$(BUILD_DIR)/tools/phase0_scan_gpu_hdll.o: tools/phase0_scan_gpu.cu tools/phase0gpu_api.h tools/p0_types.h
+	@mkdir -p $(dir $@)
+	$(CXX) -x c++ -O2 -std=gnu++17 -MMD -MP -DPHASE0_KERNEL_DLL -Itools -c $< -o $@
+
 # GPU bitmap-mark kernel cost-model microbenchmark (dev tool, CUDA only).
 # Standalone TU (does not link the miner objects); needs nvcc.
 $(BENCH_MARK): $(BUILD_DIR)/tools/bench_mark.o | $(BIN_DIR)
 	$(NVCC) $(BUILD_DIR)/tools/bench_mark.o -L$(CUDA_LIBDIR) -lcudart -lm -o $@
+	@echo "✓ Built: $@"
+
+# GPU bitmap-marking probe for the live Phase-0 scanner geometry (dev tool):
+# measures the full per-segment GPU cycle (memset + mark kernel + D2H of the
+# 64 KB bitmap) and verifies segment bitmaps against a naive CPU marker.
+# Build: make bin/bench_p0sieve WITH_CUDA=1
+$(BENCH_P0SIEVE): $(BUILD_DIR)/tools/bench_p0sieve.o | $(BIN_DIR)
+	$(NVCC) $(BUILD_DIR)/tools/bench_p0sieve.o -L$(CUDA_LIBDIR) -lcudart -lm -o $@
 	@echo "✓ Built: $@"
 
 # GPU integer-arithmetic ceiling microbenchmark (dev tool, CUDA only): the
@@ -227,7 +269,14 @@ $(CUDA_INT): $(BUILD_DIR)/tools/cuda_int_throughput.o | $(BIN_DIR)
 
 $(BUILD_DIR)/tools/%.o: tools/%.cu | $(BUILD_DIR)
 	@mkdir -p $(dir $@)
-	$(NVCC) -O3 $(CUDA_ARCH) -std=c++17 -I$(SRC_DIR)/gpu -c $< -o $@
+	$(NVCC) -O3 $(CUDA_ARCH) -std=c++17 -Xcompiler -O2 -I$(SRC_DIR)/gpu -c $< -o $@
+
+$(BUILD_DIR)/tools/mr68_gpu.o: tools/mr68_kernel.cuh
+$(BUILD_DIR)/tools/phase0_scan_gpu.o: tools/mr68_kernel.cuh tools/perig.cuh \
+    tools/p0_mark.cuh tools/p0_types.h tools/p0_walk_kern.cuh tools/phase0gpu_api.h
+$(BUILD_DIR)/tools/bench_p0sieve.o: tools/p0_mark.cuh tools/p0_types.h
+$(BUILD_DIR)/tools/phase0gpu_dll.o: tools/phase0gpu_api.h tools/mr68_kernel.cuh \
+    tools/p0_mark.cuh tools/p0_types.h tools/p0_walk_kern.cuh tools/perig.cuh
 
 # Link test_gap_priority
 $(TEST_GAP_PRIORITY): $(OBJECTS) $(BUILD_DIR)/$(TEST_DIR)/test_gap_priority.o | $(BIN_DIR)
@@ -250,6 +299,11 @@ $(GEN_CRT): $(BUILD_DIR)/$(SRC_DIR)/covering.o $(BUILD_DIR)/$(SRC_DIR)/gen_crt_m
 # Covering-coverage search experiment tool (GPA-style; CPU-only dev tool)
 $(COVER_MAX): $(BUILD_DIR)/$(SRC_DIR)/covering.o $(BUILD_DIR)/tools/cover_max.o | $(BIN_DIR)
 	$(CC) $(CFLAGS) $^ -lm -o $@
+	@echo "✓ Built: $@"
+
+# Phase-0 exhaustive prime-gap scan prototype (CPU reference; GMP + pthreads)
+$(PHASE0_SCAN): $(BUILD_DIR)/tools/phase0_scan.o | $(BIN_DIR)
+	$(CC) $(CFLAGS) $^ -lm -lgmp -lpthread -o $@
 	@echo "✓ Built: $@"
 
 $(TEST_CRT_RUNTIME): $(BUILD_DIR)/$(SRC_DIR)/covering.o $(BUILD_DIR)/$(SRC_DIR)/crt_runtime.o $(BUILD_DIR)/$(TEST_DIR)/test_crt_runtime.o | $(BIN_DIR)

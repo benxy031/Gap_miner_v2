@@ -112,6 +112,7 @@ struct worker_stats {
     /* Sieve kernel accounting (only non-zero with GPU_SIEVE_TIMING=1). */
     uint64_t sieve_mark_us;     /* pure mark kernel time (CUDA events) */
     uint64_t sieve_extract_us;  /* pure extract/pack kernel time (CUDA events) */
+    uint64_t sieve_resid_us;    /* residue-prep kernel time (CUDA events) */
 };
 
 void worker_get_stats(uint32_t worker_id, struct worker_stats *stats);

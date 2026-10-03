@@ -814,10 +814,21 @@ cios_fermat_kernel(const uint64_t *__restrict__ cands,
  *
  *  Enabled with: make WITH_CGBN_FERMAT=1 ...
  *
- *  TPI selection per AL (largest power-of-2 dividing 2×AL, capped at 8):
- *    AL%4==0  →  TPI=8  (256/512/768/1024/… bit)
- *    AL%2==0  →  TPI=4  (384/640/896/… bit)
- *    AL odd   →  no CGBN, scalar fermat_kernel_t fallback.
+ *  TPI selection per AL (per-width defaults since 2026-09-29; launch_fermat
+ *  and gpu_fermat_kernel_label share this rule, so the banner never lies):
+ *    AL=2  → TPI=4  (128-bit)      AL=4  → TPI=8  (256-bit)
+ *    AL=6  → TPI=4  (384-bit; TPI=8 via GPU_FERMAT_TPI=8)
+ *    AL=8  → TPI=8  (512-bit; TPI=4 via GPU_FERMAT_TPI=4)
+ *    AL=12/16/20 → TPI=4  (768/1024/1280-bit): the throughput regime favours
+ *      the extra threads per candidate — measured 2026-09-29, numbers at the
+ *      CGBN_DISP_WIDE call sites below: batch 40000 +20/+25/+14 %, batch 2048
+ *      −26/−27/−4.5 %, fused mining chain +8.6/+8.8 % at shifts 507/720;
+ *      TPI=8/16/32 via GPU_FERMAT_TPI
+ *    AL=24/28/32 → TPI=8  (1536/1792/2048-bit; TPI=4/16/32 via env)
+ *    other AL → no CGBN, scalar fermat_kernel_t fallback.
+ *  (The old "largest power-of-2 dividing 2×AL, capped at 8" rule described
+ *  the pre-2026-09-29 policy where TPI=8 was the only wide-AL option; the
+ *  jump-scan kernel below still has its own JUMP_LAUNCH table: AL=20 → 8.)
  *
  *  Correctness fix baked in: CGBN fwmont_mul uses lazy reduction —
  *  mont_sqr can return r ∈ [N, 2N).  Explicit reduce after every

@@ -29,6 +29,10 @@ if [ ! -f bin/gapgpu.dll ]; then
     echo "ERROR: bin/gapgpu.dll missing - build_gpu_dll.bat must succeed first" | tee -a "$LOG"
     exit 1
 fi
+if [ ! -f bin/phase0gpu.dll ]; then
+    echo "ERROR: bin/phase0gpu.dll missing - build_phase0.bat must succeed first" | tee -a "$LOG"
+    exit 1
+fi
 
 GPU_NLIMBS="${GPU_NLIMBS:-32}"
 echo "GPU_NLIMBS=$GPU_NLIMBS" >> "$LOG"

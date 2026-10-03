@@ -143,3 +143,24 @@ tests, the same trade the C knob already measured as break-even).
    in-flight count.
 4. No new `candidates`/OOM/fallback messages; fail-closed to the CPU path if the
    queue starves.
+
+## Stage 2 verdict — CLOSED by measurement (2026-10-02)
+
+Stage 1 (interleaved flights) was refuted on 2026-09-24, and the stage-2 premise
+— that the HOST paces the chain's rounds, so on-device work would buy ~13-26 % —
+is now measured and rejected on the production geometry: 60 s with 4 threads at
+`shift509_p74_covermax_m38` (merit 16, `FUSED_GPU=1`, `FUSED_STAGE_TIMING=1`) shows
+
+* **GPU utilization 100 % in 51 of 58 one-second samples** (99 % ×6, 98 % ×1, one
+  startup sample at 4 %),
+* `GPU MR acc/wall` **1.44-1.53** (43.3-45.8 s GPU-accounted per 30 s stats block),
+* 17,440 → 18,309 win/s (rolling 18,049), 70.5 tests/window, stage split
+  mark 54 % + extract 154-158 % + chain 169-175 % (mr 165-170 %) of wall.
+
+The device is oversubscribed by the four workers (~0.95-1.0 of every wall second
+is device work), so there is no idle GPU time for a persistent kernel to
+reclaim and no host round-trip cost left to remove. Same wall as both refuted
+predecessors. The miner's remaining lever is **less device work** (QUARTER_CLASS
+production A/B; extract is the other large consumer at ~40 % of the device
+budget), not less host latency. Full registry entry and reopen trigger
+(GPU util < ~95 % while `acc/wall` > 1): `docs/CLOSED_FINGERPRINTS.md`.

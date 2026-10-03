@@ -3,6 +3,7 @@ REM ===========================================================================
 REM build_all.bat - full Windows build + validation of GapMiner V2.
 REM
 REM   1. bin\gapgpu.dll    (nvcc + MSVC)          -> windows\build_gpu_dll.bat
+REM   1b.bin\phase0gpu.dll (nvcc + MSVC)          -> windows\build_phase0.bat
 REM   2. bin\gapminer.exe  (MSYS2 MinGW-w64 GCC)  -> windows\build_host.sh
 REM   3. CPU + GPU tests                          -> windows\logs\tests.log
 REM
@@ -11,7 +12,7 @@ REM   build_all.bat host     skip the (slow) DLL build if bin\gapgpu.dll exists
 REM
 REM Optional environment: CUDA_ARCH, GPU_NLIMBS, CUDA_HOME, MSYS2_ROOT (see
 REM build_gpu_dll.bat) and TEST_GPU (run the GPU tests on one GPU only).
-REM Logs: windows\logs\build_gpu_dll.log, build_host.log, tests.log, build_all.log
+REM Logs: windows\logs\build_gpu_dll.log, build_phase0.log, build_host.log, tests.log, build_all.log
 REM ===========================================================================
 setlocal EnableExtensions
 cd /d "%~dp0.."
@@ -21,7 +22,7 @@ echo [%date% %time%] build_all start %* > "%ALOG%"
 if "%MSYS2_ROOT%"=="" set "MSYS2_ROOT=C:\msys64"
 if "%GPU_NLIMBS%"=="" set "GPU_NLIMBS=32"
 
-if /i "%~1"=="host" if exist bin\gapgpu.dll goto host
+if /i "%~1"=="host" if exist bin\gapgpu.dll if exist bin\phase0gpu.dll goto host
 
 call windows\build_gpu_dll.bat
 if errorlevel 1 (
@@ -31,6 +32,15 @@ if errorlevel 1 (
     goto end
 )
 echo [%date% %time%] STEP 1 OK - gapgpu.dll >> "%ALOG%"
+
+call windows\build_phase0.bat
+if errorlevel 1 (
+    echo [%date% %time%] STEP 1b FAILED - phase0gpu.dll >> "%ALOG%"
+    echo.
+    echo *** STEP 1b FAILED: phase0gpu.dll - see windows\logs\build_phase0.log
+    goto end
+)
+echo [%date% %time%] STEP 1b OK - phase0gpu.dll >> "%ALOG%"
 
 :host
 if not exist "%MSYS2_ROOT%\usr\bin\bash.exe" (

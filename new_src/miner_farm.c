@@ -136,6 +136,7 @@ void miner_farm_get_stats(struct miner_farm *farm, struct farm_stats *stats) {
         stats->total_chain_rounds += wstats.chain_rounds;
         stats->total_sieve_mark_us += wstats.sieve_mark_us;
         stats->total_sieve_extract_us += wstats.sieve_extract_us;
+        stats->total_sieve_resid_us += wstats.sieve_resid_us;
         if (wstats.max_gap_length > stats->max_gap_length) {
             stats->max_gap_length = wstats.max_gap_length;
         }

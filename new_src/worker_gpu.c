@@ -183,6 +183,7 @@ struct worker_counter_state {
     /* Sieve kernel accounting (GPU_SIEVE_TIMING=1). */
     _Atomic uint64_t sieve_mark_us;
     _Atomic uint64_t sieve_extract_us;
+    _Atomic uint64_t sieve_resid_us;
 } __attribute__((aligned(64)));
 
 static struct worker_counter_state g_worker_stats[WORKER_STATS_MAX] = {0};
@@ -210,6 +211,7 @@ static void worker_stage_reset(uint32_t worker_id) {
     atomic_store(&g_worker_stats[worker_id].chain_rounds, 0);
     atomic_store(&g_worker_stats[worker_id].sieve_mark_us, 0);
     atomic_store(&g_worker_stats[worker_id].sieve_extract_us, 0);
+    atomic_store(&g_worker_stats[worker_id].sieve_resid_us, 0);
 }
 
 static inline uint64_t worker_stage_now_us(void) {
@@ -3548,6 +3550,21 @@ void *worker_thread_run_crt(void *arg) {
                                : 0;
     }
 
+    /* WS-B: cache step_mod_p = P mod p ONCE per run (P is the fixed row
+       stride), so every later row batch only reduces the base limbs.  The
+       rows path falls back to the old double reduction automatically when
+       the cache is absent or a different step is passed; a failure here is
+       non-fatal and only loses the savings. */
+    if (gpu_sieve && rowP_limbs_valid &&
+        !gpu_sieve_set_residue_step(gpu_sieve, rowP_limbs, gpu_limbs,
+                                    sieve.small_primes, sieve.inv_p,
+                                    sieve.small_primes_count)) {
+        fprintf(stderr,
+                "[worker %u] row step cache disabled "
+                "(gpu_sieve_set_residue_step failed)\n",
+                (unsigned)worker_id);
+    }
+
     while (!g_stop_requested) {
         uint64_t generation;
         uint32_t height;
@@ -3872,6 +3889,9 @@ void *worker_thread_run_crt(void *arg) {
                                 atomic_store(
                                     &g_worker_stats[worker_id].sieve_extract_us,
                                     gpu_sieve_accounted_extract_us(gpu_sieve));
+                                atomic_store(
+                                    &g_worker_stats[worker_id].sieve_resid_us,
+                                    gpu_sieve_accounted_residues_us(gpu_sieve));
                                 struct fused_flight_window *wv =
                                     &fl->wins[w_in];
                                 wv->nonce = nonce;
@@ -4277,6 +4297,7 @@ void worker_get_stats(uint32_t worker_id, struct worker_stats *stats) {
     stats->chain_rounds = atomic_load(&g_worker_stats[worker_id].chain_rounds);
     stats->sieve_mark_us = atomic_load(&g_worker_stats[worker_id].sieve_mark_us);
     stats->sieve_extract_us = atomic_load(&g_worker_stats[worker_id].sieve_extract_us);
+    stats->sieve_resid_us = atomic_load(&g_worker_stats[worker_id].sieve_resid_us);
 }
 
 /* Get pending gap from queue (thread-safe) */

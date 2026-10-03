@@ -42,6 +42,7 @@
 #include "gap_hunt.h"
 #include "stratum.h"
 #ifdef WITH_CUDA
+#include <cuda_runtime.h>
 #include "gpu/gpu_fermat.h"
 #endif
 
@@ -577,6 +578,34 @@ int main(int argc, char *argv[]) {
             return 0;
         }
     }
+
+#ifdef WITH_CUDA
+    /* Env-gated CUDA context flags (CUDA_SPEEDUP_REVIEW_2026-09-27 item #6):
+       ScheduleBlockingSync makes cudaEventSynchronize SLEEP instead of
+       spin-wait.  The default (ScheduleAuto) spin-waits while the process
+       has fewer threads than logical cores; at the production packing (one
+       worker per physical core, 4 of 8 threads) every waiting worker burns
+       a core the others need for their host work.  Must run before the
+       first CUDA call of the process (covers both --gap-hunt and mining).
+       A failure (context already created) is reported and ignored. */
+    {
+        const char *bs = getenv("CUDA_BLOCKING_SYNC");
+        if (bs && bs[0] && bs[0] != '0') {
+            cudaError_t ferr = cudaSetDeviceFlags(
+                cudaDeviceScheduleBlockingSync);
+            if (ferr != cudaSuccess) {
+                fprintf(stderr,
+                        "[Main] WARN: CUDA_BLOCKING_SYNC: "
+                        "cudaSetDeviceFlags failed (%s); continuing with "
+                        "the default sync mode\n",
+                        cudaGetErrorString(ferr));
+            } else {
+                printf("[Main] CUDA context flags: ScheduleBlockingSync "
+                       "(env CUDA_BLOCKING_SYNC)\n");
+            }
+        }
+    }
+#endif
 
     if (gap_hunt_enabled) {
         if (!crt_file) {
@@ -1593,21 +1622,27 @@ int main(int argc, char *argv[]) {
                           (double)stats.total_us_chain_gather * pct,
                           (double)stats.total_us_chain_mr * pct);
                   }
-                  if (stats.total_sieve_mark_us || stats.total_sieve_extract_us) {
+                  if (stats.total_sieve_mark_us || stats.total_sieve_extract_us ||
+                      stats.total_sieve_resid_us) {
                       /* GPU_SIEVE_TIMING=1: pure kernel time (CUDA events) of
                          the sieve stages, as a share of uptime.  Together
                          with GPU MR acc/wall this closes the GPU-busy
-                         budget: MR + mark + extract + idle = wall. */
+                         budget: MR + mark + extract + resid + idle = wall.
+                         resid = residue preparation (base mod p reduction;
+                         the step half is cached per run since 2026-10-03,
+                         see GPU_SIEVE_STEP_CACHE). */
                       double up_s = (double)(uptime > 0 ? uptime : 1);
                       double pct = 100.0 / (up_s * 1e6);
                       printf("  GPU kernel split: MR=%.1f%% mark=%.1f%% "
-                             "extract=%.1f%% of wall (mark=%.2f s, "
-                             "extract=%.2f s)\n",
+                             "extract=%.1f%% resid=%.1f%% of wall (mark=%.2f s, "
+                             "extract=%.2f s, resid=%.2f s)\n",
                           (double)stats.total_gpu_accounted_us * pct,
                           (double)stats.total_sieve_mark_us * pct,
                           (double)stats.total_sieve_extract_us * pct,
+                          (double)stats.total_sieve_resid_us * pct,
                           (double)stats.total_sieve_mark_us / 1e6,
-                          (double)stats.total_sieve_extract_us / 1e6);
+                          (double)stats.total_sieve_extract_us / 1e6,
+                          (double)stats.total_sieve_resid_us / 1e6);
                   }
                   if (stats.total_gpu_euler_skipped > 0) {
                       printf("  GPU Fermat: %" PRIu64 " Euler calls skipped (composite pre-filter)\n",

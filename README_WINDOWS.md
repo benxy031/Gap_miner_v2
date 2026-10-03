@@ -13,7 +13,8 @@ The build is therefore split along the existing plain-C GPU API
 | Part | Sources | Toolchain | Output |
 |---|---|---|---|
 | GPU | `new_src/gpu/gpu_fermat.cu`, `gpu_sieve.cu` | CUDA + MSVC (VS 2022) | `bin/gapgpu.dll` (exports in `windows/gapgpu.def`) |
-| Host | everything else | MSYS2 MINGW64 GCC (`Makefile.win`) | `bin/gapminer.exe` + tests, linked directly against `gapgpu.dll` |
+| Phase-0 GPU | `tools/phase0gpu_dll.cu` + shared `tools/*.cuh` headers | CUDA + MSVC (VS 2022) | `bin/phase0gpu.dll` (exports via `__declspec(dllexport)`, API `tools/phase0gpu_api.h`) |
+| Host | everything else | MSYS2 MINGW64 GCC (`Makefile.win`) | `bin/gapminer.exe` + tests + the Phase-0 host tools, linked directly against `gapgpu.dll` / `phase0gpu.dll` |
 
 The Linux build (`Makefile`) is unchanged.
 
@@ -36,6 +37,9 @@ Double-click `windows\build_all.bat` (or run it from `cmd`). It:
 
 1. builds `bin\gapgpu.dll` (`windows\build_gpu_dll.bat`, ~10-15 min the first
    time; objects are cached per arch/width in `build-win\`),
+1b. builds `bin\phase0gpu.dll` (`windows\build_phase0.bat`) - the Phase-0
+   kernels, see *Phase-0 toolkit* below (seconds, one .cu; cached per arch in
+   `build-win\gpu-phase0-<arch>`),
 2. builds `bin\gapminer.exe` and the tests with MinGW (`windows\build_host.sh`),
 3. runs the CPU tests and `test_gpu_fermat` / `test_gpu_sieve` / `test_gpu_resolve`.
    The CPU set includes `test_pow_q48` (Gapcoin Q48 proof-of-work arithmetic,
@@ -69,6 +73,39 @@ bin\gapminer.exe --host 127.0.0.1 --port 31397 --user USER --pass PASS ^
 
 `--threads` = number of GPUs (one worker per card). On Windows stdout is
 unbuffered, so redirecting it to a log file (`>> miner.log 2>&1`) keeps the log live.
+
+## Phase-0 toolkit on Windows
+
+The Phase-0 scanner family is part of the Windows build (binaries match the
+Linux ones; `README_PHASE0.md` is the operator manual):
+
+| binary | built by | links |
+|---|---|---|
+| `bin\phase0_scan_gpu.exe` | `Makefile.win` (MinGW g++) | `phase0gpu.dll`, cudart, GMP |
+| `bin\mr68_gpu.exe` | idem | `phase0gpu.dll`, cudart, GMP |
+| `bin\bench_p0sieve.exe` | idem | `phase0gpu.dll`, cudart |
+| `bin\phase0_scan.exe` | idem | GMP only (CPU reference, no CUDA) |
+| `bin\bench_fermat.exe` | idem | `gapgpu.dll` (GPU kernel throughput) |
+
+All five are produced by `build_all.bat` (and by `make -f Makefile.win all`);
+rebuild just them with `make -f Makefile.win phase0 tools`. Example run:
+
+```bat
+set PATH=%CD%\bin;C:\msys64\mingw64\bin;%PATH%
+bin\phase0_scan_gpu.exe --start 200000000000000000000 --length 1000000000000 --log phase0.log
+```
+
+**Why a second DLL:** MSVC - the only host compiler nvcc accepts - has no
+`__int128` and no POSIX threads, while the tools need pthreads + GMP. So all
+device code lives in `phase0gpu.dll` and the host programs are MinGW-built
+against the plain-C API `tools/phase0gpu_api.h` (`-DPHASE0_KERNEL_DLL`). The
+kernel sources are the same files as on Linux; the two 128-bit constructs
+(Perig's CIOS magic, the mr68 exponent shift register) are written portably and
+gated on Linux: `make bin/phase0_scan_gpu_split WITH_CUDA=1` builds the same
+split from the same sources, and its output on a fixed range must be
+byte-identical to `bin/phase0_scan_gpu` (see `README_PHASE0.md` section 5; also
+validated with the software `__int128` path forced via
+`-DP0_PERIG_U128_SHIM`).
 
 ## Windows-specific changes
 

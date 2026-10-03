@@ -218,7 +218,7 @@ static uint64_t g_j2_cap_hits = 0;
    the first version of that hook could dump every candidate of every window,
    which wrote 8.1 GB and took the editor down (2026-09-17).  A diagnostic must
    never be able to flood the terminal again. */
-#define GHDUMP_CAP 40000
+#define GHDUMP_CAP 300000
 static int g_jump = 0;         /* GAP_HUNT_JUMP env: Kehrig-style walk */
 /* Per-window chunk cap for the chain.  Default 32 (was 64): with a 64-window
    batch the round floor is amortized, so the optimum moves to the smaller
@@ -231,6 +231,15 @@ static int g_jump = 0;         /* GAP_HUNT_JUMP env: Kehrig-style walk */
    1903 (+12%), 1017/m10 603 -> 662 (+10%).  The optimum is flat 12..20 (as in
    the mining chain's own sweep); 8 and >=24 are worse. */
 #define GAP_HUNT_JUMP2_CHUNK_DEFAULT 16
+#define GAP_HUNT_PREFETCH_DEFAULT 20   /* windows/round of the next-flight
+                                          prefetch (0 = off, old serial
+                                          fill+scan).  2026-10-02 quantum
+                                          sweep, shift507, K=1024: m10
+                                          12->3604, 16->3700, 20->3741,
+                                          24->3632, 32->3437 win/s; m18
+                                          16->5488, 20->5581, 28->5572.
+                                          24+ overshoots the MR round (the
+                                          fill then EXTENDS the round). */
 static int g_jump2 = 1;        /* GAP_HUNT_JUMP2=0 restores the full scan */
 static int g_jump2_chunk = GAP_HUNT_JUMP2_CHUNK_DEFAULT;
 /* BEACON-style wave start (GAP_HUNT_JUMP2_WAVE): each window's scan tests
@@ -254,6 +263,14 @@ static uint64_t g_ht_setup, g_ht_mark, g_ht_extract, g_ht_submit, g_ht_process;
    jump2 chain actually submitted and in how many rounds (the two numbers that
    decide whether the walk is MR-throughput bound or round-latency bound). */
 static uint64_t g_j2_tests, g_j2_rounds;
+/* Per-phase breakdown of the chain's MR tests (diagnostic, GAP_HUNT_TIMING):
+   ff = FIND_FIRST sweeps, jb = JUMP_BACK slices, fe = FIND_END slices;
+   hops = primes found by the backward search, emits = reported pairs. */
+static uint64_t g_j2_t_ff, g_j2_t_jb, g_j2_t_fe;
+static uint64_t g_j2_hops, g_j2_emits;
+static uint64_t g_j2_jb_slices, g_j2_jb_ext;
+static uint64_t g_j2_pref_windows;   /* windows filled by the jump2 prefetch */
+static uint64_t g_rt_prefetch_us;    /* prefetch time inside rounds (diag)  */
 
 /* Round-internal split for the same diagnostic line: a chain round is
    gather -> submit -> collect, and at small chunks the FIXED part of a round
@@ -312,6 +329,18 @@ struct gh_ctx {
     uint64_t jump_thresh[GAP_HUNT_BATCH_MAX];
     uint64_t jump_gaps[GAP_HUNT_BATCH_MAX * GAP_HUNT_JUMP_CAP];
     uint32_t jump_n[GAP_HUNT_BATCH_MAX];
+    /* Residue amortization (GAP_HUNT_RESIDUE_INCR): the walk is CRT-periodic
+       (wb_{k+1} = wb_k + P), so the device base_mod_p array can be advanced
+       by ONE add per prime per window instead of a full limb reduction.
+       res_k/res_valid track which window the cached residues belong to; ANY
+       k gap (first fill, resume, jump) falls back to the full reduction. */
+    int residue_incr;
+    uint64_t residue_check;     /* verify every N incr windows (0 = off) */
+    uint64_t res_k;
+    int res_valid;
+    uint64_t res_windows;
+    uint64_t *p_limbs;          /* P limbs: the per-window CRT step */
+    uint64_t res_m_limit;       /* max folded m_steps (device limit) */
 };
 
 static void gh_batch_init(struct gh_batch *b) {
@@ -354,6 +383,268 @@ static uint32_t gh_jump2_find_q(struct gh_batch *b, uint32_t i, uint32_t p,
     return lo < b->count[i] ? lo : UINT32_MAX;
 }
 
+/* One window of a flight fill: mark + extract + per-window accounting.
+   Extracted VERBATIM from gh_batch_fill (P1 split, 2026-10-02) so the jump2
+   prefetch and the serial fill share one implementation; `cum_io` carries the
+   running candidate count (offset of this window's first candidate) and
+   `k` is the window's k.  Returns 1 on success, 0 on failure (fail-closed;
+   the failing check prints its own diagnostic). */
+static int gh_fill_window_step(struct gh_batch *b, int slot, uint32_t i,
+                               uint64_t k, struct gh_ctx *g, uint32_t *cum_io) {
+    uint64_t ht0 = g_host_timing ? gh_now_us() : 0;
+    b->base_k[i] = k;
+    mpz_set(g->bk, g->b0);
+    mpz_addmul_ui(g->bk, g->P, (uint64_t)k);
+    mpz_sub_ui(g->wb, g->bk, g->back_limit);
+    mpz_set(b->win_base[i], g->wb);
+    /* The CRT template prefilter assumes an EVEN base (even t -> even
+       value).  P is odd, so b_k alternates parity with k; for odd bases
+       the template's shortcut would kill odd interior primes, so the
+       prefilter is skipped there (mini-sieve alone, still exact). */
+    b->base_even[i] = (uint8_t)(mpz_odd_p(g->wb) ? 0 : 1);
+
+    memset(g->base_limbs, 0, (size_t)g->gpu_limbs * sizeof(uint64_t));
+    size_t exported = 0;
+    mpz_export(g->base_limbs, &exported, -1, sizeof(uint64_t), 0, 0,
+               g->wb);
+    if (exported > (size_t)g->gpu_limbs) {
+        fprintf(stderr,
+                "[GAP_HUNT] fill fail: base export %zu > %d limbs "
+                "(k=%llu i=%u)\n",
+                exported, g->gpu_limbs, (unsigned long long)k, i);
+        return 0;
+    }
+    uint64_t first_odd_offset = (g->base_limbs[0] & 1ULL) ? 0U : 1U;
+    uint64_t odd_size = 0;
+    if (g->interval > first_odd_offset)
+        odd_size = (g->interval - first_odd_offset + 1ULL) >> 1;
+
+    int buf = (int)(i & 1);
+    if (g_host_timing) {
+        uint64_t ht1 = gh_now_us();
+        g_ht_setup += ht1 - ht0;
+        ht0 = ht1;
+    }
+    /* Residue amortization (GAP_HUNT_RESIDUE_INCR): consecutive windows
+       differ by exactly P (wb_{k+1} = wb_k + P), so residues can be carried
+       instead of recomputed:
+         mode 2 (folded m-step): the cache stays anchored at res_k and the
+           mark kernels compute cache + m*step themselves - no residue
+           kernel per window at all; the full path re-anchors whenever m
+           would exceed the device's m limit (or on any k regression);
+         mode 1 (per-window step): the cache is advanced by ONE add per
+           prime per window (res_k tracks k).
+       Every other k (first window, resume from state, jump, re-fill) falls
+       back to the full reduction, so a desynced cache can only lose time,
+       never correctness; the optional GAP_HUNT_RESIDUE_CHECK still stops
+       the walk fail-closed on a detected desync. */
+    int mark_ok;
+    int used_mode = 0;          /* 0 = full, 1 = step, 2 = folded m */
+    uint64_t used_m = 0;
+    if (g->residue_incr >= 2 && g->res_valid && k >= g->res_k &&
+        (k - g->res_k) <= g->res_m_limit) {
+        used_m = k - g->res_k;
+        mark_ok = gpu_sieve_mark_from_base_mw(g->sieve, odd_size,
+                                              first_odd_offset, buf, used_m,
+                                              g->primes, g->inv_p,
+                                              g->prime_count, NULL, 0);
+        used_mode = 2;
+    } else if (g->residue_incr == 1 && g->res_valid &&
+               k == g->res_k + 1) {
+        mark_ok = gpu_sieve_mark_from_base_incr(g->sieve, odd_size,
+                                                first_odd_offset, buf,
+                                                g->primes, g->inv_p,
+                                                g->prime_count, NULL, 0);
+        used_mode = 1;
+    } else {
+        mark_ok = gpu_sieve_mark_from_base(g->sieve, odd_size,
+                                           first_odd_offset, g->base_limbs,
+                                           g->gpu_limbs, buf, g->primes,
+                                           g->inv_p, g->prime_count,
+                                           NULL, 0);
+    }
+    if (!mark_ok) {
+        g->res_valid = 0;   /* the cached residues may be half-advanced */
+        fprintf(stderr, "[GAP_HUNT] fill fail: mark "
+                "(k=%llu i=%u odd=%llu fo=%llu)\n",
+                (unsigned long long)k, i,
+                (unsigned long long)odd_size,
+                (unsigned long long)first_odd_offset);
+        return 0;
+    }
+    if (used_mode != 2) {
+        /* Modes 0/1 leave the cache corresponding to k itself; mode 2
+           leaves it anchored (m carries the difference). */
+        g->res_k = k;
+        g->res_valid = 1;
+    }
+    if (used_mode != 0 && g->residue_check) {
+        g->res_windows++;
+        if (g->res_windows >= g->residue_check) {
+            g->res_windows = 0;
+            uint64_t mismatches = 0;
+            if (!gpu_sieve_residues_check(g->sieve, g->base_limbs,
+                                          g->gpu_limbs, g->primes,
+                                          g->inv_p, g->prime_count,
+                                          used_m, &mismatches)) {
+                fprintf(stderr, "[GAP_HUNT] residue check call failed "
+                        "(k=%llu)\n", (unsigned long long)k);
+                g->res_valid = 0;
+                return 0;
+            }
+            if (mismatches != 0) {
+                fprintf(stderr,
+                        "[GAP_HUNT] RESIDUE DESYNC: %llu/%zu primes differ "
+                        "(k=%llu) - stopping fail-closed\n",
+                        (unsigned long long)mismatches, g->prime_count,
+                        (unsigned long long)k);
+                g->res_valid = 0;
+                return 0;
+            }
+        }
+    }
+
+    if (g_host_timing) {
+        uint64_t ht1 = gh_now_us();
+        g_ht_mark += ht1 - ht0;
+        ht0 = ht1;
+    }
+    uint64_t class_mask =
+        g->quarter ? halfclass_visible_mask() : UINT64_MAX;
+    /* The extract filter classes VALUES by (base + offset) mod 60 —
+       pass the real window-base residue, never 0. */
+    uint32_t base_mod60 = (uint32_t)mpz_fdiv_ui(g->wb, 60);
+    /* Extension band [tail_start, interval): extracted ALL-classes so
+       every prime there is a chain anchor (containers always exist). */
+    uint64_t lo_tail_odd = 0;
+    if (g->tail_start > first_odd_offset)
+        lo_tail_odd = (g->tail_start - first_odd_offset + 1ULL) >> 1;
+    if (lo_tail_odd > odd_size)
+        lo_tail_odd = odd_size;
+    if (!g->quarter)
+        lo_tail_odd = odd_size;   /* full-class: one whole-range pass */
+
+    uint64_t *d_cands = NULL;
+    unsigned int nc = 0;
+    if (!gpu_sieve_extract_pack_device_range_ex(
+            g->sieve, odd_size, first_odd_offset, 0, lo_tail_odd,
+            buf, slot, g->base_limbs, g->fermat_limbs, &d_cands,
+            b->win_off[i], &nc, base_mod60, class_mask,
+            g->region_start, (*cum_io))) {
+        fprintf(stderr, "[GAP_HUNT] fill fail: extract "
+                "(k=%llu i=%u lo_tail_odd=%llu)\n",
+                (unsigned long long)k, i,
+                (unsigned long long)lo_tail_odd);
+        return 0;
+    }
+    if ((uint64_t)nc > g->capacity) {
+        fprintf(stderr, "[GAP_HUNT] fill fail: nc=%u > capacity=%llu "
+                "(k=%llu i=%u)\n", nc,
+                (unsigned long long)g->capacity,
+                (unsigned long long)k, i);
+        return 0;
+    }
+    if ((*cum_io) + nc > g->cap) {
+        fprintf(stderr, "[GAP_HUNT] fill fail: cum=%u + nc=%u > %llu "
+                "(k=%llu i=%u)\n", (*cum_io), nc,
+                (unsigned long long)g->cap,
+                (unsigned long long)k, i);
+        return 0;
+    }
+    b->count[i] = nc;
+    b->cum[i] = (*cum_io);
+    (*cum_io) += nc;
+
+    if (g->quarter && lo_tail_odd < odd_size) {
+        unsigned int nc2 = 0;
+        if (!gpu_sieve_extract_pack_device_range_ex(
+                g->sieve, odd_size, first_odd_offset, lo_tail_odd,
+                odd_size, buf, slot, g->base_limbs, g->fermat_limbs,
+                &d_cands, b->win_off[i] + nc, &nc2,
+                base_mod60, UINT64_MAX, 0, (*cum_io)))
+            return 0;
+        if ((uint64_t)(nc + nc2) > g->capacity)
+            return 0;
+        if ((*cum_io) + nc2 > g->cap)
+            return 0;
+        b->count[i] = nc + nc2;
+        (*cum_io) += nc2;
+    }
+    if (g_host_timing) {
+        uint64_t ht1 = gh_now_us();
+        g_ht_extract += ht1 - ht0;
+        ht0 = ht1;
+    }
+    return 1;
+}
+
+/* Flight-fill finalization (shared by the serial fill and the prefetch). */
+static void gh_fill_finalize(struct gh_batch *b, int slot, uint32_t cum) {
+    b->cum[g_batch] = cum;
+    b->n_windows = (uint32_t)g_batch;
+    b->total = cum;
+    b->slot = slot;
+}
+
+/* Serial fill of a whole flight (mark + extract, NO scan).  Split out of the
+   old gh_batch_fill so the jump2 prefetch can fill the NEXT flight in quanta
+   while the current one scans. */
+static int gh_fill_only(struct gh_batch *b, int slot, uint64_t k0,
+                        struct gh_ctx *g) {
+    uint32_t cum = 0;
+    for (uint32_t i = 0; i < (uint32_t)g_batch; i++) {
+        if (!gh_fill_window_step(b, slot, i, k0 + i, g, &cum))
+            return 0;
+    }
+    gh_fill_finalize(b, slot, cum);
+    return 1;
+}
+
+/* ── P1: next-flight fill prefetch (2026-10-02) ─────────────────────────
+   Measured motivation: at shift507 m10 the per-window cost SUMD to
+   fill ~99 us + scan ~194 us (host us/window: mark+extract; the 'submit'
+   field is the whole scan), i.e. gh_batch_fill serialized the two.  Filling
+   the NEXT flight in bounded quanta between the current round's MR submit
+   and its blocking collect hides the fill behind the running MR kernel:
+   the fill's mark/extract use the sieve stream + its own bitmap/cand_buf
+   (buf = i&1, cand_buf = the TARGET slot), the MR runs on the current
+   flight's fermat slot stream -- no shared buffer.  GAP_HUNT_PREFETCH =
+   windows per round (default 16, 0 = off -> exact old serial behavior).
+   Only active on the jump2 path; every other path is untouched. */
+struct gh_prefetch {
+    struct gh_batch *b;      /* target flight                        */
+    int slot;                /* its fermat/sieve slot                */
+    uint64_t k0;             /* first k of the target flight         */
+    uint32_t next_i;         /* next window index to fill            */
+    uint32_t cum;            /* running candidate count              */
+    int done;                /* all windows filled + finalized       */
+    int failed;              /* a step failed (fail-closed)          */
+};
+static struct gh_prefetch g_pref;
+static int g_pref_qty = GAP_HUNT_PREFETCH_DEFAULT;
+
+/* Fill up to g_pref_qty windows of the prefetch target.  Returns 1 while
+   healthy (done included), 0 on failure. */
+static int gh_prefetch_step(struct gh_prefetch *pf, struct gh_ctx *g) {
+    if (!pf->b || pf->done || pf->failed)
+        return !pf->failed;
+    uint32_t q = (uint32_t)g_pref_qty;
+    while (q-- > 0 && pf->next_i < (uint32_t)g_batch) {
+        if (!gh_fill_window_step(pf->b, pf->slot, pf->next_i,
+                                 pf->k0 + pf->next_i, g, &pf->cum)) {
+            pf->failed = 1;
+            return 0;
+        }
+        pf->next_i++;
+        g_j2_pref_windows++;
+    }
+    if (pf->next_i >= (uint32_t)g_batch) {
+        gh_fill_finalize(pf->b, pf->slot, pf->cum);
+        pf->done = 1;
+    }
+    return 1;
+}
+
 /* ── Jump2: chunk-parallel backward search (Kehrig-exact, latency-free) ───
    Same chain semantics as cgbn_jump_scan_kernel_t (parity-exact), but every
    step tests a CHUNK of candidates batched across all windows in one tight
@@ -362,7 +653,7 @@ static uint32_t gh_jump2_find_q(struct gh_batch *b, uint32_t i, uint32_t p,
 enum { J2_FIND_FIRST = 0, J2_JUMP_BACK = 1, J2_FIND_END = 2, J2_DONE = 3 };
 
 static int gh_jump2_scan(struct gh_batch *b, int slot, struct gh_ctx *g,
-                         uint8_t *flags) {
+                         uint8_t *flags, struct gh_prefetch *pf) {
     const uint32_t C = (uint32_t)g->jump2_chunk;
     const uint32_t K = b->n_windows;
     if (K == 0)
@@ -418,8 +709,18 @@ static int gh_jump2_scan(struct gh_batch *b, int slot, struct gh_ctx *g,
             lo[i] = on ? clo[i] : 0;
             hi[i] = on ? chi[i] : 0;
             dcum[i] = total;
-            if (on)
-                total += chi[i] - clo[i];
+            if (on) {
+                uint32_t n = chi[i] - clo[i];
+                total += n;
+                if (phase[i] == J2_FIND_FIRST) {
+                    g_j2_t_ff += n;
+                } else if (phase[i] == J2_JUMP_BACK) {
+                    g_j2_t_jb += n;
+                    g_j2_jb_slices++;
+                } else {
+                    g_j2_t_fe += n;
+                }
+            }
         }
         if (total > 0) {
             uint32_t gathered = 0;
@@ -447,6 +748,17 @@ static int gh_jump2_scan(struct gh_batch *b, int slot, struct gh_ctx *g,
             uint64_t rt2 = g_host_timing ? gh_now_us() : 0;
             g_j2_tests += total;
             g_j2_rounds++;
+            /* P1 (2026-10-02): fill the NEXT flight's mark/extract HERE --
+               between the MR submit and the blocking collect -- so the fill
+               overlaps this round's MR kernel instead of serializing with
+               the scan (measured: fill and scan SUMMED before). */
+            if (pf && !pf->done && !pf->failed) {
+                uint64_t p0 = g_host_timing ? gh_now_us() : 0;
+                gh_prefetch_step(pf, g);
+                if (g_host_timing)
+                    g_rt_prefetch_us += gh_now_us() - p0;
+            }
+            uint64_t rt2b = g_host_timing ? gh_now_us() : 0;
             if (gpu_fermat_collect(g->fermat, slot, flags,
                                    (size_t)total) < 0) {
                 fprintf(stderr, "[GAP_HUNT] jump2 collect fail: total=%u\n",
@@ -457,7 +769,7 @@ static int gh_jump2_scan(struct gh_batch *b, int slot, struct gh_ctx *g,
                 uint64_t rt3 = gh_now_us();
                 g_rt_gather_us += rt1 - rt0;
                 g_rt_submit_us += rt2 - rt1;
-                g_rt_collect_us += rt3 - rt2;
+                g_rt_collect_us += rt3 - rt2b;
             }
         }
 
@@ -500,6 +812,7 @@ static int gh_jump2_scan(struct gh_batch *b, int slot, struct gh_ctx *g,
                 for (int32_t j = (int32_t)n - 1; j >= 0; j--)
                     if (fl[j]) { found = base + (uint32_t)j; break; }
                 if (found != UINT32_MAX) {
+                    g_j2_hops++;
                     pidx[i] = found;
                     qidx[i] = gh_jump2_find_q(b, i, found, thr[i]);
                     if (qidx[i] == UINT32_MAX) {
@@ -531,6 +844,7 @@ static int gh_jump2_scan(struct gh_batch *b, int slot, struct gh_ctx *g,
                         chi[i] = old_lo;
                         clo[i] = new_lo;
                         wcur[i] = (wcur[i] * 2 < C) ? wcur[i] * 2 : C;
+                        g_j2_jb_ext++;
                     }
                 }
             } else { /* J2_FIND_END */
@@ -556,6 +870,7 @@ static int gh_jump2_scan(struct gh_batch *b, int slot, struct gh_ctx *g,
                     b->jump_e[i][b->jump_n[i]] =
                         (uint32_t)b->win_off[i][found];
                     b->jump_n[i]++;
+                    g_j2_emits++;
                     pidx[i] = found;
                     qidx[i] = gh_jump2_find_q(b, i, found, thr[i]);
                     if (qidx[i] == UINT32_MAX) {
@@ -587,138 +902,15 @@ static int gh_jump2_scan(struct gh_batch *b, int slot, struct gh_ctx *g,
 
 static int gh_batch_fill(struct gh_batch *b, int slot, uint64_t k0,
                          struct gh_ctx *g, uint8_t *flags) {
-    uint32_t cum = 0;
-    for (uint32_t i = 0; i < (uint32_t)g_batch; i++) {
-        uint64_t ht0 = g_host_timing ? gh_now_us() : 0;
-        uint64_t k = k0 + i;
-        b->base_k[i] = k;
-        mpz_set(g->bk, g->b0);
-        mpz_addmul_ui(g->bk, g->P, (uint64_t)k);
-        mpz_sub_ui(g->wb, g->bk, g->back_limit);
-        mpz_set(b->win_base[i], g->wb);
-        /* The CRT template prefilter assumes an EVEN base (even t -> even
-           value).  P is odd, so b_k alternates parity with k; for odd bases
-           the template's shortcut would kill odd interior primes, so the
-           prefilter is skipped there (mini-sieve alone, still exact). */
-        b->base_even[i] = (uint8_t)(mpz_odd_p(g->wb) ? 0 : 1);
-
-        memset(g->base_limbs, 0, (size_t)g->gpu_limbs * sizeof(uint64_t));
-        size_t exported = 0;
-        mpz_export(g->base_limbs, &exported, -1, sizeof(uint64_t), 0, 0,
-                   g->wb);
-        if (exported > (size_t)g->gpu_limbs) {
-            fprintf(stderr,
-                    "[GAP_HUNT] fill fail: base export %zu > %d limbs "
-                    "(k=%llu i=%u)\n",
-                    exported, g->gpu_limbs, (unsigned long long)k, i);
-            return 0;
-        }
-        uint64_t first_odd_offset = (g->base_limbs[0] & 1ULL) ? 0U : 1U;
-        uint64_t odd_size = 0;
-        if (g->interval > first_odd_offset)
-            odd_size = (g->interval - first_odd_offset + 1ULL) >> 1;
-
-        int buf = (int)(i & 1);
-        if (g_host_timing) {
-            uint64_t ht1 = gh_now_us();
-            g_ht_setup += ht1 - ht0;
-            ht0 = ht1;
-        }
-        if (!gpu_sieve_mark_from_base(g->sieve, odd_size, first_odd_offset,
-                                      g->base_limbs, g->gpu_limbs, buf,
-                                      g->primes, g->inv_p, g->prime_count,
-                                      NULL, 0)) {
-            fprintf(stderr, "[GAP_HUNT] fill fail: mark "
-                    "(k=%llu i=%u odd=%llu fo=%llu)\n",
-                    (unsigned long long)k, i,
-                    (unsigned long long)odd_size,
-                    (unsigned long long)first_odd_offset);
-            return 0;
-        }
-
-        if (g_host_timing) {
-            uint64_t ht1 = gh_now_us();
-            g_ht_mark += ht1 - ht0;
-            ht0 = ht1;
-        }
-        uint64_t class_mask =
-            g->quarter ? halfclass_visible_mask() : UINT64_MAX;
-        /* The extract filter classes VALUES by (base + offset) mod 60 —
-           pass the real window-base residue, never 0. */
-        uint32_t base_mod60 = (uint32_t)mpz_fdiv_ui(g->wb, 60);
-        /* Extension band [tail_start, interval): extracted ALL-classes so
-           every prime there is a chain anchor (containers always exist). */
-        uint64_t lo_tail_odd = 0;
-        if (g->tail_start > first_odd_offset)
-            lo_tail_odd = (g->tail_start - first_odd_offset + 1ULL) >> 1;
-        if (lo_tail_odd > odd_size)
-            lo_tail_odd = odd_size;
-        if (!g->quarter)
-            lo_tail_odd = odd_size;   /* full-class: one whole-range pass */
-
-        uint64_t *d_cands = NULL;
-        unsigned int nc = 0;
-        if (!gpu_sieve_extract_pack_device_range_ex(
-                g->sieve, odd_size, first_odd_offset, 0, lo_tail_odd,
-                buf, slot, g->base_limbs, g->fermat_limbs, &d_cands,
-                b->win_off[i], &nc, base_mod60, class_mask,
-                g->region_start, cum)) {
-            fprintf(stderr, "[GAP_HUNT] fill fail: extract "
-                    "(k=%llu i=%u lo_tail_odd=%llu)\n",
-                    (unsigned long long)k, i,
-                    (unsigned long long)lo_tail_odd);
-            return 0;
-        }
-        if ((uint64_t)nc > g->capacity) {
-            fprintf(stderr, "[GAP_HUNT] fill fail: nc=%u > capacity=%llu "
-                    "(k=%llu i=%u)\n", nc,
-                    (unsigned long long)g->capacity,
-                    (unsigned long long)k, i);
-            return 0;
-        }
-        if (cum + nc > g->cap) {
-            fprintf(stderr, "[GAP_HUNT] fill fail: cum=%u + nc=%u > %llu "
-                    "(k=%llu i=%u)\n", cum, nc,
-                    (unsigned long long)g->cap,
-                    (unsigned long long)k, i);
-            return 0;
-        }
-        b->count[i] = nc;
-        b->cum[i] = cum;
-        cum += nc;
-
-        if (g->quarter && lo_tail_odd < odd_size) {
-            unsigned int nc2 = 0;
-            if (!gpu_sieve_extract_pack_device_range_ex(
-                    g->sieve, odd_size, first_odd_offset, lo_tail_odd,
-                    odd_size, buf, slot, g->base_limbs, g->fermat_limbs,
-                    &d_cands, b->win_off[i] + nc, &nc2,
-                    base_mod60, UINT64_MAX, 0, cum))
-                return 0;
-            if ((uint64_t)(nc + nc2) > g->capacity)
-                return 0;
-            if (cum + nc2 > g->cap)
-                return 0;
-            b->count[i] = nc + nc2;
-            cum += nc2;
-        }
-        if (g_host_timing) {
-            uint64_t ht1 = gh_now_us();
-            g_ht_extract += ht1 - ht0;
-            ht0 = ht1;
-        }
-    }
-    b->cum[g_batch] = cum;
-    b->n_windows = (uint32_t)g_batch;
-    b->total = cum;
-    b->slot = slot;
+    if (!gh_fill_only(b, slot, k0, g))
+        return 0;
     uint64_t ht_s = g_host_timing ? gh_now_us() : 0;
-    if (cum == 0)
+    if (b->total == 0)
         return 1;               /* nothing to MR-test; process as empty */
     if (g->jump2) {
         /* Chunk-parallel backward search: exact Kehrig chain semantics but
            each step is one batched MR round across all windows. */
-        if (!gh_jump2_scan(b, slot, g, flags)) {
+        if (!gh_jump2_scan(b, slot, g, flags, NULL)) {
             fprintf(stderr, "[GAP_HUNT] fill fail: jump2 scan (k0=%llu)\n",
                     (unsigned long long)k0);
             return 0;
@@ -766,9 +958,9 @@ static int gh_batch_fill(struct gh_batch *b, int slot, uint64_t k0,
         return 1;
     }
     uint64_t *d_batch = gpu_sieve_candidate_buffer(g->sieve, slot);
-    if (gpu_fermat_submit_device(g->fermat, slot, d_batch, (size_t)cum) != 0) {
+    if (gpu_fermat_submit_device(g->fermat, slot, d_batch, (size_t)b->total) != 0) {
         fprintf(stderr, "[GAP_HUNT] fill fail: fermat submit "
-                "(slot=%d cum=%u k0=%llu)\n", slot, cum,
+                "(slot=%d cum=%u k0=%llu)\n", slot, b->total,
                 (unsigned long long)k0);
         return 0;
     }
@@ -847,24 +1039,34 @@ static void gh_batch_process(struct gh_batch *b, const uint8_t *flags,
         *have_last = 0;
         uint64_t prev_off = 0;
         /* Bounded dump hook (diagnostics only).  GHDBG_DUMP_K=<k> writes EVERY
-           candidate of that ONE window (index, offset, MR verdict) into
-           GHDBG_DUMP_FILE (default /tmp/ghdump_<k>.txt), hard-capped at
-           GHDUMP_CAP lines.  That is what a missed gap must be diagnosed
-           with: is the endpoint absent from the candidate list, or present
-           with a wrong flag? */
+           candidate (index, offset, MR verdict) of windows k .. k+RANGE-1
+           (GHDBG_DUMP_RANGE, default 1) into GHDBG_DUMP_FILE (default
+           /tmp/ghdump_<k>.txt), hard-capped at GHDUMP_CAP lines PER WINDOW.
+           That is what a missed gap must be diagnosed with: is the endpoint
+           absent from the candidate list, or present with a wrong flag?
+           A range > 1 feeds offline chain simulations with a real corpus. */
         const char *dump_k_env = getenv("GHDBG_DUMP_K");
         FILE *dump_fp = NULL;
         long dump_lines = 0;
+        unsigned long long dump_range = 1;
+        if (dump_k_env && dump_k_env[0]) {
+            const char *dr = getenv("GHDBG_DUMP_RANGE");
+            if (dr && dr[0]) {
+                dump_range = strtoull(dr, NULL, 10);
+                if (dump_range < 1)
+                    dump_range = 1;
+            }
+        }
         if (dump_k_env && dump_k_env[0] &&
-            (unsigned long long)b->base_k[i] ==
-                strtoull(dump_k_env, NULL, 10)) {
+            b->base_k[i] >= strtoull(dump_k_env, NULL, 10) &&
+            b->base_k[i] < strtoull(dump_k_env, NULL, 10) + dump_range) {
             const char *df = getenv("GHDBG_DUMP_FILE");
             char dpath[512];
             if (!df || !df[0]) {
                 snprintf(dpath, sizeof(dpath), "/tmp/ghdump_%s.txt", dump_k_env);
                 df = dpath;
             }
-            dump_fp = fopen(df, "w");
+            dump_fp = fopen(df, "a");
             if (dump_fp)
                 fprintf(dump_fp, "[GHDUMP] win k=%llu count=%u\n",
                         (unsigned long long)b->base_k[i], b->count[i]);
@@ -1057,6 +1259,42 @@ int gap_hunt_run(const struct gap_hunt_config *cfg) {
             int w = atoi(j2w);
             if (w >= 0 && w <= 512)
                 g_jump2_wave = w;
+        }
+        /* GAP_HUNT_PREFETCH = windows of the NEXT flight filled per round
+           (0 disables -> the old serial fill+scan). */
+        const char *j2p = getenv("GAP_HUNT_PREFETCH");
+        if (j2p && j2p[0]) {
+            int pp = atoi(j2p);
+            if (pp >= 0 && pp <= 512)
+                g_pref_qty = pp;
+        }
+    }
+
+    /* GAP_HUNT_RESIDUE_INCR = amortize base mod p across the CRT-periodic
+       walk.  Values: 0 = off (full reduction per window); 1 = per-window
+       step (one add per prime per window); 2 = folded m-step (WS-A2: the
+       cache stays anchored and the mark kernels compute cache + m*step
+       themselves - no residue kernel per window; re-anchored automatically
+       when m would exceed the device limit).  DEFAULT 2 since 2026-10-03:
+       byte-parity proven across modes 0/1/2 and mode 2 vs mode 1 measured
+       +2.3% at 1784/m21 32M (wash elsewhere, never negative); it is also
+       what makes the deep sieve pay (+7.6% at 32M on 1784 vs the full
+       path).
+       GAP_HUNT_RESIDUE_CHECK = recompute+compare every N amortized windows
+       as a desync guard (stops the walk fail-closed on any mismatch);
+       default OFF (debug/soak only). */
+    int residue_incr = 2;
+    uint64_t residue_check = 0;
+    {
+        const char *ri = getenv("GAP_HUNT_RESIDUE_INCR");
+        if (ri && ri[0]) {
+            int v = atoi(ri);
+            if (v >= 0 && v <= 2) residue_incr = v;
+        }
+        const char *rc = getenv("GAP_HUNT_RESIDUE_CHECK");
+        if (rc && rc[0]) {
+            long v = strtol(rc, NULL, 10);
+            if (v > 0) residue_check = (uint64_t)v;
         }
     }
 
@@ -1320,6 +1558,42 @@ int gap_hunt_run(const struct gap_hunt_config *cfg) {
         return 1;
     }
 
+    /* Residue amortization init (plan WS-A): export P once and cache
+       step_mod_p = P mod p on the device.  Any failure disables the mode
+       and leaves the walk on the proven full per-window reduction. */
+    uint64_t *p_limbs = NULL;
+    uint64_t res_m_limit = 0;
+    if (residue_incr) {
+        size_t pbits = mpz_sizeinbase(P, 2);
+        size_t plimbs = (pbits + 63U) / 64U;
+        if (plimbs < 1) plimbs = 1;
+        if (plimbs <= (size_t)gpu_limbs) {
+            p_limbs = (uint64_t *)calloc((size_t)gpu_limbs,
+                                         sizeof(uint64_t));
+        }
+        if (p_limbs) {
+            size_t pexp = 0;
+            mpz_export(p_limbs, &pexp, -1, sizeof(uint64_t), 0, 0, P);
+        }
+        if (!p_limbs) {
+            fprintf(stderr, "[GAP_HUNT] residue incr disabled: P needs "
+                    "%zu > %d limbs\n", plimbs, gpu_limbs);
+            residue_incr = 0;
+        } else if (!gpu_sieve_set_residue_step(gpu_sieve, p_limbs,
+                                               gpu_limbs,
+                                               sieve.small_primes,
+                                               sieve.inv_p,
+                                               sieve.small_primes_count)) {
+            fprintf(stderr, "[GAP_HUNT] residue incr disabled: "
+                    "gpu_sieve_set_residue_step failed\n");
+            free(p_limbs);
+            p_limbs = NULL;
+            residue_incr = 0;
+        } else {
+            res_m_limit = gpu_sieve_residue_m_limit(gpu_sieve);
+        }
+    }
+
     uint64_t k = 0;
     int have_last = 0;
     /* last_prime is saved in the state file only for diagnostics; it is
@@ -1362,6 +1636,8 @@ int gap_hunt_run(const struct gap_hunt_config *cfg) {
             "jump2=%d "
             "jump2_chunk=%d "
             "jump2_wave=%d "
+            "prefetch=%d "
+            "residue_incr=%d "
             "kmax=%llu min_merit=%.6f "
             "k0=%llu device=%d\n",            rt.shift, rt.n_primes,
             (double)mpz_sizeinbase(P, 2),
@@ -1379,7 +1655,8 @@ int gap_hunt_run(const struct gap_hunt_config *cfg) {
                                  (uint64_t)gpu_fermat_get_limbs(fermat) * 8U /
                                  1000000U),
             g_quarter,
-            g_jump, g_jump2, g_jump2_chunk, g_jump2_wave,
+            g_jump, g_jump2, g_jump2_chunk, g_jump2_wave, g_pref_qty,
+            residue_incr,
             (unsigned long long)g_kmax, cfg->min_merit,
             (unsigned long long)k, cfg->device);
 
@@ -1423,6 +1700,7 @@ int gap_hunt_run(const struct gap_hunt_config *cfg) {
         stage_timing = 1;
     }
     uint64_t acc_mark_prev = 0, acc_ext_prev = 0, acc_mr_prev = 0;
+    uint64_t acc_res_prev = 0;
     if (stage_timing) {
         acc_mark_prev = gpu_sieve_accounted_mark_us(gpu_sieve);
         acc_ext_prev = gpu_sieve_accounted_extract_us(gpu_sieve);
@@ -1462,6 +1740,10 @@ int gap_hunt_run(const struct gap_hunt_config *cfg) {
     g.jump2 = g_jump2;
     g.jump2_chunk = g_jump2_chunk;
     g.min_merit = cfg->min_merit;
+    g.residue_incr = residue_incr;
+    g.residue_check = residue_check;
+    g.p_limbs = p_limbs;
+    g.res_m_limit = res_m_limit;
     g.region_start = g_quarter ? back_limit : 0;
     g.tail_start = back_limit + rt.window;
     g.owned_limit = interval;   /* the whole scan is ours */
@@ -1507,8 +1789,68 @@ int gap_hunt_run(const struct gap_hunt_config *cfg) {
         }
 
         /* Refill and resubmit this flight so it is in flight while the other
-           is collected next; empty batches (cum==0) process inline. */
-        if (!g_stop && !(g_kmax && next_k >= g_kmax)) {
+           is collected next; empty batches (cum==0) process inline.
+           P1 (2026-10-02): on the jump2 path the NEXT flight is filled in
+           bounded quanta between this flight's MR submit and collect (see
+           gh_jump2_scan), so fill and scan stop serializing.  GAP_HUNT_
+           PREFETCH=0 restores the old serial fill+scan. */
+        if (g.jump2) {
+            int filled_now = 0;
+            if (g_pref.b == fl) {
+                /* Prefetched while the previous flight scanned. */
+                while (!g_pref.done && !g_pref.failed)
+                    gh_prefetch_step(&g_pref, &g);
+                if (g_pref.failed)
+                    break;      /* the failing step printed the reason */
+                g_pref.b = NULL;
+                filled_now = 1;
+            } else if (!g_stop && !(g_kmax && next_k >= g_kmax)) {
+                if (!gh_fill_only(fl, turn, next_k, &g)) {
+                    fprintf(stderr,
+                            "[GAP_HUNT] batch fill failed (k=%llu)\n",
+                            (unsigned long long)next_k);
+                    break;
+                }
+                next_k += (uint64_t)g_batch;
+                filled_now = 1;
+            } else if (!g_pref.b && A.n_windows == 0 && B.n_windows == 0) {
+                g_stop = 1;     /* KMAX reached and both flights drained */
+            }
+            struct gh_prefetch *pf = NULL;
+            if (filled_now && !g_stop && g_pref_qty > 0 &&
+                !(g_kmax && next_k >= g_kmax)) {
+                g_pref.b = fls[turn ^ 1];
+                g_pref.slot = turn ^ 1;
+                g_pref.k0 = next_k;
+                g_pref.next_i = 0;
+                g_pref.cum = 0;
+                g_pref.done = 0;
+                g_pref.failed = 0;
+                next_k += (uint64_t)g_batch;
+                pf = &g_pref;
+            }
+            if (filled_now) {
+                if (fl->total > 0 &&
+                    !gh_jump2_scan(fl, turn, &g, flags, pf)) {
+                    fprintf(stderr,
+                            "[GAP_HUNT] batch fill failed (k=%llu)\n",
+                            (unsigned long long)fl->base_k[0]);
+                    break;
+                }
+                if (pf && !g_pref.done) {
+                    /* Empty flight: no rounds to hide the prefetch behind;
+                       finish it serially (rare, keeps the pipeline simple). */
+                    while (!g_pref.done && !g_pref.failed)
+                        gh_prefetch_step(&g_pref, &g);
+                    if (g_pref.failed)
+                        break;
+                }
+                gh_batch_process(fl, flags, cfg, &g, &windows,
+                                 &gaps_reported, &best_merit, out,
+                                 p1, p2, last_prime, &have_last);
+                fl->n_windows = 0;
+            }
+        } else if (!g_stop && !(g_kmax && next_k >= g_kmax)) {
             if (!gh_batch_fill(fl, turn, next_k, &g, flags)) {
                 fprintf(stderr, "[GAP_HUNT] batch fill failed (k=%llu)\n",
                         (unsigned long long)next_k);
@@ -1552,6 +1894,13 @@ int gap_hunt_run(const struct gap_hunt_config *cfg) {
                 k_safe = A.base_k[0];
             if (B.active && B.base_k[0] < k_safe)
                 k_safe = B.base_k[0];
+            /* P1: a prefetched-but-unscanned flight is FILLED yet its windows
+               are not processed (not counted in `windows`): after a hard kill
+               it must be redone, so the watermark is its k0. */
+            if (g.jump2 && g_pref.b &&
+                (g_pref.next_i > 0 || g_pref.done) &&
+                g_pref.k0 < k_safe)
+                k_safe = g_pref.k0;
             if (getenv("GAPDEBUG"))
                 fprintf(stderr, "[GAPDEBUG] watermark next_k=%llu "
                         "A(act=%d n=%u k0=%llu) B(act=%d n=%u k0=%llu) "
@@ -1577,24 +1926,30 @@ int gap_hunt_run(const struct gap_hunt_config *cfg) {
                 uint64_t dw = dw_tick;
                 uint64_t mark_now = gpu_sieve_accounted_mark_us(gpu_sieve);
                 uint64_t ext_now = gpu_sieve_accounted_extract_us(gpu_sieve);
+                uint64_t res_now = gpu_sieve_accounted_residues_us(gpu_sieve);
                 uint64_t mr_now = gpu_fermat_accounted_us(fermat);
                 double per_win = 1e6 / (win_s_now > 0.0 ? win_s_now : 1.0);
                 double m_us = dw ? (double)(mark_now - acc_mark_prev) / (double)dw : 0.0;
                 double e_us = dw ? (double)(ext_now - acc_ext_prev) / (double)dw : 0.0;
+                double s_us = dw ? (double)(res_now - acc_res_prev) / (double)dw : 0.0;
                 double r_us = dw ? (double)(mr_now - acc_mr_prev) / (double)dw : 0.0;
                 fprintf(stderr,
                         "[GAP_HUNT] stage us/window: total=%.0f mark=%.2f "
-                        "extract=%.2f mr=%.2f (mark=%.0f%% extract=%.0f%% "
-                        "mr=%.0f%%; totals mark=%llu extract=%llu mr=%llu us)\n",
-                        per_win, m_us, e_us, r_us,
+                        "extract=%.2f resid=%.2f mr=%.2f (mark=%.0f%% "
+                        "extract=%.0f%% resid=%.0f%% mr=%.0f%%; totals "
+                        "mark=%llu extract=%llu resid=%llu mr=%llu us)\n",
+                        per_win, m_us, e_us, s_us, r_us,
                         per_win > 0 ? 100.0 * m_us / per_win : 0.0,
                         per_win > 0 ? 100.0 * e_us / per_win : 0.0,
+                        per_win > 0 ? 100.0 * s_us / per_win : 0.0,
                         per_win > 0 ? 100.0 * r_us / per_win : 0.0,
                         (unsigned long long)mark_now,
                         (unsigned long long)ext_now,
+                        (unsigned long long)res_now,
                         (unsigned long long)mr_now);
                 acc_mark_prev = mark_now;
                 acc_ext_prev = ext_now;
+                acc_res_prev = res_now;
                 acc_mr_prev = mr_now;
             }
             if (g_host_timing) {
@@ -1621,23 +1976,46 @@ int gap_hunt_run(const struct gap_hunt_config *cfg) {
                 uint64_t rounds_tick = g_j2_rounds;
                 fprintf(stderr,
                         "[GAP_HUNT] chain: tests/window=%.1f "
-                        "rounds/1k-win=%.1f (jump2 only)\n",
+                        "(ff=%.1f jb=%.1f fe=%.1f) "
+                        "rounds/1k-win=%.1f prefetch/1k-win=%.1f "
+                        "hops/1k=%.1f emits/1k=%.1f "
+                        "jb-slices/hop=%.2f jb-tests/slice=%.1f ext/hop=%.2f "
+                        "(jump2 only)\n",
                         dw ? (double)g_j2_tests / (double)dw : 0.0,
-                        dw ? 1000.0 * (double)rounds_tick / (double)dw : 0.0);
+                        dw ? (double)g_j2_t_ff / (double)dw : 0.0,
+                        dw ? (double)g_j2_t_jb / (double)dw : 0.0,
+                        dw ? (double)g_j2_t_fe / (double)dw : 0.0,
+                        dw ? 1000.0 * (double)rounds_tick / (double)dw : 0.0,
+                        dw ? 1000.0 * (double)g_j2_pref_windows / (double)dw : 0.0,
+                        dw ? 1000.0 * (double)g_j2_hops / (double)dw : 0.0,
+                        dw ? 1000.0 * (double)g_j2_emits / (double)dw : 0.0,
+                        g_j2_hops ? (double)g_j2_jb_slices / (double)g_j2_hops : 0.0,
+                        g_j2_jb_slices ? (double)g_j2_t_jb / (double)g_j2_jb_slices : 0.0,
+                        g_j2_hops ? (double)g_j2_jb_ext / (double)g_j2_hops : 0.0);
                 if (g_host_timing && rounds_tick > 0) {
                     fprintf(stderr,
                             "[GAP_HUNT] round us (mean of %llu): "
-                            "gather=%.1f submit=%.1f collect=%.1f total=%.1f\n",
+                            "gather=%.1f submit=%.1f collect=%.1f "
+                            "prefetch=%.1f total=%.1f\n",
                             (unsigned long long)rounds_tick,
                             (double)g_rt_gather_us / (double)rounds_tick,
                             (double)g_rt_submit_us / (double)rounds_tick,
                             (double)g_rt_collect_us / (double)rounds_tick,
+                            (double)g_rt_prefetch_us / (double)rounds_tick,
                             (double)(g_rt_gather_us + g_rt_submit_us +
-                                     g_rt_collect_us) / (double)rounds_tick);
+                                     g_rt_collect_us + g_rt_prefetch_us) /
+                                (double)rounds_tick);
                 }
                 g_j2_tests = 0;
                 g_j2_rounds = 0;
+                g_j2_pref_windows = 0;
+                g_j2_t_ff = g_j2_t_jb = g_j2_t_fe = 0;
+                g_j2_hops = 0;
+                g_j2_emits = 0;
+                g_j2_jb_slices = 0;
+                g_j2_jb_ext = 0;
                 g_rt_gather_us = g_rt_submit_us = g_rt_collect_us = 0;
+                g_rt_prefetch_us = 0;
             }
         }
 
@@ -1683,6 +2061,7 @@ int gap_hunt_run(const struct gap_hunt_config *cfg) {
     if (out)
         fclose(out);
     free(base_limbs);
+    free(p_limbs);
     free(offsets);
     free(flags);
     gpu_sieve_destroy(gpu_sieve);

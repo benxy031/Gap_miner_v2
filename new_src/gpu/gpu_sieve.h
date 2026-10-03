@@ -63,6 +63,76 @@ int gpu_sieve_mark_from_base(gpu_sieve_ctx *ctx,
                              uint64_t *host_bitmap,
                              size_t host_bitmap_words);
 
+/* CRT walk residue amortization (b_{k+1} = b_k + P): cache
+   step_mod_p = P mod p for every prime ONCE per run, then mark every window
+   whose base is `previous + P` with gpu_sieve_mark_from_base_incr() (one
+   add mod p per prime per window) instead of recomputing base mod p from
+   limbs (O(limbs) per prime).  Returns 1 on success; 0 fail-closed, in
+   which case the caller keeps using gpu_sieve_mark_from_base.  Requires
+   every prime < 2^62 and step_limb_count <= the base-limbs capacity. */
+int gpu_sieve_set_residue_step(gpu_sieve_ctx *ctx,
+                               const uint64_t *step_limbs,
+                               int step_limb_count,
+                               const uint64_t *primes,
+                               const uint64_t *inv_p,
+                               size_t prime_count);
+
+/* mark_from_base variant for the NEXT CRT window: advances the cached
+   residues by one stored step and marks, skipping the per-prime base
+   reduction.  Requires a successful gpu_sieve_set_residue_step() for the
+   same prime table and cached residues that currently correspond to
+   base - P.  Same fail-closed contract as gpu_sieve_mark_from_base. */
+int gpu_sieve_mark_from_base_incr(gpu_sieve_ctx *ctx,
+                                  uint64_t odd_interval_size,
+                                  uint64_t first_odd_offset,
+                                  int buf,
+                                  const uint64_t *primes,
+                                  const uint64_t *inv_p,
+                                  size_t prime_count,
+                                  uint64_t *host_bitmap,
+                                  size_t host_bitmap_words);
+
+/* Folded-step window mark (WS-A2): marks the window ``m_steps CRT steps``
+   after the cached anchor WITHOUT touching the cache - the mark kernels
+   compute residue = cache + m_steps * step mod p themselves, so no residue
+   kernel runs per window.  The caller re-anchors with a full
+   gpu_sieve_mark_from_base() whenever m_steps would exceed
+   gpu_sieve_residue_m_limit().  Requires gpu_sieve_set_residue_step() for
+   the same prime table.  Same fail-closed contract as the other variants. */
+int gpu_sieve_mark_from_base_mw(gpu_sieve_ctx *ctx,
+                                uint64_t odd_interval_size,
+                                uint64_t first_odd_offset,
+                                int buf,
+                                uint64_t m_steps,
+                                const uint64_t *primes,
+                                const uint64_t *inv_p,
+                                size_t prime_count,
+                                uint64_t *host_bitmap,
+                                size_t host_bitmap_words);
+
+/* Largest m_steps accepted by gpu_sieve_mark_from_base_mw (0 while no
+   residue step is cached; bounded by (2^63 / p_max) - 1 so the folded sum
+   cannot overflow). */
+uint64_t gpu_sieve_residue_m_limit(const gpu_sieve_ctx *ctx);
+
+/* Verification (debug only): recompute base mod p for every prime and count
+   how many EFFECTIVE residues differ (0 = consistent).  Does not modify the
+   cache.  m_steps mirrors gpu_sieve_mark_from_base_mw: 0 compares the cached
+   anchor directly, > 0 compares cache + m_steps*step against the recompute.
+   Primes < 3 are skipped: the even prime's Barrett reciprocal is degenerate
+   by design and no mark kernel reads it, so it is neither maintained nor
+   compared.  GPU_SIEVE_RESIDUES_DEBUG=1 additionally prints the first
+   mismatching prime.  Returns 1 on success (count in *mismatch_out), 0 on
+   any CUDA/validation error. */
+int gpu_sieve_residues_check(gpu_sieve_ctx *ctx,
+                             const uint64_t *base_limbs,
+                             int base_limb_count,
+                             const uint64_t *primes,
+                             const uint64_t *inv_p,
+                             size_t prime_count,
+                             uint64_t m_steps,
+                             uint64_t *mismatch_out);
+
 /* Pair-batched fused mark: residues + marking for TWO windows in ONE kernel
    launch and ONE stream sync.  base_limbs_pairs: 2 × base_limb_count
    little-endian limbs; window 0 marks d_bitmap[0], window 1 d_bitmap[1].
@@ -83,6 +153,15 @@ int gpu_sieve_mark_batch_from_bases(gpu_sieve_ctx *ctx,
    base + m*P; the per-row first odd offset flips with the row parity only
    when P is odd (P even keeps one grid for all rows).  Amortizes the
    per-window residue cost over the batch.
+
+   STEP CACHE (WS-B, 2026-10-03): when gpu_sieve_set_residue_step() has
+   cached step_mod_p for this prime table AND the passed step_limbs equal the
+   cached ones (byte compare of host limbs), only the BASE residue is reduced
+   per call - the step half of the sweep is skipped, because the stride P is
+   fixed for a whole CRT run.  Any mismatch (or GPU_SIEVE_STEP_CACHE=0) falls
+   back to the full double reduction and refreshes the cache from the
+   caller's limbs, so mixing strides stays correct.  Output is identical
+   either way (see tests/test_gpu_sieve.c cached-rows cases).
    base_limbs/step_limbs: little-endian limbs, base_limb_count each.
    Returns 1 on success, 0 on any CUDA or validation error (fail-closed). */
 int gpu_sieve_mark_rows_from_base(gpu_sieve_ctx *ctx,
@@ -267,6 +346,9 @@ uint64_t gpu_sieve_last_elapsed_us(const gpu_sieve_ctx *ctx);
    Non-zero only when GPU_SIEVE_TIMING=1 was set before gpu_sieve_init(). */
 uint64_t gpu_sieve_accounted_mark_us(gpu_sieve_ctx *ctx);
 uint64_t gpu_sieve_accounted_extract_us(gpu_sieve_ctx *ctx);
+/* Cumulative time of the residue-preparation kernels (full base-mod-p
+   reduction, one-step CRT increment and verification checks). */
+uint64_t gpu_sieve_accounted_residues_us(gpu_sieve_ctx *ctx);
 /* Device name for logging, empty string when unavailable. */
 const char *gpu_sieve_device_name(const gpu_sieve_ctx *ctx);
 

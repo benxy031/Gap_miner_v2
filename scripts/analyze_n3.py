@@ -11,10 +11,10 @@ The two files differ in size AND in cover (and, in the tail fit, in how much
 of the data sits just above the report threshold).  A difference between them
 is therefore a fact about the two WALKS, not about size.  The natural
 (Hardy-Littlewood) reference drawn into the figures is what makes that
-separation visible: scripts/hl_natural.py reads the coefficient tables in
-forum/ and reports a natural sigma of 0.961 (L=528) vs 0.960 (L=882), i.e.
-SIZE-FLAT to 0.15 %, while our corpora sit 31-45 % above it and differ from
-each other by ~8 %.  Two consequences for the captions below: the natural
+separation visible: scripts/hl_natural.py (exact c1,c2 from the distributed
+coefficient database since 2026-10-04) reports a natural sigma of 0.990
+(L=528) vs 0.994 (L=882), i.e. SIZE-FLAT to +0.5 %, while our corpora sit
+27-38 % above it and differ from each other by ~8 %.  Two consequences for the captions below: the natural
 baseline explains neither corpus's distance from it nor the gap between them,
 and the same-size cover A/B (shifts 998 and 1017) shows a cover effect that
 CHANGES SIGN (-2.5 % and +5.6 %), so the cover is not a settled explanation
@@ -157,8 +157,9 @@ def main():
     L1 = corpus_L(g1, m1)
     L2 = corpus_L(g2, m2)
     if NATURAL is not None:
-        print("HL natural baseline (forum/ coefficient tables; the natural "
-              "tail is essentially size-flat):")
+        print("HL natural baseline (exact c1,c2 from the distributed "
+              "coefficient database; the natural tail is essentially "
+              "size-flat):")
         for lab, L, s_eff in (("f1", L1, s1), ("f2", L2, s2)):
             print("  %s: %s" % (lab, NATURAL.describe(L, s_eff)))
         nat = 100.0 * (NATURAL.sigma(L2) / NATURAL.sigma(L1) - 1.0)
@@ -190,7 +191,7 @@ def main():
                 "MLE). READ THE ATTRIBUTION: the two corpora differ in size "
                 "AND cover (and in the share of data just above the "
                 "threshold), so this is a difference between two WALKS. The "
-                "natural HL tail is size-flat to 0.15 % over this range, and "
+                "natural HL tail is size-flat to ~0.5 % over this range, and "
                 "the same-size cover A/B changes sign, so neither size nor "
                 "cover is established as the cause.")
     fig.savefig(f"{OUTDIR}/n3_merit_hist.png", dpi=130)
@@ -214,15 +215,15 @@ def main():
     ax.set_ylabel("P(merit >= m)")
     ax.set_title("N3: two corpora differ, but size is not established as the "
                  "cause\n(dotted = Hardy-Littlewood natural, which is "
-                 "size-flat to 0.15 % here)")
+                 "size-flat to ~0.5 % here)")
     ax.legend(fontsize=8)
     fig.tight_layout(rect=(0, 0.045, 1, 1))
     caption(fig, "Survival probability P(merit >= m), log scale. Dashed = "
                 "maximum-likelihood exponential fits; dotted = the natural HL "
                 "law with NO cover, at each corpus's own size. Reading: both "
-                "hunts sit ~1.3-1.5x above the natural decay (the covering's "
+                "hunts sit ~1.27-1.38x above the natural decay (the covering's "
                 "gain), the two corpora separate over merit 8-14 and CROSS "
-                "again near 15-17, and the natural law predicts only 0.15 % "
+                "again near 15-17, and the natural law predicts only ~0.5 % "
                 "between the two sizes. So the separation is real for these "
                 "walks but is NOT attributable to size alone; the same-size "
                 "cover A/B changes sign.")
@@ -328,10 +329,10 @@ def main():
     fig.tight_layout(rect=(0, 0.045, 1, 1))
     caption(fig, "The 1273-bit sigma exceeds the 763-bit sigma by 7.4 to "
                 "34.4 sigma depending on the fit threshold, and BOTH sit "
-                "30-45 % above the natural HL line (dotted, no cover). Two "
+                "27-38 % above the natural HL line (dotted, no cover). Two "
                 "honest readings: the offset from nature is the covering's "
                 "gain; the gap between the files is a property of these two "
-                "walks, because size predicts only 0.15 % and the same-size "
+                "walks, because size predicts only ~0.5 % and the same-size "
                 "cover A/B changes sign.")
     fig.savefig(f"{OUTDIR}/n3_sigma_threshold.png", dpi=130)
     plt.close(fig)

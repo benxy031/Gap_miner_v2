@@ -36,27 +36,50 @@ threshold m0 is a pure function of the exponent
 
 and its local slope dE/dm is the natural inverse-sigma.
 
-MEASURED CONSEQUENCE (2026-09-23, our two corpus sizes)
-------------------------------------------------------
-    L = 528.9 (shift 507, 763-bit):  dE/dm = 1.0401  -> sigma_nat = 0.961
-    L = 882.4 (shift 1017, 1273-bit): dE/dm = 1.0416 -> sigma_nat = 0.960
+SOURCES (precision order)
+-------------------------
+1. The distributed exact database
+   (`forum/hl_gap_distributed/data/hl_gap_cumulants.csv`, community project,
+   added 2026-10-04): B1 and B2 are EXACT for every even gap up to 90090,
+   which covers our whole working range (15k..27k) -- and c1 = B1, c2 from B1,
+   B2 are the two terms that dominate at our L.  c3 is exact for every gap up
+   to 9990 plus 211 SAMPLED gaps from 10k to 90090: the code fits a power law
+   to those (good to <0.8 % overall, ~0.3 % in our 15k-21k window; the forum
+   tables' global fit is 11-15 % off there).  c4 stays fitted (its term is
+   ~4e-5 at our L, i.e. irrelevant).
+2. Fallback: power laws fitted to the forum/ four- and three-parameter tables
+   (used when the database folder is absent -- e.g. fleet boxes -- or beyond
+   g = 90090).
 
-Two facts follow, and both matter more than the exact numbers:
-  * the natural tail is essentially SIZE-FLAT over our whole range (0.15 %
-    between the two corpora), so a measured size effect has to be argued, not
-    assumed;
-  * every sigma our hunts measure (1.26 .. 1.47) sits 31-53 % ABOVE it, so the
-    ratio sigma_eff/sigma_nat is a covering-gain KPI: in slope terms ~1.39,
-    i.e. x10 on the merit-28 rate, x330 on merit-40.
+MEASURED CONSEQUENCE (updated 2026-10-04, exact c1,c2)
+------------------------------------------------------
+    L = 528.9 (shift 507):   dE/dm = 1.011  ->  sigma_nat = 0.990
+    L = 676.2 (shift 720):   dE/dm = 1.009  ->  sigma_nat = 0.991
+    L = 882.4 (shift 1017):  dE/dm = 1.006  ->  sigma_nat = 0.994
+
+3-4 % larger than the old fitted reading (0.96): over 15k..21k the fit
+over-predicted c1 by 2.0-2.2 % and c2 by 7-8 %, i.e. it decayed too fast.
+The tail is still SIZE-FLAT (+0.5 % between the extreme sizes; the fitted law
+claimed -0.15 %, an artifact of the fit), so a measured size effect has to be
+argued, not assumed.  Our hunts measure sigma 1.25..1.5, i.e. 25-50 % above
+nature -- that excess is the cover gain.  Measured on the live fleet s720 log
+(2026-10-04, against this baseline): x1.23 per merit unit, cumulative x1.7 at
+merit 24.4 -> x4.5 at 29.0.
+
+NOTE ON slope(): with exact coefficients c1 carries an arithmetic term that
+jumps between adjacent gaps (dc1 per +2 gap swings 0.2..3.6), so a POINTWISE
+dE/dm oscillates by tens of percent.  E differences over >=1 merit unit are
+unaffected (the term contributes <=0.003 there).  slope() therefore defaults
+to a secant over +-1 merit unit whenever exact coefficients are active: a
+trend value, accurate to ~0.3 %.  Pass dm explicitly for the raw derivative.
 
 CAVEAT (must travel with every use)
 -----------------------------------
-The coefficient tables stop at g = 3600 (order 4) and g = 9990 (order 3), while
-our gaps are 17k-25k, so ANY evaluation at our g is an extrapolation.  The
-model itself diverges from the real record frontier beyond g ~ 1500-1800
-(median model/real merit ratio 1.278, up to 1.97 at g ~ 3580), so treat the
-baseline as a shape reference, never as an absolute prediction.  `slope()` and
-`E()` never claim otherwise; callers should print `is_extrapolated(L, m)`.
+c1 and c2 are exact only to g = 90090; c3, c4 and anything beyond that gap are
+modelled.  The model diverges from the real record frontier at small g (median
+model/real merit ratio 1.278 up to g ~ 3580), so treat the baseline as a SHAPE
+reference, never as an absolute prediction; callers print `source_note(L, m)`
+instead of assuming what is exact.
 
 Run directly for a table:
     scripts/hl_natural.py [L ...]
@@ -81,6 +104,48 @@ def default_paths(root=None):
     f = os.path.join(root, "forum")
     return (os.path.join(f, "hl_gap_4param_exact_parameters_with_first_occurrence.csv"),
             os.path.join(f, "hl_gap_3param_exact_parameters_with_first_occurrence.csv"))
+
+
+def default_db_path(root=None):
+    """The distributed exact-coefficient database inside <repo>/forum."""
+    if root is None:
+        root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    return os.path.join(root, "forum", "hl_gap_distributed", "data",
+                        "hl_gap_cumulants.csv")
+
+
+def _read_db(path):
+    """{k: {gap: c_k}} from the distributed databases's cumulant CSV.
+
+    Row = gap, order, c1..c12.  A row with order K carries EXACT c1..cK for
+    that gap; higher cumulants are absent and must come from a fallback.
+    """
+    tables = {}
+    with open(path, errors="ignore") as fh:
+        head = fh.readline().rstrip("\n").split(",")
+        idx = {name: i for i, name in enumerate(head)}
+        if "gap" not in idx or "order" not in idx or "c1" not in idx:
+            raise ValueError("%s: unexpected columns" % path)
+        for line in fh:
+            parts = line.rstrip("\n").split(",")
+            if len(parts) <= idx["order"]:
+                continue
+            try:
+                g = int(parts[idx["gap"]])
+                o = int(parts[idx["order"]])
+            except ValueError:
+                continue
+            for k in range(1, o + 1):
+                name = "c%d" % k
+                if name not in idx or idx[name] >= len(parts):
+                    continue
+                v = parts[idx[name]]
+                if v:
+                    try:
+                        tables.setdefault(name, {})[g] = float(v)
+                    except ValueError:
+                        pass
+    return tables
 
 
 def _read_csv(path):
@@ -131,11 +196,30 @@ class Natural:
     which case every method degrades to None and callers skip the baseline.
     """
 
-    def __init__(self, rows4, rows3, order4_path, order3_path):
+    def __init__(self, rows4, rows3, order4_path, order3_path,
+                 db=None, db_path=None):
         self.rows4 = rows4
         self.rows3 = rows3
         self.order4_path = order4_path
         self.order3_path = order3_path
+        self._db = db or {}
+        self.db_path = db_path
+        # Exact coverage of the distributed database: B1/B2 are complete to
+        # g=90090 (c1, c2 = the dominant terms), so that is what E() trusts.
+        self.exact_max_g = max(self._db.get("c1", {}), default=0)
+        # c3: the SAMPLED exact rows above the exhaustive order-3 cutoff give
+        # a power law that is ~40x more accurate than the forum tables' fit
+        # in our evaluation window (0.3 % vs 11-15 %).
+        self._c3_win = None
+        self._c3_lo = self._c3_hi = 0
+        win = sorted((g, v) for g, v in self._db.get("c3", {}).items()
+                     if g > MAX_TABLE_G and v > 0)
+        if len(win) >= 20:
+            self._c3_lo, self._c3_hi = win[0][0], win[-1][0]
+            try:
+                self._c3_win = _power_law([(float(g), v) for g, v in win])
+            except ValueError:
+                self._c3_win = None
         self.max_g = max(max(rows4), max(rows3)) if (rows4 or rows3) else 0
         # Prefer order-4 rows (c1..c4); fall back to order-3 (c1..c3, c4 = 0).
         self._fits = {}
@@ -155,9 +239,24 @@ class Natural:
 
     # ── coefficients and exponent ────────────────────────────────────────
     def c(self, k, g):
-        """Extrapolated coefficient c_k at gap g (power law from the CSVs)."""
+        """c_k at an even gap g (rounded to the nearest even integer).
+
+        Exact from the distributed database when that gap is covered for this
+        order; otherwise the sampled-window power law (c3) or the global
+        power-law fit (all k, and everything beyond the database).
+        """
+        gk = int(round(g / 2.0)) * 2
+        exact = self._db.get(k)
+        if exact is not None:
+            v = exact.get(gk)
+            if v is not None:
+                return v
+        if (k == "c3" and self._c3_win is not None
+                and self._c3_lo <= gk <= self._c3_hi):
+            a, b = self._c3_win
+            return a * (gk ** b)
         a, b = self._fits[k]
-        return a * (g ** b)
+        return a * (gk ** b)
 
     def E(self, L, m):
         """The natural exponent at merit m for prime scale L (g = m*L)."""
@@ -165,8 +264,19 @@ class Natural:
         return (self.c("c1", g) / L + self.c("c2", g) / L ** 2 +
                 self.c("c3", g) / L ** 3 + self.c("c4", g) / L ** 4)
 
-    def slope(self, L, m=24.0, dm=0.01):
-        """dE/dm at merit m: the natural inverse-sigma (1/sigma_nat)."""
+    def slope(self, L, m=24.0, dm=None):
+        """dE/dm at merit m: the natural inverse-sigma (1/sigma_nat).
+
+        dm=None picks the WIDE secant (+-1 merit unit) whenever exact
+        coefficients are active at this (L, m): c1 carries an arithmetic term
+        that jumps between adjacent gaps, so a pointwise derivative oscillates
+        by tens of percent, while trend differences over >=1 merit unit are
+        unaffected.  Pass dm explicitly for the raw pointwise derivative.
+        """
+        if dm is None:
+            g = int(round((m * L) / 2.0)) * 2
+            exact = self._db.get("c1") or {}
+            dm = 1.0 if g in exact else 0.01
         return (self.E(L, m + dm) - self.E(L, m - dm)) / (2.0 * dm)
 
     def sigma(self, L, m=24.0):
@@ -182,6 +292,23 @@ class Natural:
     def is_extrapolated(self, L, m=24.0):
         """True when m*L lies beyond the largest tabulated gap."""
         return (m * L) > self.max_g
+
+    def source_note(self, L=None, m=24.0):
+        """One-line description of what is exact at this (L, m), for logs."""
+        if not self._db:
+            return ("power-law fits of the forum/ tables only (no exact "
+                    "database); c1..c4 fitted, last tabulated g=%d"
+                    % self.max_g)
+        if L and L > 0 and m * L > self.exact_max_g:
+            return ("all coefficients modelled beyond g=%d (exact c1,c2 only "
+                    "to %d)" % (self.exact_max_g, self.exact_max_g))
+        txt = "c1,c2 exact to g=%d (community DB)" % self.exact_max_g
+        if self._c3_win:
+            txt += ("; c3 sampled power law g=%d..%d"
+                    % (self._c3_lo, self._c3_hi))
+        else:
+            txt += "; c3 fitted"
+        return txt + "; c4 fitted"
 
     def gain_slope(self, sigma_eff, L, m=24.0):
         """LOCAL ratio of our decay rate to nature's at merit m (>1 = gain).
@@ -222,13 +349,12 @@ class Natural:
                         sigma_eff, self.gain_slope(sigma_eff, L, m) or 0.0,
                         self.gain(28.0, sigma_eff, L) or 0.0,
                         self.gain(40.0, sigma_eff, L) or 0.0))
-        if self.is_extrapolated(L, m):
-            txt += " [extrapolated beyond g=%d]" % self.max_g
+        txt += " [%s]" % self.source_note(L, m)
         return txt
 
 
-def load(root=None, path4=None, path3=None):
-    """Build a Natural from the forum CSVs; returns None if unavailable."""
+def load(root=None, path4=None, path3=None, db_path=None):
+    """Build a Natural from the forum CSVs + exact DB; None if CSVs absent."""
     p4, p3 = default_paths(root)
     path4 = path4 or p4
     path3 = path3 or p3
@@ -242,8 +368,19 @@ def load(root=None, path4=None, path3=None):
         return None
     if not rows4 and not rows3:
         return None
+    # The distributed exact database (community project, added 2026-10-04)
+    # is OPTIONAL: absent on fleet boxes, and the tool then behaves exactly
+    # as before (power-law fits only).
+    db, used = None, None
+    dbp = db_path or default_db_path(root)
+    if dbp and os.path.exists(dbp):
+        try:
+            db = _read_db(dbp)
+            used = dbp
+        except (OSError, ValueError):
+            db, used = None, None
     try:
-        return Natural(rows4, rows3, path4, path3)
+        return Natural(rows4, rows3, path4, path3, db=db, db_path=used)
     except ValueError:
         return None
 
@@ -260,13 +397,24 @@ def _main(argv):
     for k in ("c1", "c2", "c3", "c4"):
         a, b = hl._fits[k]
         print("  fit %s = %.6g * g^%.4f" % (k, a, b))
+    if hl._db:
+        print("exact DB: %s" % os.path.basename(hl.db_path or ""))
+        print("  c1,c2 exact for every gap to g=%d (n=%d)"
+              % (hl.exact_max_g, len(hl._db.get("c1", {}))))
+        if hl._c3_win:
+            print("  c3 sampled power law over g=%d..%d (n=%d)"
+                  % (hl._c3_lo, hl._c3_hi,
+                     sum(1 for g in hl._db.get("c3", {})
+                         if g > MAX_TABLE_G)))
+    else:
+        print("exact DB not found -> power-law fits only (fleet behaviour)")
     Ls = [float(a) for a in argv] or [528.9, 882.4, 1404.9]
-    print("\n%-10s %8s %10s %10s %8s" %
-          ("L", "bits", "dE/dm@24", "sigma_nat", "extrap?"))
+    print("\n%-10s %8s %10s %10s   %s"
+          % ("L", "bits", "dE/dm@24", "sigma_nat", "source"))
     for L in Ls:
-        print("%-10.1f %8.0f %10.4f %10.3f %8s" %
+        print("%-10.1f %8.0f %10.4f %10.3f   %s" %
               (L, L / math.log(2.0), hl.slope(L, 24.0), hl.sigma(L, 24.0),
-               hl.is_extrapolated(L, 24.0)))
+               hl.source_note(L, 24.0)))
     return 0
 
 

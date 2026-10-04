@@ -25,7 +25,8 @@ are skipped) it reports:
     also shown for a prior sigma = 1.30 x sigma_nat(L), with sigma_nat
     from the HL coefficient model (scripts/hl_model.py; the 1.30 lift
     reproduces the historical shift-507 anchor 1.29 ~= 1.30 x 0.99, and
-    the natural law is size-flat at 0.96-1.00 across our range).  Without
+    the natural law is size-flat (0.99-1.00 across our L range on the
+    exact-coefficient baseline).  Without
     the HL tables the prior falls back to the constant 1.29;
   * the easiest recordable targets at this size.
 

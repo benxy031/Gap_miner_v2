@@ -90,7 +90,7 @@ BIN_HALF = 1.0
 # being defined, which made --shift-scan raise NameError (fixed 2026-09-23).
 # CAVEAT: the two anchors are two different WALKS (size AND cover differ), so
 # the interpolation is a walk-to-walk trend, not a measured size law - the
-# natural HL tail moves only -0.15 % between these sizes and the same-size
+# natural HL tail moves only +0.4 % between these sizes and the same-size
 # cover A/B changes sign.  See sigma_of_L()'s docstring.
 SIGMA_ANCHORS = ((528.18, 1.2618), (881.68, 1.3716))
 
@@ -651,7 +651,7 @@ def sigma_of_L(L, anchors=None, fixed=None):
 
     ATTRIBUTION CAVEAT (2026-09-23).  The two anchors are two different WALKS:
     they differ in size AND in cover, and in how much of their data sits just
-    above the report threshold.  The natural HL tail moves only -0.15 % between
+    above the report threshold.  The natural HL tail moves only +0.4 % between
     these two sizes (scripts/hl_natural.py) and the same-size cover A/B changes
     sign (-2.5 % at shift 998, +5.6 % at 1017), so the linear interpolation is a
     walk-to-walk trend, NOT a measured size law.  Treat sigma(L) between the
@@ -917,7 +917,7 @@ def main():
               f" {SIGMA_ANCHORS[0][0]:.0f}->{SIGMA_ANCHORS[0][1]:.4f},"
               f" {SIGMA_ANCHORS[1][0]:.0f}->{SIGMA_ANCHORS[1][1]:.4f}")
         # Natural reference: how much of sigma(L) is a size effect at all.
-        # The HL law moves ~0.15 % between these sizes, so the interpolated
+        # The HL law moves only ~0.4 % between these sizes, so the interpolated
         # trend above is a walk-to-walk difference (size AND cover), not a
         # measured size law - see sigma_of_L's caveat.
         try:

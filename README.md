@@ -343,18 +343,21 @@ scripts/analyze_n3.py               # f1 vs f2 N3 report + analysis/n3_*.png
                                      # reference, and the captions state the
                                      # attribution the data supports: the two
                                      # corpora differ in size AND cover, the
-                                     # natural tail is size-flat to 0.15 %
+                                     # natural tail is size-flat to ~0.5 %
                                      # between them, and the same-size cover
                                      # A/B changes sign - so the separation is
                                      # a fact about those two WALKS, not a
                                      # measured size law.
 scripts/hl_natural.py               # the natural (no-cover) HL merit law at
-                                     # any L, read from the forum/ coefficient
-                                     # tables: dE/dm, sigma_nat, and the
-                                     # covering's cumulative gain (x10 at
-                                     # merit 28, x335 at merit 40 for a
-                                     # sigma_eff of 1.327); flags every use
-                                     # beyond g=9990 as an extrapolation.
+                                     # any L: exact c1,c2 from the distributed
+                                     # coefficient database (forum/
+                                     # hl_gap_distributed) with power-law c3/c4:
+                                     # dE/dm, sigma_nat, and the covering's
+                                     # cumulative gain (x8 at merit 28, x175 at
+                                     # merit 40 for a sigma_eff of 1.327);
+                                     # prints which coefficients are exact and
+                                     # flags everything beyond g=90090 as
+                                     # modelled.
 scripts/hl_natural.py 528.9 881.7   # same, as a table for given L values
 scripts/tail_shape.py --selftest    # verify the exp/stretched/GPD estimators firstscripts/tail_shape.py gap_hunt_records_f1.txt --u-fit 16 --u-test 18,20,22
                                      # is the tail exponential at depth? (S9)

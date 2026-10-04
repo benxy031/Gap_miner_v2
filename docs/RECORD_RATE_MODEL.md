@@ -158,9 +158,10 @@ Two measurements narrow it further:
   depth where records live.  f1's `E[records]` is therefore biased high and its
   gaps/record optimistic; the stretched/GPD option in `tail_shape.py` exists
   for this case and should be preferred for f1-like corpora.
-* **every corpus sits 31-45 % above the natural line**, i.e. the covering gain
-  is real in aggregate (×7-13 at merit 28, ×150-650 at merit 40) even though
-  the cover DESIGN is not distinguishable at this sample size.
+* **every corpus sits 27-38 % above the natural line** (exact-coefficient
+  baseline, 2026-10-04), i.e. the covering gain is real in aggregate
+  (x6-9 at merit 28, x80-260 at merit 40 on the model's reference anchor)
+  even though the cover DESIGN is not distinguishable at this sample size.
 
 Consequence for this model: keep the anchors (they reproduce §2), keep reading
 `sigma(L)` between them as HYPOTHESIS, and prefer `--sigma-fixed` whenever a

@@ -21,6 +21,10 @@ at that prime scale.  This script overlays two Hardy-Littlewood baselines:
       forum/hl_gap_3param_exact_parameters_with_first_occurrence.csv   (g <= 9990)
   Our relevant gaps are g <= ~1400 (m <= 30), i.e. INSIDE the order-4 table, so
   table rows are used exactly (no power-law extrapolation of the c's).
+  Cross-verified 2026-10-04 against the community exact database
+  (forum/hl_gap_distributed/data/hl_gap_cumulants.csv): for g = 700..1500 the
+  two sources agree to <= 1e-9 relative on every coefficient (c1 to 1e-15), so
+  this tool needs no coefficient update for the Phase-0 range.
   The g-tail beyond 9990 contributes < 1e-30 at this L (e^{-(9990-12)/46.7}).
 
 CAVEAT / PROVENANCE (travels with the figure)
@@ -211,7 +215,8 @@ def main(argv=None):
         el = [min(math.sqrt(n), n * 0.9) for n in ys]
         eh = [math.sqrt(n) for n in ys]
         ax.errorbar(xs, ys, yerr=[el, eh], fmt="o", ms=6.5, lw=1.6,
-                    color=fg, capsize=3, zorder=5, label="measured (Phase-0, 1e14)")
+                    color=fg, capsize=3, zorder=5,
+                    label="measured (Phase-0, %.1e range)" % R)
 
         ax.plot(grid, hl4, "-", color="#d62728", lw=2.2, label="HL-4p (P. Williams model)")
         ax.plot(grid, hl1, "-", color="#1f77b4", lw=2.2, label="HL-1t (2C2 e^-m R/L)")

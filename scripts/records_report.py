@@ -35,20 +35,21 @@ What it reports (per file, then pooled):
     not a record hunt;
   * how that tail compares with NATURE: the same depths are also measured
     against the Hardy-Littlewood natural law (no cover) at this run's own
-    L = ln(start), read from the forum/ coefficient tables by
-    scripts/hl_natural.py.  The exponential fit above is SELF-REFERENTIAL - it
+    L = ln(start), read by scripts/hl_natural.py (exact c1,c2 from the
+    distributed coefficient database, power-law c3/c4).  The exponential fit
+    above is SELF-REFERENTIAL - it
     is fitted to the very data it is compared with - so it can only detect a
     shape mismatch; the natural line is the external reference.  A tailed cover
     should sit ABOVE that line by its covering gain (sigma_eff/sigma_nat,
     printed as xG at merit 28/40).  A tail that MATCHES the natural law means
     the cover is adding nothing at this size, which is a finding, not a pass.
-    TWO independent estimators of that sigma_nat exist: the smooth power-law
-    fit of the coefficient tables (scripts/hl_natural.py; the line and the
-    dotted curves) and scripts/hl_model.py averaging the LOCAL same-order
-    slopes of the nearest table rows.  They differ by ~3% at our sizes; the
-    local reading is printed beside the line as a cross-check so the spread is
-    visible, and it feeds no computed number (the sigma_eff and the gain come
-    from the candidates themselves and from the coefficient tables);
+    TWO independent estimators of sigma_nat exist: the baseline in
+    scripts/hl_natural.py (exact c1,c2 from the distributed database; the
+    line and the dotted curves) and scripts/hl_model.py averaging the LOCAL
+    same-order slopes of the nearest table rows.  They now agree to ~1 % at
+    our sizes; the local reading is printed beside the line as a cross-check
+    and feeds no computed number (sigma_eff comes from the candidates, the
+    gain from the exact coefficients);
   * how the work source ruled on each candidate (accepted / rejected /
     unresolved / stale ...), PER HOUR — for a pool this is the plot that shows
     a stale-work outage (a run that stops being accepted keeps finding
@@ -649,23 +650,21 @@ def report_group(title, cands, table, args, out=sys.stdout, comparable=True):
         # printed first, so it cannot rely on the tail block having run.
         s_eff, _m0_eff = fit_sigma(merits)
         print(f"   natural tail   sigma_nat={s_nat:.3f} at L={L_nat:.1f} "
-              "(HL, no cover"
-              + ("; extrapolated beyond g=%d" % nat.max_g
-                 if nat.is_extrapolated(L_nat) else "") + ")", file=out)
+              "(HL, no cover; " + nat.source_note(L_nat) + ")", file=out)
         # Same natural sigma, read LOCALLY (hl_model: average of the
         # same-order c-slopes at the nearest table gaps) instead of through
-        # the smooth power-law fit above.  The two differ by ~3% at our
-        # sizes; printed so the spread is visible rather than hidden inside
-        # one method's digits.  It feeds no computed number below: sigma_eff
-        # comes from these candidates and the gain from the coefficient
-        # tables, so no verdict can hinge on which reading is quoted.
+        # the exact-coefficient baseline above.  The two now agree to ~1 %;
+        # printed so any future divergence stays visible.  It feeds no
+        # computed number below: sigma_eff comes from these candidates and
+        # the gain from the exact coefficients, so no verdict can hinge on
+        # which reading is quoted.
         if hl_model is not None:
             gaps = sorted(c.gap for c in cands if c.gap)
             g_t = quantile(gaps, 0.5) if gaps else 24.0 * L_nat
             sn = hl_model.natural_sigma_avg(L_nat, g_t)
             if sn:
                 print(f"                  cross-check (local slopes, nearest "
-                      f"table gaps): sigma_nat={sn:.3f} -- the ~3% method "
+                      f"table gaps): sigma_nat={sn:.3f} -- the ~1 % method "
                       f"spread changes none of the numbers below", file=out)
         if s_eff:
             print(f"                  sigma_eff={s_eff:.3f} -> cover gain "

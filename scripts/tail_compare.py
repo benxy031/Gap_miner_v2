@@ -46,12 +46,13 @@ Usage:
 
 Runs without numpy/matplotlib for the text part (fleet boxes).
 
-HL3 NOTE (2026-09-27): data/hl_order3_targets.csv adds exact order-3 rows for
-g = 17.9k..40.5k (scripts/hl_order3_targets.py).  This tool keeps the
-hl_natural POWER-LAW fit as its baseline: it needs a smooth sigma(L) at an
-evaluation point, where a per-gap local slope wobbles with delta(g) ~ +-1.5
-between neighbours.  A hl_model local-slope cross-check is printed beside it
-so the two methods' ~3% spread (0.99 vs 0.96 at our L) stays visible.
+HL3 NOTE (updated 2026-10-04): the baseline comes from scripts/hl_natural.py,
+which now uses EXACT c1,c2 from the distributed coefficient database
+(forum/hl_gap_distributed) with power-law terms only for c3/c4.  A per-gap
+pointwise slope would wobble (c1's arithmetic term jumps between neighbours),
+so hl_natural's slope() returns a secant over +-0.5 merit units -- a smooth
+sigma(L) by construction, accurate to ~0.3 %.  A hl_model local-slope
+cross-check is printed beside it; the two now agree to ~1 % at our L.
 """
 import sys
 import math
@@ -363,15 +364,16 @@ def main():
                   " NOT the record-rate sigma")
 
     # ── HL natural baseline: what sigma would be with NO cover ────────────
-    # Every sigma above is cover-assisted.  The natural reference (forum/
-    # coefficient tables, scripts/hl_natural.py) makes the covering gain
-    # explicit and, just as importantly, states how much of a size difference
-    # the natural law EXPECTS between the two corpora: dE/dm moves only ~0.2 %
-    # per 350 units of L, so "sigma differs with size" is a claim that needs
-    # the cover held fixed before it can be attributed.
+    # Every sigma above is cover-assisted.  The natural reference (exact
+    # c1,c2 from the distributed coefficient database, scripts/hl_natural.py)
+    # makes the covering gain explicit and, just as importantly, states how
+    # much of a size difference the natural law EXPECTS between the two
+    # corpora: dE/dm moves only ~0.5 % per 350 units of L, so "sigma differs
+    # with size" is a claim that needs the cover held fixed before it can be
+    # attributed.
     if natural is not None:
-        print("\nHL natural baseline (forum/ coefficient tables, extrapolated "
-              "beyond g=%d):" % natural.max_g)
+        print("\nHL natural baseline (%s):"
+              % natural.source_note(L_a if L_a > 0 else L_b))
         for lab, L, s_eff in ((os.path.basename(fa), L_a, sa),
                               (os.path.basename(fb), L_b, sb)):
             if L > 0:
@@ -380,7 +382,7 @@ def main():
                     sn = hl_model.natural_sigma_avg(L, 24.0 * L)
                     if sn:
                         print("      cross-check (local slopes, nearest table"
-                              " gaps): sigma_nat=%.3f -- the ~3%% method"
+                              " gaps): sigma_nat=%.3f -- the ~1 %% method"
                               " spread does not change any verdict below"
                               % sn)
         if L_a > 0 and L_b > 0:

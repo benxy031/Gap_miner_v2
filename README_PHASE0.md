@@ -7,6 +7,10 @@ gap_hunt objects; its own kernels and tools).  Measurement history, theory and
 model comparisons live in [`docs/PHASE0_scan_bench.md`](docs/PHASE0_scan_bench.md)
 - this file is the operator manual (tools, flags, defaults, gates).
 
+A self-contained, shareable copy of this toolkit (same layout, its own Makefile
+and prose README) lives in [`phase0/`](phase0/README.md) - build and run from
+there when the rest of the repo should not be distributed.
+
 Current performance (RTX 3070, i3-10100, 8 threads):
 
 | range | wall | rate |
@@ -25,6 +29,7 @@ Current performance (RTX 3070, i3-10100, 8 threads):
 | `bin/phase0_scan` | `tools/phase0_scan.c` | CPU-only reference scanner (same gates, slow; no GPU) |
 | `bin/bench_p0sieve` | `tools/bench_p0sieve.cu` | GPU marking probe: rate + **bit-exact check** vs a naive CPU marker |
 | `bin/mr68_gpu` | `tools/mr68_gpu.cu` | 96-bit Miller-Rabin kernel validator (`--validate`, GMP cross-check) + benchmark |
+| `scripts/p0_bench.py` | | fixed-range walk-engine bench: runs arms, parses wall/e2e/tests + the GPU-event stage split; `--bin-b` gives the ABBA order; results append to `data/p0_bench_results.txt` |
 | `scripts/phase0_hl_compare.py` | | merit-tail comparison vs HL-1t / HL-4p models (figure) |
 
 Shared device code: `tools/mr68_kernel.cuh` (CIOS Montgomery + base-2 MR +
@@ -87,7 +92,11 @@ Defaults:
 
 Environment: `P0_FAST_DBG=N` dumps the first N fast-walk summaries
 (word counts, prime count, first/last set slot) to stderr - the tool that
-isolated the cross-segment chain bug in the bitmap walk.
+isolated the cross-segment chain bug in the bitmap walk.  `P0_SG_GRID=N`
+(walk engine) sets the mark-kernel CTA count under the P0_PIPE overlap,
+default `92` (= the pre-pipeline full wave; range 1..4096).  Measured on the
+2e13 arm at `--gap-min 1586`: 92 -> 58.9 s, 46 -> 58.6 s, 23 -> 75.6 s (too few
+CTAs - the mark stage becomes the pacer).  Keep the default.
 
 ### Pipelines
 
@@ -120,6 +129,27 @@ Reported gaps
 enter the same log/records/top-4/band/GMP-verification path as the sieve
 engine, and state files are format-identical (`off0` in integers from
 `--start`), so a killed walk run resumes exactly with the same command.
+
+Overlap (P0_PIPE, 2026-10-05): the walk result of each super-batch is
+collected one iteration late, so the sieve of batch j+1 really runs while the
+walk of batch j is in flight (before the change the host synchronized right
+after launching the walk and the stages were strictly serial: measured
+mark 34 % + walk 66 % = 99.5 % of the wall).  Measured at the campaign
+geometry (start 1.3300107e20, 2e13 ints, `--gap-min 1586`, K=64):
+65.1 s -> 58.1-58.9 s = **+9..11 %** (3.06e11 -> 3.38-3.44e11 ints/s; the
+drift-immune ABBA run reads +8.5 %, `docs/PHASE0_scan_bench.md` §20), and the
+emitted sets and `tests` count are identical to the pre-P0_PIPE binary (182,535 rows
+and tests=6,029,529,566 on the 1e12 `--gap-min 500` gate).  The collect copies
+run on a private stream: a synchronous `cudaMemcpy` in the legacy default
+stream implicitly synchronizes with every blocking stream and would wait for
+the next batch's marks and walk, re-serializing the pipeline (measured: the
+first P0_PIPE version still showed 100 % serial for exactly this reason).
+Stop/resume is unchanged - state is written from the deferred collect, and a
+stop drains the in-flight batch first.
+
+Reproduce: `python3 scripts/p0_bench.py --bin-b <pre-P0_PIPE binary>
+--length 2e13 --gap-min 1586 --label P0_PIPE` (~8 min ABBA; raw lines in
+`data/p0_bench_results.txt`).
 
 Minimal usage (production defaults at the default threshold):
 
@@ -170,6 +200,11 @@ The monitor thread prints exactly this status line; end of run:
 [phase0-gpu]   top#1..4 gap/merit/lower/upper/verified
 [phase0-gpu] gaps reported=...  verification_failures=0  records_new=...
 ```
+
+Walk runs print one extra summary line before the band table:
+`stage split (GPU events): mark=... (..%)  walk=... (..%)  other=... (..%)`
+(mark/walk are pure kernel times from CUDA events; `other` goes NEGATIVE when
+P0_PIPE overlaps the stages - that is the overlap, not an error).
 
 Note: the `fast split` sums are per-kernel wall times on 8 shared streams and
 inflate with stream overlap; run `--threads 1` (or use the 1-thread numbers in

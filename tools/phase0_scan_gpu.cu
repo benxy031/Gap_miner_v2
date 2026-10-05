@@ -1300,18 +1300,27 @@ static void *monitor_thread(void *arg) {
    Geometry: block = 30*2^25 numbers (2^28 slots, 32 MB bitmap), tile 2^19
    slots (64 KB shared), wheel {7,11,13} pattern OR, item table of 64-mark
    chunks.  Super-batches of --walk-batch blocks; two bitmap regions
-   alternate so the sieves of batch j+1 overlap the walk of batch j, and
-   each batch carries one lookahead block (re-sieved by the next batch) so a
-   gap straddling a batch boundary is found exactly once (by the batch that
-   owns its lower prime).  Constraint: the whole range must fit one 64-bit
-   window of the block base A (checked; aborts otherwise).                  */
+   alternate; the walk of batch j is collected one iteration late (P0_PIPE,
+   below) so the sieve of batch j+1 really overlaps it.  Measured BEFORE the
+   P0_PIPE change (2026-10-05): mark 34% + walk 66% = 99.5% of wall, i.e. the
+   two stages were strictly serial.  Each batch carries one lookahead block
+   (re-sieved by the next batch) so a gap straddling a batch boundary is found
+   exactly once (by the batch that owns its lower prime).  Constraint: the
+   whole range must fit one 64-bit window of the block base A (checked;
+   aborts otherwise).                                                       */
 static int run_walk_engine(void) {
     const uint64_t blockNum30 = 30ull * (1ull << 25);
     const uint64_t cWords = (1ull << 28) / 64;
     const uint64_t tileSlots = 1ull << 19;
     const uint32_t tileWords = (uint32_t)(tileSlots >> 6);
     const uint64_t tilesPerBlockC = (1ull << 28) / tileSlots;
-    const uint32_t sg_grid = 92, sg_block = 512;
+    uint32_t sg_grid = 92, sg_block = 512;
+    {   /* P0_SG_GRID: mark-kernel CTA count.  92 (the pre-pipeline value) is a
+           full-width wave; under P0_PIPE the marks only need to fill the walk's
+           latency shadow, so a smaller grid can be cheaper (contention knob). */
+        const char *ev = getenv("P0_SG_GRID");
+        if (ev) { int v = atoi(ev); if (v >= 1 && v <= 4096) sg_grid = (uint32_t)v; }
+    }
     const uint32_t wk_grid = 46, wk_block = 512;
 
     u128 A = ((g_start | 1) / 30u) * 30u;
@@ -1431,8 +1440,10 @@ static int run_walk_engine(void) {
     e = cudaMalloc(&d_ik2, nii2 * 4); if (e != cudaSuccess) die_cuda(e, "items alloc");
     e = cudaMalloc(&d_wtab, 8 * 4); if (e != cudaSuccess) die_cuda(e, "wtab alloc");
     e = cudaMalloc(&d_wpidx, 3 * 4); if (e != cudaSuccess) die_cuda(e, "wpidx alloc");
-    e = cudaMalloc(&d_out, (size_t)(1u << 20) * sizeof(w_gaprec_t)); if (e != cudaSuccess) die_cuda(e, "gap buffer alloc");
-    e = cudaMalloc(&d_stats, 2 * sizeof(unsigned long long)); if (e != cudaSuccess) die_cuda(e, "stats alloc");
+    /* P0_PIPE: two result/stat slots, one per alternating bitmap region, so a
+       batch's walk can stay in flight while the previous batch is collected. */
+    e = cudaMalloc(&d_out, 2 * (size_t)(1u << 20) * sizeof(w_gaprec_t)); if (e != cudaSuccess) die_cuda(e, "gap buffer alloc");
+    e = cudaMalloc(&d_stats, 4 * sizeof(unsigned long long)); if (e != cudaSuccess) die_cuda(e, "stats alloc");
     cudaMemcpy(d_p, hp, np * 8, cudaMemcpyHostToDevice);
     cudaMemcpy(d_iv, h_iv, np * 8, cudaMemcpyHostToDevice);
     cudaMemcpy(d_r, h_r, np * 8, cudaMemcpyHostToDevice);
@@ -1453,13 +1464,26 @@ static int run_walk_engine(void) {
     cudaMemcpyToSymbol(c30_pinv, pinv, sizeof(pinv));
     cudaFuncSetAttribute(class30_sieve_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)(tileWords * 8));
 #endif
-    cudaStream_t sA, sB;
-    cudaEvent_t evS[2], evW[2];
-    e = cudaStreamCreate(&sA); if (e != cudaSuccess) die_cuda(e, "stream create");
-    e = cudaStreamCreate(&sB); if (e != cudaSuccess) die_cuda(e, "stream create");
+    cudaStream_t sA, sB, sC;
+    cudaEvent_t evS[2], evW[2], evM[2], evX[2];
+    /* P0_PIPE priorities: the walk is the critical path, the mark must fill its
+       leftover latency (W1: the walk is latency/stream-limited, ~87% of its own
+       pure-MR ceiling), so sB runs at the highest and sA at the lowest stream
+       priority and the scheduler prefers walk CTAs.  Non-blocking streams: no
+       implicit legacy-stream coupling (the collect copies use their own sC). */
+    int prio_lo = 0, prio_hi = 0;
+    cudaDeviceGetStreamPriorityRange(&prio_lo, &prio_hi);   /* (least, greatest) */
+    e = cudaStreamCreateWithPriority(&sA, cudaStreamNonBlocking, prio_lo); if (e != cudaSuccess) die_cuda(e, "stream create");
+    e = cudaStreamCreateWithPriority(&sB, cudaStreamNonBlocking, prio_hi); if (e != cudaSuccess) die_cuda(e, "stream create");
+    e = cudaStreamCreateWithPriority(&sC, cudaStreamNonBlocking, prio_hi); if (e != cudaSuccess) die_cuda(e, "stream create");
     for (int i = 0; i < 2; i++) {
-        e = cudaEventCreateWithFlags(&evS[i], cudaEventDisableTiming); if (e != cudaSuccess) die_cuda(e, "event create");
-        e = cudaEventCreateWithFlags(&evW[i], cudaEventDisableTiming); if (e != cudaSuccess) die_cuda(e, "event create");
+        /* P0_SPLIT: timing-enabled - the three events measure the mark stage
+           (evM->evS, stream A) and the walk stage (evS->evW, stream B); the
+           sums are printed as the stage-split line in the summary. */
+        e = cudaEventCreate(&evS[i]); if (e != cudaSuccess) die_cuda(e, "event create");
+        e = cudaEventCreate(&evW[i]); if (e != cudaSuccess) die_cuda(e, "event create");
+        e = cudaEventCreate(&evM[i]); if (e != cudaSuccess) die_cuda(e, "event create");
+        e = cudaEventCreate(&evX[i]); if (e != cudaSuccess) die_cuda(e, "event create");
         cudaEventRecord(evW[i], sB);   /* pre-recorded: first waits are no-ops */
     }
     w_gaprec_t *hgaps = (w_gaprec_t *)malloc((size_t)(1u << 20) * sizeof(w_gaprec_t));
@@ -1512,87 +1536,134 @@ static int run_walk_engine(void) {
     int sb = 0;
     uint64_t b_next = b0;
     unsigned long long jumps_total = 0;
-    for (uint64_t b = b0; b < b_total && !g_stop; b += K) {
-        int r = (sb++) & 1;
-        uint64_t k = b_total - b; if (k > K) k = K;                 /* blocks reported here */
-        uint64_t cnb = k + ((b + k < b_total) ? 1 : 0);             /* coverage (+1 lookahead) */
-        uint64_t *bm = d_bm + (size_t)r * region_words;
-        u128 Ab = A + (u128)b * (u128)blockNum30;
-        e = cudaStreamWaitEvent(sA, evW[r], 0);
-        if (e != cudaSuccess) die_cuda(e, "wait evW");
-        for (uint64_t j = 0; j < cnb; j++) {
-            u128 av = A + (u128)(b + j) * (u128)blockNum30;
-            u128 Aj = (av / 30u) * 30u;
+    double t_mark_gpu = 0.0, t_walk_gpu = 0.0;   /* P0_SPLIT stage sums (seconds) */
+    /* P0_PIPE (2026-10-05): the host used to block on evW[r] right after launching
+       batch b's walk, so the mark of batch b+1 could never overlap it (measured:
+       mark 34% + walk 66% = 99.5% of wall, i.e. strictly serial).  Now the walk of
+       batch b is collected one iteration LATER, while the next batch's marks are
+       already queued on sA: steady state = sB runs walks back-to-back with the mark
+       stage hidden behind them.  Safety: every batch owns one of the two per-region
+       result slots (sB is stream-ordered, so slot reuse is safe), and a slot is read
+       from the host only after cudaEventSynchronize of that batch's own evW. */
+    int prev_r = -1;                     /* region of the launched, not-yet-collected batch */
+    uint64_t prev_b = 0, prev_k = 0;     /* its first block and its reported block count */
+    for (uint64_t b = b0; ; b += K) {
+        int have_new = 0, nr = 0;
+        uint64_t nb = 0, nk = 0;
+        if (b < b_total && !g_stop) {
+            int r = (sb++) & 1;
+            uint64_t k = b_total - b; if (k > K) k = K;             /* blocks reported here */
+            uint64_t cnb = k + ((b + k < b_total) ? 1 : 0);         /* coverage (+1 lookahead) */
+            uint64_t *bm = d_bm + (size_t)r * region_words;
+            u128 Ab = A + (u128)b * (u128)blockNum30;
+            w_gaprec_t *out_r = d_out + (size_t)r * (1u << 20);
+            unsigned long long *st_r = d_stats + 2 * (size_t)r;
+            e = cudaStreamWaitEvent(sA, evW[r], 0);
+            if (e != cudaSuccess) die_cuda(e, "wait evW");
+            e = cudaEventRecord(evM[r], sA); if (e != cudaSuccess) die_cuda(e, "record evM");
+            for (uint64_t j = 0; j < cnb; j++) {
+                u128 av = A + (u128)(b + j) * (u128)blockNum30;
+                u128 Aj = (av / 30u) * 30u;
 #ifdef PHASE0_KERNEL_DLL
-            if (p0gpu_class30_sieve(d_p, d_iv, d_r, d_ip2, d_ik2, (uint32_t)nii2,
-                                   (uint64_t)Aj, (uint64_t)(Aj >> 64),
-                                   tileSlots, tilesPerBlockC, bm + j * cWords,
-                                   tileWords, d_wpidx, 1,
-                                   sg_grid, sg_block, (size_t)tileWords * 8,
-                                   sA) != 0)
-                die("p0gpu_class30_sieve failed");
+                if (p0gpu_class30_sieve(d_p, d_iv, d_r, d_ip2, d_ik2, (uint32_t)nii2,
+                                       (uint64_t)Aj, (uint64_t)(Aj >> 64),
+                                       tileSlots, tilesPerBlockC, bm + j * cWords,
+                                       tileWords, d_wpidx, 1,
+                                       sg_grid, sg_block, (size_t)tileWords * 8,
+                                       sA) != 0)
+                    die("p0gpu_class30_sieve failed");
 #else
-            class30_sieve_kernel<<<sg_grid, sg_block, (size_t)tileWords * 8, sA>>>(
-                d_p, d_iv, d_r, d_ip2, d_ik2, (uint32_t)nii2,
-                (uint64_t)Aj, (uint64_t)(Aj >> 64), tileSlots, tilesPerBlockC,
-                bm + j * cWords, tileWords, d_wpidx, 1);
+                class30_sieve_kernel<<<sg_grid, sg_block, (size_t)tileWords * 8, sA>>>(
+                    d_p, d_iv, d_r, d_ip2, d_ik2, (uint32_t)nii2,
+                    (uint64_t)Aj, (uint64_t)(Aj >> 64), tileSlots, tilesPerBlockC,
+                    bm + j * cWords, tileWords, d_wpidx, 1);
 #endif
-            e = cudaGetLastError();
-            if (e != cudaSuccess) die_cuda(e, "walk sieve launch");
-        }
-        e = cudaEventRecord(evS[r], sA); if (e != cudaSuccess) die_cuda(e, "record evS");
-        e = cudaStreamWaitEvent(sB, evS[r], 0); if (e != cudaSuccess) die_cuda(e, "wait evS");
-        e = cudaMemsetAsync(d_out, 0, sizeof(w_gaprec_t), sB); if (e != cudaSuccess) die_cuda(e, "gap reset");
-        /* d_stats must be zeroed per batch as well: the kernel accumulates with
-           atomicAdd and the host sums the per-batch values (without this the
-           cumulative counts are summed again, over-reporting tests/jumps). */
-        e = cudaMemsetAsync(d_stats, 0, 2 * sizeof(unsigned long long), sB); if (e != cudaSuccess) die_cuda(e, "stats reset");
-#ifdef PHASE0_KERNEL_DLL
-        if (p0gpu_walk(bm, cnb * cWords, (uint64_t)Ab, (uint64_t)(Ab >> 64),
-                       d_wtab, (uint32_t)gapmin, d_out, 1u << 20, d_stats,
-                       wk_grid, wk_block, sB) != 0)
-            die("p0gpu_walk failed");
-#else
-        walk_kernel7<<<wk_grid, wk_block, 0, sB>>>(bm, cnb * cWords,
-            (uint64_t)Ab, (uint64_t)(Ab >> 64), d_wtab, (uint32_t)gapmin,
-            d_out, 1u << 20, d_stats);
-#endif
-        e = cudaGetLastError(); if (e != cudaSuccess) die_cuda(e, "walk launch");
-        e = cudaEventRecord(evW[r], sB); if (e != cudaSuccess) die_cuda(e, "record evW");
-        e = cudaEventSynchronize(evW[r]); if (e != cudaSuccess) die_cuda(e, "walk sync");
-        uint32_t ng = 0;
-        /* counter lives in out[0].gap (offset 8), same layout as the engine's */
-        e = cudaMemcpy(&ng, (char *)d_out + 8, 4, cudaMemcpyDeviceToHost); if (e != cudaSuccess) die_cuda(e, "gap count copy");
-        if (ng > (1u << 20) - 1) {
-            fprintf(stderr, "[phase0-gpu] FATAL: walk gap buffer overflow (ng=%u)\n", ng);
-            return 1;
-        }
-        unsigned long long st2[2] = {0, 0};
-        e = cudaMemcpy(st2, d_stats, 16, cudaMemcpyDeviceToHost); if (e != cudaSuccess) die_cuda(e, "stats copy");
-        wj.tests += st2[0];
-        jumps_total += st2[1];
-        wj.batches++;
-        if (ng) {
-            e = cudaMemcpy(hgaps, d_out + 1, (size_t)ng * sizeof(w_gaprec_t), cudaMemcpyDeviceToHost);
-            if (e != cudaSuccess) die_cuda(e, "gap copy");
-            u128 rep_lo = A + (u128)b * (u128)blockNum30;
-            u128 rep_hi = A + (u128)(b + k) * (u128)blockNum30;
-            for (uint32_t i = 0; i < ng; i++) {
-                u128 lower = ((u128)Ahi << 64) | (u128)hgaps[i].slot;
-                uint64_t gap = hgaps[i].gap;
-                if (lower < rep_lo || lower >= rep_hi) continue;  /* other batch's range */
-                if (lower < g_start || lower >= range_end) continue;
-                process_prime_gap(&wj, lower, lower + (u128)gap, gap);
+                e = cudaGetLastError();
+                if (e != cudaSuccess) die_cuda(e, "walk sieve launch");
             }
+            e = cudaEventRecord(evS[r], sA); if (e != cudaSuccess) die_cuda(e, "record evS");
+            e = cudaStreamWaitEvent(sB, evS[r], 0); if (e != cudaSuccess) die_cuda(e, "wait evS");
+            e = cudaMemsetAsync(out_r, 0, sizeof(w_gaprec_t), sB); if (e != cudaSuccess) die_cuda(e, "gap reset");
+            /* d_stats must be zeroed per batch as well: the kernel accumulates with
+               atomicAdd and the host sums the per-batch values (without this the
+               cumulative counts are summed again, over-reporting tests/jumps). */
+            e = cudaMemsetAsync(st_r, 0, 2 * sizeof(unsigned long long), sB); if (e != cudaSuccess) die_cuda(e, "stats reset");
+            e = cudaEventRecord(evX[r], sB); if (e != cudaSuccess) die_cuda(e, "record evX");
+#ifdef PHASE0_KERNEL_DLL
+            if (p0gpu_walk(bm, cnb * cWords, (uint64_t)Ab, (uint64_t)(Ab >> 64),
+                           d_wtab, (uint32_t)gapmin, out_r, 1u << 20, st_r,
+                           wk_grid, wk_block, sB) != 0)
+                die("p0gpu_walk failed");
+#else
+            walk_kernel7<<<wk_grid, wk_block, 0, sB>>>(bm, cnb * cWords,
+                (uint64_t)Ab, (uint64_t)(Ab >> 64), d_wtab, (uint32_t)gapmin,
+                out_r, 1u << 20, st_r);
+#endif
+            e = cudaGetLastError(); if (e != cudaSuccess) die_cuda(e, "walk launch");
+            e = cudaEventRecord(evW[r], sB); if (e != cudaSuccess) die_cuda(e, "record evW");
+            have_new = 1; nr = r; nb = b; nk = k;
         }
-        b_next = b + k;
-        {   /* progress/checkpoint accounting (report-end of this batch) */
-            uint64_t done = (uint64_t)((uint64_t)((A + (u128)(b + k) * (u128)blockNum30) - g_start));
-            if (done > g_len) done = g_len;
-            __sync_synchronize();
-            g_resume_off[0] = done;
-            wj.ints = done - g_pre_ints;
+        /* ---- collect the batch launched in the PREVIOUS iteration (P0_PIPE) ---- */
+        if (prev_r >= 0) {
+            w_gaprec_t *out_p = d_out + (size_t)prev_r * (1u << 20);
+            unsigned long long *st_p = d_stats + 2 * (size_t)prev_r;
+            e = cudaEventSynchronize(evW[prev_r]); if (e != cudaSuccess) die_cuda(e, "walk sync");
+            {   /* P0_SPLIT: accumulate this batch's GPU-timeline stage durations.
+                   mark = evM->evS (pure mark-kernel time, stream A); walk =
+                   evX->evW (pure walk-kernel time, stream B - evX is recorded
+                   after the memsets, so the memsets stay out of the walk
+                   number).  When P0_PIPE overlaps the stages, mark+walk EXCEEDS
+                   the wall and "other" goes negative - that is the overlap. */
+                float ms = 0.0f;
+                if (cudaEventElapsedTime(&ms, evM[prev_r], evS[prev_r]) == cudaSuccess) t_mark_gpu += (double)ms * 1e-3;
+                if (cudaEventElapsedTime(&ms, evX[prev_r], evW[prev_r]) == cudaSuccess) t_walk_gpu += (double)ms * 1e-3;
+            }
+            uint32_t ng = 0;
+            unsigned long long st2[2] = {0, 0};
+            /* The collect copies MUST NOT use the legacy default stream: a
+               synchronous cudaMemcpy there serializes against EVERY blocking
+               stream (implicit sync), i.e. it waits for the next batch's marks
+               and walk that were just queued on sA/sB and re-serializes the
+               pipeline (measured 2026-10-05: v1 of P0_PIPE still showed
+               mark 34% + walk 66% = 100% of wall for exactly this reason).
+               sC is a private stream and the source data is already final
+               (the host synchronized evW[prev_r] above). */
+            e = cudaMemcpyAsync(&ng, (char *)out_p + 8, 4, cudaMemcpyDeviceToHost, sC); if (e != cudaSuccess) die_cuda(e, "gap count copy");
+            e = cudaMemcpyAsync(st2, st_p, 16, cudaMemcpyDeviceToHost, sC); if (e != cudaSuccess) die_cuda(e, "stats copy");
+            e = cudaStreamSynchronize(sC); if (e != cudaSuccess) die_cuda(e, "collect sync");
+            if (ng > (1u << 20) - 1) {
+                fprintf(stderr, "[phase0-gpu] FATAL: walk gap buffer overflow (ng=%u)\n", ng);
+                return 1;
+            }
+            wj.tests += st2[0];
+            jumps_total += st2[1];
+            wj.batches++;
+            if (ng) {
+                e = cudaMemcpyAsync(hgaps, out_p + 1, (size_t)ng * sizeof(w_gaprec_t), cudaMemcpyDeviceToHost, sC);
+                if (e != cudaSuccess) die_cuda(e, "gap copy");
+                e = cudaStreamSynchronize(sC); if (e != cudaSuccess) die_cuda(e, "gap copy sync");
+                u128 rep_lo = A + (u128)prev_b * (u128)blockNum30;
+                u128 rep_hi = A + (u128)(prev_b + prev_k) * (u128)blockNum30;
+                for (uint32_t i = 0; i < ng; i++) {
+                    u128 lower = ((u128)Ahi << 64) | (u128)hgaps[i].slot;
+                    uint64_t gap = hgaps[i].gap;
+                    if (lower < rep_lo || lower >= rep_hi) continue;  /* other batch's range */
+                    if (lower < g_start || lower >= range_end) continue;
+                    process_prime_gap(&wj, lower, lower + (u128)gap, gap);
+                }
+            }
+            b_next = prev_b + prev_k;
+            {   /* progress/checkpoint accounting (report-end of this batch) */
+                uint64_t done = (uint64_t)((uint64_t)((A + (u128)(prev_b + prev_k) * (u128)blockNum30) - g_start));
+                if (done > g_len) done = g_len;
+                __sync_synchronize();
+                g_resume_off[0] = done;
+                wj.ints = done - g_pre_ints;
+            }
+            prev_r = -1;
         }
+        if (have_new) { prev_r = nr; prev_b = nb; prev_k = nk; }
+        else break;
     }
     int all_done = (b_next >= b_total) ? 1 : 0;
     g_mon_stop = 1;
@@ -1624,6 +1695,15 @@ static int run_walk_engine(void) {
                (unsigned long long)wj.batches, (unsigned long long)wj.tests,
                wall > 0 ? (double)wj.tests / wall : 0.0,
                jumps_total > 0 ? (double)wj.tests / (double)jumps_total : 0.0);
+        if (t_mark_gpu + t_walk_gpu > 0.0) {
+            double other = wall - t_mark_gpu - t_walk_gpu;
+            printf("[phase0-gpu] stage split (GPU events): mark=%.1f s (%.1f%%)  "
+                   "walk=%.1f s (%.1f%%)  other=%.1f s (%.1f%%) "
+                   "[other = host/sync/launch+boot; negative = mark/walk overlap]\n",
+                   t_mark_gpu, 100.0 * t_mark_gpu / wall,
+                   t_walk_gpu, 100.0 * t_walk_gpu / wall,
+                   other, 100.0 * other / wall);
+        }
         printf("[phase0-gpu] gaps per merit threshold (this session -> per 1e14 ints):\n");
         for (int bnd = 0; bnd < N_BANDS; bnd++)
             printf("[phase0-gpu]   m>=%2.0f : %8llu  ->  %.4g\n",
@@ -1644,8 +1724,8 @@ static int run_walk_engine(void) {
         printf("[phase0-gpu] --- end ---\n");
     }
 
-    cudaStreamDestroy(sA); cudaStreamDestroy(sB);
-    for (int i = 0; i < 2; i++) { cudaEventDestroy(evS[i]); cudaEventDestroy(evW[i]); }
+    cudaStreamDestroy(sA); cudaStreamDestroy(sB); cudaStreamDestroy(sC);
+    for (int i = 0; i < 2; i++) { cudaEventDestroy(evS[i]); cudaEventDestroy(evW[i]); cudaEventDestroy(evM[i]); cudaEventDestroy(evX[i]); }
     cudaFree(d_bm); cudaFree(d_p); cudaFree(d_iv); cudaFree(d_r);
     cudaFree(d_ip2); cudaFree(d_ik2); cudaFree(d_wtab); cudaFree(d_wpidx);
     cudaFree(d_out); cudaFree(d_stats);

@@ -147,6 +147,18 @@ first P0_PIPE version still showed 100 % serial for exactly this reason).
 Stop/resume is unchanged - state is written from the deferred collect, and a
 stop drains the in-flight batch first.
 
+Mark item-loop (2026-10-05, later): two changes in the class-30 sieve's item
+loop, both bit-identical in output - an **early break** when a mark chunk
+passes the tile end (positions are monotone; the loop used to walk all 64
+guarded iterations) and **item chunks of 256 marks** instead of 64 (4x fewer
+item rows; `offset = C*p*k0` in builder and kernel together).  Measured at
+the campaign geometry (2e13, `--gap-min 1586`, K=64): 57.5 s -> 50.9 s =
+**another -11.5 %** (3.48e11 -> 3.93e11 ints/s; ABBA reps=2, mark span
+58.1 -> 50.0 s, walk unchanged, `tests` identical 35,646,342,874; sorted
+gap-set parity on 5 geometries + P-invariance + split parity all green).
+`--walk-primes 15000` remains the wall optimum (60000 -> 29.4 s vs 25.9 s at
+1e13) - see `docs/PHASE0_scan_bench.md` §22.
+
 Reproduce: `python3 scripts/p0_bench.py --bin-b <pre-P0_PIPE binary>
 --length 2e13 --gap-min 1586 --label P0_PIPE` (~8 min ABBA; raw lines in
 `data/p0_bench_results.txt`).

@@ -158,15 +158,21 @@ __global__ static void class30_sieve_kernel(const uint64_t * __restrict__ primes
                     ph = ph2; j = j2;
                 }
             }
-            uint32_t p32 = pos_base + 64u * cur_p * k0;
+            uint32_t p32 = pos_base + 256u * cur_p * k0;
             if (p32 >= (uint32_t)tileSlots) continue;
-            for (int r8 = 0; r8 < 8; r8++) {
+            for (int r8 = 0; r8 < 32; r8++) {
+                int done = 0;
 #pragma unroll
                 for (int st = 0; st < 8; st++) {
-                    if (p32 < (uint32_t)tileSlots)
-                        atomicOr(((unsigned int *)sh) + (p32 >> 5), 1u << (p32 & 31u));
+                    /* positions are strictly monotone (step >= +1), so once
+                       past the tile the rest of the chunk is skipped instead
+                       of walking 64 guarded iterations - the dominant item
+                       cost at deep sieve depths, and identical marks. */
+                    if (p32 >= (uint32_t)tileSlots) { done = 1; break; }
+                    atomicOr(((unsigned int *)sh) + (p32 >> 5), 1u << (p32 & 31u));
                     p32 += step[st];
                 }
+                if (done) break;
             }
         }
         }

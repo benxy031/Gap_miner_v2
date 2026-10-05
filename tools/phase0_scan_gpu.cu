@@ -1393,7 +1393,7 @@ static int run_walk_engine(void) {
     size_t icap2 = 0;
     for (size_t i = 0; i < np; i++) {
         if (hp[i] <= 13u) continue;
-        icap2 += (size_t)((tileSlots / hp[i] + 2 + 63) / 64);
+        icap2 += (size_t)((tileSlots / hp[i] + 2 + 255) / 256);
     }
     uint32_t *h_ip2 = (uint32_t *)malloc(icap2 * 4), *h_ik2 = (uint32_t *)malloc(icap2 * 4);
     if (!h_ip2 || !h_ik2) die("walk item alloc failed");
@@ -1401,7 +1401,7 @@ static int run_walk_engine(void) {
     for (size_t i = 0; i < np; i++) {
         if (hp[i] <= 13u) continue;
         uint64_t marks = tileSlots / hp[i] + 2;
-        uint32_t chunks = (uint32_t)((marks + 63) / 64);
+        uint32_t chunks = (uint32_t)((marks + 255) / 256);
         for (uint32_t c = 0; c < chunks; c++) { h_ip2[nii2] = (uint32_t)i; h_ik2[nii2] = c; nii2++; }
     }
     uint32_t h_wpidx[3] = {0, 0, 0};

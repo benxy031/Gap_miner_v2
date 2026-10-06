@@ -166,7 +166,7 @@ static int load_state(const char *path, uint64_t *k, mpz_t last_prime,
    K=512 at shift998 now costs ~0.7 GB instead of ~7.4 GB, the walk runs at
    **1010 win/s vs 773 at K=128 (+30.7%, ABBA 40 s arms, dev 3070)** and it is no
    longer refused by an 8 GB card at all.  K<=512 behaves exactly as before. */
-#define GAP_HUNT_BATCH_MAX 1024
+#define GAP_HUNT_BATCH_MAX 4096
 /* Default 512 (was 64; the ~4 ms per-LAUNCH floor of a chain round is amortized
    over the windows sharing it).  Doubling history: 32 -> 64 was +21% (shift1017
    559 -> 679 win/s) and +28% (shift507 1876 -> 2406 win/s); re-measured
@@ -231,15 +231,23 @@ static int g_jump = 0;         /* GAP_HUNT_JUMP env: Kehrig-style walk */
    1903 (+12%), 1017/m10 603 -> 662 (+10%).  The optimum is flat 12..20 (as in
    the mining chain's own sweep); 8 and >=24 are worse. */
 #define GAP_HUNT_JUMP2_CHUNK_DEFAULT 16
-#define GAP_HUNT_PREFETCH_DEFAULT 20   /* windows/round of the next-flight
-                                          prefetch (0 = off, old serial
-                                          fill+scan).  2026-10-02 quantum
-                                          sweep, shift507, K=1024: m10
-                                          12->3604, 16->3700, 20->3741,
-                                          24->3632, 32->3437 win/s; m18
-                                          16->5488, 20->5581, 28->5572.
-                                          24+ overshoots the MR round (the
-                                          fill then EXTENDS the round). */
+#define GAP_HUNT_PREFETCH_DEFAULT 20   /* floor of the next-flight prefetch
+                                          (windows/round; 0 = off, old serial
+                                          fill+scan).  The active quantum is
+                                          self-tuned from the flight's chain
+                                          length unless GAP_HUNT_PREFETCH pins
+                                          it -- see gh_prefetch_qty().  This
+                                          value is also the floor: it was the
+                                          fixed optimum of the 2026-10-02
+                                          sweep (shift507, K=1024, before the
+                                          pair fold: m10 12->3604, 16->3700,
+                                          20->3741, 24->3632, 32->3437; m18
+                                          16->5488, 20->5581, 28->5572) and it
+                                          is still the best value on surfaces
+                                          whose flights need <=20 windows per
+                                          round (measured 2026-10-07: m10
+                                          21->+0.25%, shift1017 m16 33->+0.5%,
+                                          K=512 floor). */
 static int g_jump2 = 1;        /* GAP_HUNT_JUMP2=0 restores the full scan */
 static int g_jump2_chunk = GAP_HUNT_JUMP2_CHUNK_DEFAULT;
 /* BEACON-style wave start (GAP_HUNT_JUMP2_WAVE): each window's scan tests
@@ -796,19 +804,72 @@ struct gh_prefetch {
 };
 static struct gh_prefetch g_pref;
 static int g_pref_qty = GAP_HUNT_PREFETCH_DEFAULT;
+static int g_pref_qty_env = 0;   /* GAP_HUNT_PREFETCH given -> fixed value */
+/* Self-tuning quantum (used when GAP_HUNT_PREFETCH is not set).  The fill runs
+   inside the current round's submit->collect window, so it has exactly as many
+   rounds as the current flight's chain takes to deliver the NEXT flight's K
+   windows -- i.e. the fill rate has to be K / rounds-per-flight, and a fixed
+   quantum that misses that either starves the pipeline or becomes the round's
+   critical path.  The flight's chain length is a property of the chain alone
+   (all K windows advance one slice per round, independent of how fast the fill
+   feeds them), so it is the one signal that is not self-confirming; the
+   completion rate per round is NOT usable for this (it is pinned to the fill
+   rate by conservation).
+   Measured 2026-10-07 (shift507/p74_lex_m30, m16, interleaved ABBA arms,
+   byte-identical emitted sets): the optimum follows K / rounds-per-flight,
+   20 (floor, = old default) at K=512 (drain 16.5), 33 at K=1024 (31 rounds,
+   +8.1% over a fixed 20), ~66 at K=2048 (66 -> 7894 and 33 -> 7915 vs 7583 at
+   a fixed 20).  The 2026-10-02 sweep that picked 20 as the default predates the
+   pair-folded fill of 2026-10-06, whose per-round cost structure moved the
+   optimum.
+   GH_PREF_TUNE_FLIGHTS flights are averaged (a flight's chain length moves with
+   the window geometry and drifts with the anchor), and the result is floored at
+   GAP_HUNT_PREFETCH_DEFAULT, so a geometry that needs no more than the old
+   default keeps the pre-existing behaviour bit for bit. */
+static int g_pref_rounds_flight = 0;   /* smoothed chain rounds per flight */
+#define GH_PREF_TUNE_FLIGHTS 4
+#define GH_PREF_QTY_MAX 512
+
+/* Windows of the next flight to fill per round: the explicit
+   GAP_HUNT_PREFETCH value when given (0 = fill disabled), else the estimate. */
+static int gh_prefetch_qty(void) {
+    if (g_pref_qty_env)
+        return g_pref_qty;
+    if (g_pref_rounds_flight <= 0)
+        return GAP_HUNT_PREFETCH_DEFAULT;
+    uint32_t k = g_batch > 0 ? (uint32_t)g_batch : 1U;
+    int q = (int)((k + (uint32_t)g_pref_rounds_flight - 1U) /
+                  (uint32_t)g_pref_rounds_flight);
+    if (q < GAP_HUNT_PREFETCH_DEFAULT)
+        q = GAP_HUNT_PREFETCH_DEFAULT;
+    if (q > GH_PREF_QTY_MAX)
+        q = GH_PREF_QTY_MAX;
+    return q;
+}
+
+/* One flight's chain finished after `rounds` rounds: fold it into the estimate
+   the next flight's fill uses. */
+static void gh_prefetch_note_flight(uint32_t rounds) {
+    if (rounds == 0)
+        return;
+    g_pref_rounds_flight = g_pref_rounds_flight > 0
+        ? (3 * g_pref_rounds_flight + (int)rounds + 2) / GH_PREF_TUNE_FLIGHTS
+        : (int)rounds;
+}
 
 /* Fill up to g_pref_qty windows of the prefetch target.  Returns 1 while
    healthy (done included), 0 on failure. */
 static int gh_prefetch_step(struct gh_prefetch *pf, struct gh_ctx *g) {
     if (!pf->b || pf->done || pf->failed)
         return !pf->failed;
-    uint32_t left = (uint32_t)g_pref_qty;
+    const uint32_t qty = (uint32_t)gh_prefetch_qty();
+    uint32_t left = qty;
     while (left > 0 && pf->next_i < (uint32_t)g_batch) {
         uint32_t q = gh_fill_quantum(g, pf->next_i, pf->k0 + pf->next_i);
         /* Never split a pair across quanta; a quantum that is too small to
            hold one still gets it when nothing has been done yet (the quantum
            is a scheduling knob, not a correctness boundary). */
-        if (q > left && left < (uint32_t)g_pref_qty)
+        if (q > left && left < qty)
             break;
         if (!gh_fill_step(pf->b, pf->slot, pf->next_i, pf->k0 + pf->next_i,
                           g, &pf->cum, q)) {
@@ -889,7 +950,9 @@ static int gh_jump2_scan(struct gh_batch *b, int slot, struct gh_ctx *g,
     uint32_t lo[GAP_HUNT_BATCH_MAX], hi[GAP_HUNT_BATCH_MAX];
     uint32_t dcum[GAP_HUNT_BATCH_MAX];
     int any_active = 1;
+    uint32_t rounds_flight = 0;
     while (any_active) {
+        rounds_flight++;
         uint32_t total = 0;
         for (uint32_t i = 0; i < K; i++) {
             int on = (phase[i] != J2_DONE && chi[i] > clo[i]);
@@ -1084,6 +1147,7 @@ static int gh_jump2_scan(struct gh_batch *b, int slot, struct gh_ctx *g,
                 any_active = 1;
         }
     }
+    gh_prefetch_note_flight(rounds_flight);
     return 1;
 }
 
@@ -1413,6 +1477,14 @@ int gap_hunt_run(const struct gap_hunt_config *cfg) {
             int v = atoi(kb);
             if (v >= 1 && v <= GAP_HUNT_BATCH_MAX)
                 g_batch = v;
+            else if (v > GAP_HUNT_BATCH_MAX)
+                fprintf(stderr,
+                        "[GAP_HUNT] GAP_HUNT_BATCH=%d exceeds the compile-time "
+                        "ceiling %d -> using %d (K>%d is measured to buy nothing "
+                        "on this walk and the buffers are sized by this cap; "
+                        "raise GAP_HUNT_BATCH_MAX to experiment)\n",
+                        v, GAP_HUNT_BATCH_MAX, GAP_HUNT_BATCH_MAX,
+                        GAP_HUNT_BATCH_MAX);
         }
         const char *qv = getenv("GAP_HUNT_QUARTER");
         if (qv && qv[0] && atoi(qv) > 0)
@@ -1448,12 +1520,15 @@ int gap_hunt_run(const struct gap_hunt_config *cfg) {
                 g_jump2_wave = w;
         }
         /* GAP_HUNT_PREFETCH = windows of the NEXT flight filled per round
-           (0 disables -> the old serial fill+scan). */
+           (0 disables -> the old serial fill+scan).  Unset = self-tuning: the
+           quantum follows the flight's measured chain length (gh_prefetch_qty). */
         const char *j2p = getenv("GAP_HUNT_PREFETCH");
         if (j2p && j2p[0]) {
             int pp = atoi(j2p);
-            if (pp >= 0 && pp <= 512)
+            if (pp >= 0 && pp <= GH_PREF_QTY_MAX) {
                 g_pref_qty = pp;
+                g_pref_qty_env = 1;
+            }
         }
         /* GAP_HUNT_PAIR=0 disables the two-window fill round (kept as a
            parity/rollback knob: the pair mark is bit-exact per
@@ -1849,6 +1924,7 @@ int gap_hunt_run(const struct gap_hunt_config *cfg) {
             "jump2_chunk=%d "
             "jump2_wave=%d "
             "prefetch=%d "
+            "prefetch_auto=%d "
             "residue_incr=%d "
             "kmax=%llu min_merit=%.6f "
             "k0=%llu device=%d\n",            rt.shift, rt.n_primes,
@@ -1868,6 +1944,7 @@ int gap_hunt_run(const struct gap_hunt_config *cfg) {
                                  1000000U),
             g_quarter,
             g_jump, g_jump2, g_jump2_chunk, g_jump2_wave, g_pref_qty,
+            !g_pref_qty_env,
             residue_incr,
             (unsigned long long)g_kmax, cfg->min_merit,
             (unsigned long long)k, cfg->device);
@@ -2029,7 +2106,7 @@ int gap_hunt_run(const struct gap_hunt_config *cfg) {
                 g_stop = 1;     /* KMAX reached and both flights drained */
             }
             struct gh_prefetch *pf = NULL;
-            if (filled_now && !g_stop && g_pref_qty > 0 &&
+            if (filled_now && !g_stop && gh_prefetch_qty() > 0 &&
                 !(g_kmax && next_k >= g_kmax)) {
                 g_pref.b = fls[turn ^ 1];
                 g_pref.slot = turn ^ 1;
@@ -2190,6 +2267,7 @@ int gap_hunt_run(const struct gap_hunt_config *cfg) {
                         "[GAP_HUNT] chain: tests/window=%.1f "
                         "(ff=%.1f jb=%.1f fe=%.1f) "
                         "rounds/1k-win=%.1f prefetch/1k-win=%.1f "
+                        "pref-qty=%d "
                         "hops/1k=%.1f emits/1k=%.1f "
                         "jb-slices/hop=%.2f jb-tests/slice=%.1f ext/hop=%.2f "
                         "(jump2 only)\n",
@@ -2199,6 +2277,7 @@ int gap_hunt_run(const struct gap_hunt_config *cfg) {
                         dw ? (double)g_j2_t_fe / (double)dw : 0.0,
                         dw ? 1000.0 * (double)rounds_tick / (double)dw : 0.0,
                         dw ? 1000.0 * (double)g_j2_pref_windows / (double)dw : 0.0,
+                        gh_prefetch_qty(),
                         dw ? 1000.0 * (double)g_j2_hops / (double)dw : 0.0,
                         dw ? 1000.0 * (double)g_j2_emits / (double)dw : 0.0,
                         g_j2_hops ? (double)g_j2_jb_slices / (double)g_j2_hops : 0.0,

@@ -383,16 +383,49 @@ static uint32_t gh_jump2_find_q(struct gh_batch *b, uint32_t i, uint32_t p,
     return lo < b->count[i] ? lo : UINT32_MAX;
 }
 
-/* One window of a flight fill: mark + extract + per-window accounting.
-   Extracted VERBATIM from gh_batch_fill (P1 split, 2026-10-02) so the jump2
-   prefetch and the serial fill share one implementation; `cum_io` carries the
-   running candidate count (offset of this window's first candidate) and
-   `k` is the window's k.  Returns 1 on success, 0 on failure (fail-closed;
-   the failing check prints its own diagnostic). */
-static int gh_fill_window_step(struct gh_batch *b, int slot, uint32_t i,
-                               uint64_t k, struct gh_ctx *g, uint32_t *cum_io) {
+/* Upper bound on the per-window base-limb count (mirrors GPU_SIEVE_MAX_BASE_LIMBS
+   in gpu_sieve.cu, which is the capacity of the sieve's base buffer; the walk's
+   own width is g->gpu_limbs <= this). */
+#define GAP_HUNT_MAX_LIMBS 64
+
+/* One window of a flight fill, split into a MARK PHASE and an EXTRACT PHASE
+   (2026-10-06) so two consecutive windows can be marked in ONE round (see
+   gh_fill_pair_step): the pair needs both windows' mark inputs before it can
+   issue the shared mark, and the extracts must then run per window.  The
+   mark phase does the host-side work (bases, mpz export, geometry, residue
+   mode decision) and stashes everything the extract needs in the struct
+   below; the commit runs the mark; the extract runs the (parallel) survivor
+   extraction and updates the running candidate count `cum_io`.
+   Returns 1 on success, 0 on failure (fail-closed; the failing check prints
+   its own diagnostic). */
+struct gh_fill_win {
+    uint32_t i;                 /* window index inside the flight        */
+    uint64_t k;                 /* its k (diagnostics)                   */
+    int      buf;               /* bitmap ping-pong buffer (i & 1)       */
+    uint64_t first_odd_offset;  /* this window's geometry (parity flip)  */
+    uint64_t odd_size;
+    /* This window's base limbs.  NOT g->base_limbs: in a two-window round the
+       second mark phase overwrites the shared buffer before the FIRST window
+       has been extracted, which would build its candidates from the wrong base
+       (shifted by one CRT step P) and emit false records.  The mark phase
+       fills this copy and the extract uploads it. */
+    uint64_t *limbs;
+    uint64_t lo_tail_odd;
+    uint64_t class_mask;
+    uint32_t base_mod60;
+    int      used_mode;         /* residue mode the phase selected       */
+    uint64_t used_m;
+    uint64_t ht0;               /* host-timing base for the extract      */
+};
+
+static int gh_fill_mark_phase(struct gh_batch *b, uint32_t i, uint64_t k,
+                              struct gh_ctx *g, struct gh_fill_win *w,
+                              uint64_t *limbs) {
     uint64_t ht0 = g_host_timing ? gh_now_us() : 0;
     b->base_k[i] = k;
+    w->i = i;
+    w->k = k;
+    w->limbs = limbs;
     mpz_set(g->bk, g->b0);
     mpz_addmul_ui(g->bk, g->P, (uint64_t)k);
     mpz_sub_ui(g->wb, g->bk, g->back_limit);
@@ -403,10 +436,9 @@ static int gh_fill_window_step(struct gh_batch *b, int slot, uint32_t i,
        prefilter is skipped there (mini-sieve alone, still exact). */
     b->base_even[i] = (uint8_t)(mpz_odd_p(g->wb) ? 0 : 1);
 
-    memset(g->base_limbs, 0, (size_t)g->gpu_limbs * sizeof(uint64_t));
+    memset(limbs, 0, (size_t)g->gpu_limbs * sizeof(uint64_t));
     size_t exported = 0;
-    mpz_export(g->base_limbs, &exported, -1, sizeof(uint64_t), 0, 0,
-               g->wb);
+    mpz_export(limbs, &exported, -1, sizeof(uint64_t), 0, 0, g->wb);
     if (exported > (size_t)g->gpu_limbs) {
         fprintf(stderr,
                 "[GAP_HUNT] fill fail: base export %zu > %d limbs "
@@ -414,12 +446,14 @@ static int gh_fill_window_step(struct gh_batch *b, int slot, uint32_t i,
                 exported, g->gpu_limbs, (unsigned long long)k, i);
         return 0;
     }
-    uint64_t first_odd_offset = (g->base_limbs[0] & 1ULL) ? 0U : 1U;
+    uint64_t first_odd_offset = (limbs[0] & 1ULL) ? 0U : 1U;
     uint64_t odd_size = 0;
     if (g->interval > first_odd_offset)
         odd_size = (g->interval - first_odd_offset + 1ULL) >> 1;
 
-    int buf = (int)(i & 1);
+    w->buf = (int)(i & 1);
+    w->first_odd_offset = first_odd_offset;
+    w->odd_size = odd_size;
     if (g_host_timing) {
         uint64_t ht1 = gh_now_us();
         g_ht_setup += ht1 - ht0;
@@ -438,55 +472,86 @@ static int gh_fill_window_step(struct gh_batch *b, int slot, uint32_t i,
        back to the full reduction, so a desynced cache can only lose time,
        never correctness; the optional GAP_HUNT_RESIDUE_CHECK still stops
        the walk fail-closed on a detected desync. */
-    int mark_ok;
-    int used_mode = 0;          /* 0 = full, 1 = step, 2 = folded m */
-    uint64_t used_m = 0;
+    w->used_mode = 0;
+    w->used_m = 0;
     if (g->residue_incr >= 2 && g->res_valid && k >= g->res_k &&
         (k - g->res_k) <= g->res_m_limit) {
-        used_m = k - g->res_k;
-        mark_ok = gpu_sieve_mark_from_base_mw(g->sieve, odd_size,
-                                              first_odd_offset, buf, used_m,
-                                              g->primes, g->inv_p,
-                                              g->prime_count, NULL, 0);
-        used_mode = 2;
+        w->used_mode = 2;
+        w->used_m = k - g->res_k;
     } else if (g->residue_incr == 1 && g->res_valid &&
                k == g->res_k + 1) {
-        mark_ok = gpu_sieve_mark_from_base_incr(g->sieve, odd_size,
-                                                first_odd_offset, buf,
+        w->used_mode = 1;
+    }
+
+    w->class_mask = g->quarter ? halfclass_visible_mask() : UINT64_MAX;
+    /* The extract filter classes VALUES by (base + offset) mod 60 - pass the
+       real window-base residue, never 0. */
+    w->base_mod60 = (uint32_t)mpz_fdiv_ui(g->wb, 60);
+    /* Extension band [tail_start, interval): extracted ALL-classes so
+       every prime there is a chain anchor (containers always exist). */
+    uint64_t lo_tail_odd = 0;
+    if (g->tail_start > first_odd_offset)
+        lo_tail_odd = (g->tail_start - first_odd_offset + 1ULL) >> 1;
+    if (lo_tail_odd > odd_size)
+        lo_tail_odd = odd_size;
+    if (!g->quarter)
+        lo_tail_odd = odd_size;   /* full-class: one whole-range pass */
+    w->lo_tail_odd = lo_tail_odd;
+    w->ht0 = ht0;
+    return 1;
+}
+
+/* Execute the mark the phase selected (residue mode 0/1/2) and update the
+   cached-residue bookkeeping. */
+static int gh_fill_mark_commit(struct gh_ctx *g, struct gh_fill_win *w) {
+    int mark_ok;
+    uint64_t k = w->k;
+    uint32_t i = w->i;
+    switch (w->used_mode) {
+    case 2:
+        mark_ok = gpu_sieve_mark_from_base_mw(g->sieve, w->odd_size,
+                                              w->first_odd_offset, w->buf,
+                                              w->used_m, g->primes, g->inv_p,
+                                              g->prime_count, NULL, 0);
+        break;
+    case 1:
+        mark_ok = gpu_sieve_mark_from_base_incr(g->sieve, w->odd_size,
+                                                w->first_odd_offset, w->buf,
                                                 g->primes, g->inv_p,
                                                 g->prime_count, NULL, 0);
-        used_mode = 1;
-    } else {
-        mark_ok = gpu_sieve_mark_from_base(g->sieve, odd_size,
-                                           first_odd_offset, g->base_limbs,
-                                           g->gpu_limbs, buf, g->primes,
+        break;
+    default:
+        mark_ok = gpu_sieve_mark_from_base(g->sieve, w->odd_size,
+                                           w->first_odd_offset, w->limbs,
+                                           g->gpu_limbs, w->buf, g->primes,
                                            g->inv_p, g->prime_count,
                                            NULL, 0);
+        break;
     }
     if (!mark_ok) {
         g->res_valid = 0;   /* the cached residues may be half-advanced */
         fprintf(stderr, "[GAP_HUNT] fill fail: mark "
                 "(k=%llu i=%u odd=%llu fo=%llu)\n",
                 (unsigned long long)k, i,
-                (unsigned long long)odd_size,
-                (unsigned long long)first_odd_offset);
+                (unsigned long long)w->odd_size,
+                (unsigned long long)w->first_odd_offset);
         return 0;
     }
-    if (used_mode != 2) {
+    if (w->used_mode != 2) {
         /* Modes 0/1 leave the cache corresponding to k itself; mode 2
            leaves it anchored (m carries the difference). */
         g->res_k = k;
         g->res_valid = 1;
     }
-    if (used_mode != 0 && g->residue_check) {
+    if (w->used_mode != 0 && g->residue_check) {
         g->res_windows++;
         if (g->res_windows >= g->residue_check) {
             g->res_windows = 0;
             uint64_t mismatches = 0;
-            if (!gpu_sieve_residues_check(g->sieve, g->base_limbs,
+            if (!gpu_sieve_residues_check(g->sieve, w->limbs,
                                           g->gpu_limbs, g->primes,
                                           g->inv_p, g->prime_count,
-                                          used_m, &mismatches)) {
+                                          w->used_m, &mismatches)) {
                 fprintf(stderr, "[GAP_HUNT] residue check call failed "
                         "(k=%llu)\n", (unsigned long long)k);
                 g->res_valid = 0;
@@ -503,79 +568,182 @@ static int gh_fill_window_step(struct gh_batch *b, int slot, uint32_t i,
             }
         }
     }
-
     if (g_host_timing) {
-        uint64_t ht1 = gh_now_us();
-        g_ht_mark += ht1 - ht0;
-        ht0 = ht1;
+        g_ht_mark += gh_now_us() - w->ht0;
+        w->ht0 = gh_now_us();
     }
-    uint64_t class_mask =
-        g->quarter ? halfclass_visible_mask() : UINT64_MAX;
-    /* The extract filter classes VALUES by (base + offset) mod 60 —
-       pass the real window-base residue, never 0. */
-    uint32_t base_mod60 = (uint32_t)mpz_fdiv_ui(g->wb, 60);
-    /* Extension band [tail_start, interval): extracted ALL-classes so
-       every prime there is a chain anchor (containers always exist). */
-    uint64_t lo_tail_odd = 0;
-    if (g->tail_start > first_odd_offset)
-        lo_tail_odd = (g->tail_start - first_odd_offset + 1ULL) >> 1;
-    if (lo_tail_odd > odd_size)
-        lo_tail_odd = odd_size;
-    if (!g->quarter)
-        lo_tail_odd = odd_size;   /* full-class: one whole-range pass */
+    return 1;
+}
 
+/* EXTRACT PHASE: launch the (parallel) survivor extraction for this window,
+   collect its count and offsets, and advance the running candidate count. */
+static int gh_fill_extract(struct gh_batch *b, int slot, struct gh_ctx *g,
+                           struct gh_fill_win *w, uint32_t *cum_io) {
     uint64_t *d_cands = NULL;
     unsigned int nc = 0;
     if (!gpu_sieve_extract_pack_device_range_ex(
-            g->sieve, odd_size, first_odd_offset, 0, lo_tail_odd,
-            buf, slot, g->base_limbs, g->fermat_limbs, &d_cands,
-            b->win_off[i], &nc, base_mod60, class_mask,
+            g->sieve, w->odd_size, w->first_odd_offset, 0, w->lo_tail_odd,
+            w->buf, slot, w->limbs, g->fermat_limbs, &d_cands,
+            b->win_off[w->i], &nc, w->base_mod60, w->class_mask,
             g->region_start, (*cum_io))) {
         fprintf(stderr, "[GAP_HUNT] fill fail: extract "
                 "(k=%llu i=%u lo_tail_odd=%llu)\n",
-                (unsigned long long)k, i,
-                (unsigned long long)lo_tail_odd);
+                (unsigned long long)w->k, w->i,
+                (unsigned long long)w->lo_tail_odd);
         return 0;
     }
     if ((uint64_t)nc > g->capacity) {
         fprintf(stderr, "[GAP_HUNT] fill fail: nc=%u > capacity=%llu "
                 "(k=%llu i=%u)\n", nc,
                 (unsigned long long)g->capacity,
-                (unsigned long long)k, i);
+                (unsigned long long)w->k, w->i);
         return 0;
     }
     if ((*cum_io) + nc > g->cap) {
         fprintf(stderr, "[GAP_HUNT] fill fail: cum=%u + nc=%u > %llu "
                 "(k=%llu i=%u)\n", (*cum_io), nc,
                 (unsigned long long)g->cap,
-                (unsigned long long)k, i);
+                (unsigned long long)w->k, w->i);
         return 0;
     }
-    b->count[i] = nc;
-    b->cum[i] = (*cum_io);
+    b->count[w->i] = nc;
+    b->cum[w->i] = (*cum_io);
     (*cum_io) += nc;
 
-    if (g->quarter && lo_tail_odd < odd_size) {
+    if (g->quarter && w->lo_tail_odd < w->odd_size) {
         unsigned int nc2 = 0;
         if (!gpu_sieve_extract_pack_device_range_ex(
-                g->sieve, odd_size, first_odd_offset, lo_tail_odd,
-                odd_size, buf, slot, g->base_limbs, g->fermat_limbs,
-                &d_cands, b->win_off[i] + nc, &nc2,
-                base_mod60, UINT64_MAX, 0, (*cum_io)))
+                g->sieve, w->odd_size, w->first_odd_offset, w->lo_tail_odd,
+                w->odd_size, w->buf, slot, w->limbs, g->fermat_limbs,
+                &d_cands, b->win_off[w->i] + nc, &nc2,
+                w->base_mod60, UINT64_MAX, 0, (*cum_io)))
             return 0;
         if ((uint64_t)(nc + nc2) > g->capacity)
             return 0;
         if ((*cum_io) + nc2 > g->cap)
             return 0;
-        b->count[i] = nc + nc2;
+        b->count[w->i] = nc + nc2;
         (*cum_io) += nc2;
     }
     if (g_host_timing) {
         uint64_t ht1 = gh_now_us();
-        g_ht_extract += ht1 - ht0;
-        ht0 = ht1;
+        g_ht_extract += ht1 - w->ht0;
+        w->ht0 = ht1;
     }
     return 1;
+}
+
+/* One window = mark phase + commit + extract. */
+static int gh_fill_window_step(struct gh_batch *b, int slot, uint32_t i,
+                               uint64_t k, struct gh_ctx *g, uint32_t *cum_io) {
+    struct gh_fill_win w;
+    uint64_t limbs[GAP_HUNT_MAX_LIMBS];
+    if (!gh_fill_mark_phase(b, i, k, g, &w, limbs))
+        return 0;
+    if (!gh_fill_mark_commit(g, &w))
+        return 0;
+    return gh_fill_extract(b, slot, g, &w, cum_io);
+}
+
+/* Can windows k and k+1 be marked TOGETHER?  Only when both fold from the
+   same anchored residue cache (mode 2), which is the mode that reads the
+   prime/step tables once per mark: the pair kernel needs a valid anchor and
+   m+1 inside the fold limit.  The optional residue check keeps the
+   single-window path (debug only). */
+static int g_pair_fill = 1;      /* GAP_HUNT_PAIR=0 disables two-window rounds */
+/* Dense-marking chunk (odd slots per work item) for the pair mark.  0 = auto:
+   ~86 chunks per window, which is where the isolated sweep puts the optimum
+   (measured 2026-10-06 with tools/bench_hunt_mark.cu at shift258: 240 slots
+   = 20.3/19.2/19.3 us per window vs 160 slots = 20.7/20.9/20.7 - i.e. ~5.5%
+   on the mark, reproduced 3x interleaved).  The trade-off is per-item
+   overhead (more, smaller chunks = more items) against the small-prime
+   straggler chain (p=3 walks slots/3 slots serially inside one item).  The
+   mining path keeps its own GPU_MARK_SPLIT_SLOTS default of 160. */
+static int g_hunt_mark_slots = 0;
+
+static int gh_fill_pair_ok(const struct gh_ctx *g, uint64_t k) {
+    if (!g_pair_fill || g->residue_check)
+        return 0;
+    if (g->residue_incr < 2 || !g->res_valid || k < g->res_k)
+        return 0;
+    return (k + 1ULL - g->res_k) <= g->res_m_limit;
+}
+
+/* One TWO-window round: both windows are marked by a single folded pair mark
+   (one table read for both), then each window is extracted in turn.  The
+   pair mark is issued before either extract, so the two extracts queue behind
+   it on the sieve stream and their counts are collected back to back.
+   Returns 1 on success, 0 if the pair could not be marked (the caller falls
+   back to the per-window path; nothing has been extracted yet, so the fallback
+   cannot double-count). */
+static int gh_fill_pair_step(struct gh_batch *b, int slot, uint32_t i,
+                             uint64_t k, struct gh_ctx *g, uint32_t *cum_io) {
+    struct gh_fill_win wa, wb;
+    uint64_t limbs_a[GAP_HUNT_MAX_LIMBS], limbs_b[GAP_HUNT_MAX_LIMBS];
+    if (!gh_fill_mark_phase(b, i, k, g, &wa, limbs_a))
+        return 0;
+    if (!gh_fill_mark_phase(b, i + 1, k + 1, g, &wb, limbs_b))
+        return 0;
+    if (wa.used_mode != 2 || wb.used_mode != 2) {
+        /* A re-anchor would be needed: let the single path do it. */
+        return 0;
+    }
+    uint64_t m = wa.used_m;
+    uint64_t slots = 0;
+    if (g_hunt_mark_slots > 0) {
+        slots = (uint64_t)g_hunt_mark_slots;
+    } else {
+        uint64_t wmax = wa.odd_size > wb.odd_size ? wa.odd_size : wb.odd_size;
+        slots = (wmax + 85ULL) / 86ULL;
+        if (slots < 160ULL) slots = 160ULL;
+        if (slots > 1024ULL) slots = 1024ULL;
+    }
+    if (!gpu_sieve_mark_pair_fold(g->sieve, wa.odd_size,
+                                  wa.first_odd_offset, wb.odd_size,
+                                  wb.first_odd_offset, m, g->primes,
+                                  g->inv_p, g->prime_count, slots)) {
+        fprintf(stderr, "[GAP_HUNT] pair mark declined (k=%llu i=%u) - "
+                "falling back to the per-window mark\n",
+                (unsigned long long)k, i);
+        return 0;
+    }
+    if (g_host_timing) {
+        uint64_t now = gh_now_us();
+        g_ht_mark += now - wa.ht0;
+        /* Both windows' extract clocks start here: phase(b) ran BEFORE the
+           shared mark, so leaving its base untouched would charge the mark
+           (and window a's extract) to window b's extract bucket. */
+        wa.ht0 = now;
+        wb.ht0 = now;
+    }
+    if (!gh_fill_extract(b, slot, g, &wa, cum_io))
+        return 0;
+    return gh_fill_extract(b, slot, g, &wb, cum_io);
+}
+
+/* Fill `q` windows (1, or 2 when the pair path applies) starting at index i,
+   each window's k = k + (index - i).  A pair that cannot be marked falls back
+   to the per-window path (nothing has been extracted yet). */
+static int gh_fill_step(struct gh_batch *b, int slot, uint32_t i, uint64_t k,
+                        struct gh_ctx *g, uint32_t *cum_io, uint32_t q) {
+    if (q == 2) {
+        if (gh_fill_pair_step(b, slot, i, k, g, cum_io))
+            return 1;
+        if (!gh_fill_window_step(b, slot, i, k, g, cum_io))
+            return 0;
+        return gh_fill_window_step(b, slot, i + 1, k + 1, g, cum_io);
+    }
+    return gh_fill_window_step(b, slot, i, k, g, cum_io);
+}
+
+/* How many windows the next step should fill: 2 when the pair path applies
+   (an even flight index so that window i uses bitmap 0 and i+1 bitmap 1, and
+   both windows eligible to fold), else 1. */
+static uint32_t gh_fill_quantum(const struct gh_ctx *g, uint32_t i,
+                                uint64_t k) {
+    if ((i & 1U) != 0 || i + 1 >= (uint32_t)g_batch)
+        return 1;
+    return gh_fill_pair_ok(g, k) ? 2U : 1U;
 }
 
 /* Flight-fill finalization (shared by the serial fill and the prefetch). */
@@ -592,12 +760,18 @@ static void gh_fill_finalize(struct gh_batch *b, int slot, uint32_t cum) {
 static int gh_fill_only(struct gh_batch *b, int slot, uint64_t k0,
                         struct gh_ctx *g) {
     uint32_t cum = 0;
-    for (uint32_t i = 0; i < (uint32_t)g_batch; i++) {
-        if (!gh_fill_window_step(b, slot, i, k0 + i, g, &cum))
+    for (uint32_t i = 0; i < (uint32_t)g_batch; ) {
+        uint32_t q = gh_fill_quantum(g, i, k0 + i);
+        if (!gh_fill_step(b, slot, i, k0 + i, g, &cum, q))
             return 0;
+        i += q;
     }
     gh_fill_finalize(b, slot, cum);
-    return 1;
+    /* Flight boundary: with the fill pipeline the mark/extract syncs are
+       deferred (see gpu_sieve_set_fill_pipeline), so this is where the flight's
+       last window is made host-visible before anything else reads the host
+       offsets or the device candidate buffer. */
+    return gpu_sieve_sync_stream(g->sieve);
 }
 
 /* ── P1: next-flight fill prefetch (2026-10-02) ─────────────────────────
@@ -628,21 +802,34 @@ static int g_pref_qty = GAP_HUNT_PREFETCH_DEFAULT;
 static int gh_prefetch_step(struct gh_prefetch *pf, struct gh_ctx *g) {
     if (!pf->b || pf->done || pf->failed)
         return !pf->failed;
-    uint32_t q = (uint32_t)g_pref_qty;
-    while (q-- > 0 && pf->next_i < (uint32_t)g_batch) {
-        if (!gh_fill_window_step(pf->b, pf->slot, pf->next_i,
-                                 pf->k0 + pf->next_i, g, &pf->cum)) {
+    uint32_t left = (uint32_t)g_pref_qty;
+    while (left > 0 && pf->next_i < (uint32_t)g_batch) {
+        uint32_t q = gh_fill_quantum(g, pf->next_i, pf->k0 + pf->next_i);
+        /* Never split a pair across quanta; a quantum that is too small to
+           hold one still gets it when nothing has been done yet (the quantum
+           is a scheduling knob, not a correctness boundary). */
+        if (q > left && left < (uint32_t)g_pref_qty)
+            break;
+        if (!gh_fill_step(pf->b, pf->slot, pf->next_i, pf->k0 + pf->next_i,
+                          g, &pf->cum, q)) {
             pf->failed = 1;
             return 0;
         }
-        pf->next_i++;
-        g_j2_pref_windows++;
+        pf->next_i += q;
+        left -= q;
+        g_j2_pref_windows += q;
     }
     if (pf->next_i >= (uint32_t)g_batch) {
         gh_fill_finalize(pf->b, pf->slot, pf->cum);
+        /* Flight boundary: drain the deferred mark/extract work of this fill
+           before the scan of this flight can start (the MR gather reads the
+           device candidate buffer from the fermat stream, so it must not race
+           the sieve stream's last extract).  Once per flight, not per window. */
+        if (!gpu_sieve_sync_stream(g->sieve))
+            pf->failed = 1;
         pf->done = 1;
     }
-    return 1;
+    return !pf->failed;
 }
 
 /* ── Jump2: chunk-parallel backward search (Kehrig-exact, latency-free) ───
@@ -1268,6 +1455,20 @@ int gap_hunt_run(const struct gap_hunt_config *cfg) {
             if (pp >= 0 && pp <= 512)
                 g_pref_qty = pp;
         }
+        /* GAP_HUNT_PAIR=0 disables the two-window fill round (kept as a
+           parity/rollback knob: the pair mark is bit-exact per
+           tools/bench_hunt_mark.cu, and on/off must emit identical records). */
+        const char *pfv = getenv("GAP_HUNT_PAIR");
+        if (pfv && pfv[0] && atoi(pfv) <= 0)
+            g_pair_fill = 0;
+        /* GAP_HUNT_MARK_SLOTS = dense-marking chunk in odd slots (0 = auto,
+           see g_hunt_mark_slots). */
+        const char *msv = getenv("GAP_HUNT_MARK_SLOTS");
+        if (msv && msv[0]) {
+            int v = atoi(msv);
+            if (v >= 64 && v <= 4096)
+                g_hunt_mark_slots = v;
+        }
     }
 
     /* GAP_HUNT_RESIDUE_INCR = amortize base mod p across the CRT-periodic
@@ -1427,6 +1628,17 @@ int gap_hunt_run(const struct gap_hunt_config *cfg) {
         crt_runtime_free(&rt);
         return 1;
     }
+    /* Fill pipeline (2026-10-05): the walk chain is mark(window i) ->
+       extract(window i) on the sieve stream, and per-window the two calls cost
+       TWO host round trips (one stream sync each) that the GPU waits out -- the
+       measured handicap of the --gap-hunt fill (mark 49 us + extract 43 us of
+       kernel against 118-120 us of wall at shift258/m24, i.e. ~25 us/window of
+       bubbles, while MR at 55 us/window rides in the shadow of it).  In this
+       mode the mark does not sync and the extract syncs once instead of twice;
+       the flight fill already ends in gpu_sieve_sync_stream() (see
+       gh_fill_finalize users), which is what makes the device candidate buffer
+       safe to hand to the MR gather on the fermat stream. */
+    gpu_sieve_set_fill_pipeline(gpu_sieve, 1);
     /* Size the batch to the CARD (same policy as the mining chain): the
        candidate buffers cost 2 x cap x K x limbs x 8 B + cap x K x 8 B with
        cap from the measured-density rule, and the old one-slot-per-odd-position

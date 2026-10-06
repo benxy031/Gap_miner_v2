@@ -35,6 +35,15 @@ static int gpu_mark_split_enabled(void) {
     return 1;
 }
 
+/* Single-launch (fused) ordered extract, on by default: GPU_SIEVE_EXTRACT_FUSED=0
+   restores the three-kernel count/scan/write sweep (parity/rollback knob; the
+   two paths must produce identical offsets and counts). */
+static int gpu_extract_fused_enabled(void) {
+    const char *v = getenv("GPU_SIEVE_EXTRACT_FUSED");
+    if (v && v[0] && v[0] == '0') return 0;
+    return 1;
+}
+
 static uint64_t gpu_mark_split_slots(void) {
     const char *v = getenv("GPU_MARK_SPLIT_SLOTS");
     uint64_t s = 160;
@@ -160,6 +169,37 @@ struct gpu_sieve_ctx {
     cudaEvent_t t_res_start;
     cudaEvent_t t_res_end;
     uint64_t accounted_residues_us;
+    /* Deferred-mark accounting: a mark that does NOT synchronize (see
+       fill_pipeline below) still reports its kernel time, bracketed by its own
+       event pair and drained at the next sync -- the first point where those
+       events are known to have completed. */
+    int t_def_pending;
+    cudaEvent_t t_def_start;
+    cudaEvent_t t_def_end;
+    /* Fill-pipeline mode (opt-in, gpu_sieve_set_fill_pipeline): the caller
+       walks windows in a chain on this context's stream and consumes a
+       window's results only after the extract that follows its mark, so the
+       mark does not have to synchronize and the extract needs one stream sync
+       instead of two.  Default 0 = the synchronizing behaviour every other
+       caller (miner fused path, tests) relies on. */
+    int fill_pipeline;
+    /* Scratch for the parallel (multi-block) ordered extraction: blk_tot[]
+       followed by blk_base[], EXTRACT_MAX_BLOCKS entries each.  Allocated
+       lazily; if the allocation fails the caller keeps the single-block
+       kernel (fail-safe, never a silent skip). */
+    uint32_t *d_ext_scan;
+    int ext_scan_ok;
+    /* Single-launch ordered extract (decoupled lookback): per-block scan
+       states, each tagged with the launch epoch so a stale entry from the
+       previous extraction is recognised as "not published yet" instead of
+       being summed (which would corrupt every following window's base). */
+    unsigned long long *d_ext_states;
+    uint32_t ext_epoch;
+    /* Precomputed mark indices for the two windows of a pair round: one entry
+       per (small prime, window), written by gpu_sieve_pair_fold_prep_kernel
+       and read by the dense marking kernel (see gpu_sieve_mark_index). */
+    uint64_t *d_rem[2];
+    size_t rem_cap;
     /* Cached CRT step (d_step_mod_p = P mod p): valid for step_ready_count
        primes after a successful gpu_sieve_set_residue_step().  step_m_limit
        is the largest safe window offset m for the folded-step mark
@@ -249,6 +289,62 @@ uint64_t gpu_sieve_accounted_residues_us(gpu_sieve_ctx *ctx) {
     return __atomic_load_n(&ctx->accounted_residues_us, __ATOMIC_RELAXED);
 }
 
+/* ── Deferred-mark accounting (fill-pipeline mode) ──────────────────────
+   The drain MUST run after a stream sync: an event that has not completed
+   reads back as an error, which would silently drop the sample (and be
+   indistinguishable from a fast kernel). */
+static void sieve_timing_drain_deferred(struct gpu_sieve_ctx *ctx) {
+    if (!ctx->t_def_pending) return;
+    ctx->t_def_pending = 0;
+    float ms = 0.0f;
+    if (cudaEventElapsedTime(&ms, ctx->t_def_start, ctx->t_def_end) ==
+            cudaSuccess && ms > 0.0f)
+        __atomic_fetch_add(&ctx->accounted_mark_us,
+                           (uint64_t)(ms * 1000.0f + 0.5f), __ATOMIC_RELAXED);
+}
+
+static void sieve_timing_defer_begin(struct gpu_sieve_ctx *ctx) {
+    if (!ctx->timing_on || !ctx->t_inited) return;
+    /* Anything still pending belongs to the previous window, whose extract
+       already synchronized, so it can be read out (and must be, before the
+       events are re-armed below). */
+    sieve_timing_drain_deferred(ctx);
+    if (!ctx->t_def_pending &&
+        cudaEventRecord(ctx->t_def_start, ctx->stream) == cudaSuccess)
+        ctx->t_def_pending = 1;
+}
+
+static void sieve_timing_defer_end(struct gpu_sieve_ctx *ctx) {
+    if (!ctx->t_def_pending) return;
+    if (cudaEventRecord(ctx->t_def_end, ctx->stream) != cudaSuccess)
+        ctx->t_def_pending = 0;
+}
+
+/* Fill-pipeline mode (see the ctx field).  Returns 1 on success. */
+int gpu_sieve_set_fill_pipeline(gpu_sieve_ctx *ctx, int on) {
+    if (!ctx) return 0;
+    ctx->fill_pipeline = on ? 1 : 0;
+    return 1;
+}
+
+/* Drain the sieve stream: completes any work the fill path left in flight
+   (deferred mark sync, deferred offset copies).  The fill-pipeline caller
+   MUST call this at a flight boundary, before it reads host offsets/counts or
+   hands the device candidate buffer to another stream. */
+int gpu_sieve_sync_stream(gpu_sieve_ctx *ctx) {
+    if (!ctx) return 0;
+    cudaError_t err = cudaStreamSynchronize(ctx->stream);
+    sieve_timing_drain(ctx);
+    sieve_timing_drain_deferred(ctx);
+    sieve_res_timing_drain(ctx);
+    if (err != cudaSuccess) {
+        fprintf(stderr, "gpu_sieve: sync_stream: %s\n",
+                cudaGetErrorString(err));
+        return 0;
+    }
+    return 1;
+}
+
 uint64_t gpu_sieve_residue_m_limit(const gpu_sieve_ctx *ctx) {
     if (!ctx) return 0;
     return ctx->step_m_limit;
@@ -309,6 +405,67 @@ __device__ static __forceinline__ uint64_t gpu_sieve_window_residue(
     if (r >= p) r -= p;
     if (r >= p) r -= p;
     return r;
+}
+
+/* Reciprocal-based modulo/division (inv = floor(2^64 / p), the table the
+   sieve already keeps as inv_p).  The mark kernels used to compute
+   `(((p - remainder) % p) * inverse_two) % p` with raw 64-bit modulo, which
+   nvcc lowers to a full software division (~dozens of instructions) per work
+   item; with ~150k-600k work items per window that per-item cost was a
+   measurable share of the mark.  Both helpers here are exact:
+   q = mulhi(x, inv) is at most one below floor(x/p), so a single correction
+   suffices, and x * inv2 never overflows because x < p <= 2^32. */
+__device__ static __forceinline__ uint64_t gpu_sieve_fast_mod(uint64_t x,
+                                                              uint64_t p,
+                                                              uint64_t inv)
+{
+    uint64_t q = __umul64hi(x, inv);
+    uint64_t r = x - q * p;
+    if (r >= p) r -= p;
+    return r;
+}
+
+/* ceil(x / p) for any x < 2^64 (same reciprocal, one correction). */
+__device__ static __forceinline__ uint64_t gpu_sieve_ceil_div(uint64_t x,
+                                                              uint64_t p,
+                                                              uint64_t inv)
+{
+    uint64_t q = __umul64hi(x, inv);
+    uint64_t r = x - q * p;
+    if (r >= p) { q++; r -= p; }
+    return q + (r != 0 ? 1ULL : 0ULL);
+}
+
+/* The mark start index for one prime and one window: the smallest odd-slot
+   index q with base + first_odd_offset + 2q == 0 (mod p), i.e. exactly what
+   the dense/batch kernels compute inline as
+   `(((p - remainder) % p) * inverse_two) % p`. */
+__device__ static __forceinline__ uint64_t gpu_sieve_mark_index(
+        uint64_t base_mod, const uint64_t *step_mod_p, const uint64_t *inv_p,
+        uint64_t idx, uint64_t p, uint64_t m_steps, uint64_t first_odd_offset)
+{
+    uint64_t inv = inv_p[idx];
+    uint64_t remainder = gpu_sieve_window_residue(base_mod, step_mod_p,
+                                                  inv_p, idx, p, m_steps);
+    remainder += first_odd_offset % p;
+    if (remainder >= p) remainder -= p;
+    uint64_t x = (remainder == 0) ? 0 : p - remainder;
+    return gpu_sieve_fast_mod(x * ((p + 1U) >> 1), p, inv);
+}
+
+__device__ static __forceinline__ uint64_t gpu_sieve_mark_index2(
+        uint64_t base_mod, const uint64_t *step_mod_p, const uint64_t *inv_p,
+        uint64_t idx, uint64_t p, uint64_t m_steps, uint64_t first_odd_offset,
+        uint64_t base_offset_mod, uint64_t inv)
+{
+    uint64_t remainder = gpu_sieve_window_residue(base_mod, step_mod_p,
+                                                  inv_p, idx, p, m_steps);
+    remainder += base_offset_mod;
+    if (remainder >= p) remainder -= p;
+    remainder += first_odd_offset % p;
+    if (remainder >= p) remainder -= p;
+    uint64_t x = (remainder == 0) ? 0 : p - remainder;
+    return gpu_sieve_fast_mod(x * ((p + 1U) >> 1), p, inv);
 }
 
 __global__ static void gpu_sieve_mark_kernel_batch(uint64_t *bitmap,
@@ -557,7 +714,9 @@ gpu_sieve_ctx *gpu_sieve_init(int device_id,
             if (cudaEventCreate(&ctx->t_start) == cudaSuccess &&
                 cudaEventCreate(&ctx->t_end) == cudaSuccess &&
                 cudaEventCreate(&ctx->t_res_start) == cudaSuccess &&
-                cudaEventCreate(&ctx->t_res_end) == cudaSuccess) {
+                cudaEventCreate(&ctx->t_res_end) == cudaSuccess &&
+                cudaEventCreate(&ctx->t_def_start) == cudaSuccess &&
+                cudaEventCreate(&ctx->t_def_end) == cudaSuccess) {
                 ctx->t_inited = 1;
                 ctx->timing_on = 1;
             }
@@ -1589,6 +1748,272 @@ int gpu_sieve_mark_batch_from_bases(gpu_sieve_ctx *ctx,
     return 1;
 }
 
+/* ── Folded PAIR mark: TWO consecutive windows in one round (2026-10-06) ──
+   Motivation (measured with tools/bench_hunt_mark.cu at shift258 geometry,
+   2,000,000 sieve primes, W=20574): the suffix mark is a pure table-traffic
+   kernel - one thread per prime > W, each reading primes[i], base_mod_p[i],
+   step_mod_p[i] (24 B per prime, ~48 MB per window) - while its own marking
+   work is at most ONE atomicOr per prime.  Marking two windows SEPARATELY
+   reads those tables twice; the pair kernel reads them ONCE and marks both
+   bitmaps, and the dense split kernel does the same for p <= W.  The second
+   window's residue needs no extra table data: the folded cache makes it
+   cache + (m+1)*step, i.e. the SAME cache and step with m+1.
+
+   Contract: window 0 (fold offset m_steps) -> bitmap[0], window 1
+   (m_steps + 1) -> bitmap[1]; both bitmaps are zeroed here.  Both windows
+   must be the consecutive walk windows k and k+1, which is what makes
+   m_steps + 1 the correct fold offset for the second.  Requires the same
+   prime table / cached step as mode 2 above (gpu_sieve_set_residue_step) and
+   m_steps + 1 <= step_m_limit.  Returns 1 on success, 0 fail-closed. */
+/* Per-prime mark indices for the two windows of a pair round: one thread per
+   (small) prime, two values.  This is what turns the dense kernel's per-ITEM
+   residue math into a per-PRIME computation (the dense kernel has ~65-129
+   items per prime; every one of them used to redo the same two multiplies and
+   two software divisions). */
+__global__ static void gpu_sieve_pair_fold_prep_kernel(
+    const uint64_t *primes,
+    const uint64_t *base_mod_p,
+    const uint64_t *step_mod_p,
+    const uint64_t *inv_p,
+    uint64_t m0,
+    uint64_t n_small,
+    uint64_t first_odd_offset0,
+    uint64_t first_odd_offset1,
+    uint64_t *rem0,
+    uint64_t *rem1)
+{
+    uint64_t i = (uint64_t)blockIdx.x * (uint64_t)blockDim.x +
+                 (uint64_t)threadIdx.x;
+    if (i >= n_small) return;
+    uint64_t p = primes[i];
+    if (p < 3U) {
+        rem0[i] = 0;
+        rem1[i] = 0;
+        return;
+    }
+    rem0[i] = gpu_sieve_mark_index(base_mod_p[i], step_mod_p, inv_p, i, p,
+                                   m0, first_odd_offset0);
+    rem1[i] = gpu_sieve_mark_index(base_mod_p[i], step_mod_p, inv_p, i, p,
+                                   m0 + 1ULL, first_odd_offset1);
+}
+
+__global__ static void gpu_sieve_pair_fold_dense_kernel(
+    uint64_t *bitmap0,
+    uint64_t *bitmap1,
+    uint64_t odd_interval_size0,
+    uint64_t odd_interval_size1,
+    const uint64_t *primes,
+    const uint64_t *inv_p,
+    const uint64_t *rem0,
+    const uint64_t *rem1,
+    uint64_t n_small,
+    uint32_t chunks,
+    uint64_t chunk_slots)
+{
+    uint64_t item = (uint64_t)blockIdx.x * (uint64_t)blockDim.x +
+                    (uint64_t)threadIdx.x;
+    uint64_t total = n_small * (uint64_t)chunks * 2ULL;
+    if (item >= total) return;
+
+    uint32_t w = (uint32_t)(item & 1ULL);        /* window: 0 then 1 */
+    uint64_t rest = item >> 1;
+    uint32_t c = (uint32_t)(rest % chunks);
+    uint64_t i = rest / chunks;
+
+    uint64_t p = primes[i];
+    if (p < 3U) return;
+
+    /* Consecutive walk windows differ by the odd CRT step P, so the base
+       parity - and with it the odd-slot count - flips between them; each
+       window therefore marks with its OWN geometry (the start index itself was
+       computed once per prime by the prep kernel). */
+    uint64_t W = (w == 0) ? odd_interval_size0 : odd_interval_size1;
+
+    uint64_t begin = (uint64_t)c * chunk_slots;
+    if (begin >= W) return;
+    uint64_t end = begin + chunk_slots;
+    if (end > W) end = W;
+
+    uint64_t rem = (w == 0) ? rem0[i] : rem1[i];
+
+    uint64_t first;
+    if (begin <= rem) {
+        first = rem;
+    } else {
+        uint64_t off = begin - rem;
+        uint64_t k = gpu_sieve_ceil_div(off, p, inv_p[i]);
+        first = rem + k * p;
+    }
+    if (first >= W) return;
+
+    uint64_t *bitmap = (w == 0) ? bitmap0 : bitmap1;
+    for (uint64_t q = first; q < end; q += p) {
+        atomicOr((unsigned long long *)&bitmap[q >> 6],
+                 (unsigned long long)(1ULL << (q & 63U)));
+    }
+}
+
+__global__ static void gpu_sieve_pair_fold_suffix_kernel(
+    uint64_t *bitmap0,
+    uint64_t *bitmap1,
+    uint64_t odd_interval_size0,
+    uint64_t first_odd_offset0,
+    uint64_t odd_interval_size1,
+    uint64_t first_odd_offset1,
+    uint64_t base_offset,
+    const uint64_t *primes,
+    const uint64_t *base_mod_p,
+    const uint64_t *step_mod_p,
+    const uint64_t *inv_p,
+    uint64_t m0,
+    uint64_t prime_count)
+{
+    uint64_t i = (uint64_t)blockIdx.x * (uint64_t)blockDim.x +
+                 (uint64_t)threadIdx.x;
+    if (i >= prime_count) return;
+
+    uint64_t p = primes[i];
+    if (p < 3U) return;
+
+    /* Both windows from the same table entries: only the fold offset and the
+       per-window geometry (parity flip) differ.  base_offset is 0 on the walk
+       path; when it is not, fold it in with the same reciprocal modulo. */
+    uint64_t inv = inv_p[i];
+    uint64_t bo = base_offset ? gpu_sieve_fast_mod(base_offset, p, inv) : 0;
+    uint64_t pos0 = gpu_sieve_mark_index2(base_mod_p[i], step_mod_p, inv_p, i,
+                                          p, m0, first_odd_offset0, bo, inv);
+    uint64_t pos1 = gpu_sieve_mark_index2(base_mod_p[i], step_mod_p, inv_p, i,
+                                          p, m0 + 1ULL, first_odd_offset1, bo,
+                                          inv);
+    gpu_sieve_mark_progression(bitmap0, odd_interval_size0, p, pos0);
+    gpu_sieve_mark_progression(bitmap1, odd_interval_size1, p, pos1);
+}
+
+int gpu_sieve_mark_pair_fold(gpu_sieve_ctx *ctx,
+                             uint64_t odd_interval_size0,
+                             uint64_t first_odd_offset0,
+                             uint64_t odd_interval_size1,
+                             uint64_t first_odd_offset1,
+                             uint64_t m_steps,
+                             const uint64_t *primes,
+                             const uint64_t *inv_p,
+                             size_t prime_count,
+                             uint64_t chunk_slots)
+{
+    uint64_t start_time = gpu_sieve_clock_us();
+    if (!ctx || !primes || !inv_p) return 0;
+    if (prime_count == 0 || prime_count > ctx->max_primes) return 0;
+    if (ctx->step_ready_count != prime_count) return 0;
+    if (odd_interval_size0 == 0 || odd_interval_size1 == 0) return 0;
+    if (first_odd_offset0 > 1U || first_odd_offset1 > 1U) return 0;
+    if (m_steps + 1ULL > ctx->step_m_limit) return 0;
+
+    size_t words0 = (size_t)((odd_interval_size0 + 63U) >> 6);
+    size_t words1 = (size_t)((odd_interval_size1 + 63U) >> 6);
+    size_t required_words = words0 > words1 ? words0 : words1;
+    if (required_words == 0 || required_words > ctx->max_bitmap_words) return 0;
+
+    cudaError_t err = gpu_sieve_ensure_device(ctx->device_id);
+    if (err != cudaSuccess) return 0;
+
+    /* Same per-stage accounting as the single-window mark: the deferred event
+       pair is drained at the next stream sync (the extract the caller runs
+       next), so the pair's kernel time shows up in `stage us/window`. */
+    sieve_timing_defer_begin(ctx);
+
+    err = cudaMemsetAsync(ctx->d_bitmap[0], 0,
+                          required_words * sizeof(*ctx->d_bitmap[0]),
+                          ctx->stream);
+    if (err != cudaSuccess) return 0;
+    err = cudaMemsetAsync(ctx->d_bitmap[1], 0,
+                          required_words * sizeof(*ctx->d_bitmap[1]),
+                          ctx->stream);
+    if (err != cudaSuccess) return 0;
+
+    const int tpb = 128;
+    uint64_t prime_count_u64 = (uint64_t)prime_count;
+
+    /* Dense prefix (p <= W) as chunked work items, both windows per launch. */
+    uint64_t n_small = 0;
+    uint64_t W_max = odd_interval_size0 > odd_interval_size1
+                         ? odd_interval_size0 : odd_interval_size1;
+    if (gpu_mark_split_enabled() && W_max < (1ULL << 32) &&
+        gpu_mark_primes_ascending(primes, prime_count)) {
+        while (n_small < prime_count_u64 && primes[n_small] <= W_max)
+            n_small++;
+    }
+    uint64_t rest_count = prime_count_u64 - n_small;
+
+    if (n_small > 0) {
+        /* Mark indices once per prime (two windows) instead of once per
+           (prime, chunk) item.  A failed allocation falls back to the
+           per-window path rather than marking with stale values. */
+        if (ctx->rem_cap < n_small) {
+            if (ctx->d_rem[0]) { cudaFree(ctx->d_rem[0]); ctx->d_rem[0] = NULL; }
+            if (ctx->d_rem[1]) { cudaFree(ctx->d_rem[1]); ctx->d_rem[1] = NULL; }
+            ctx->rem_cap = 0;
+            if (cudaMalloc(&ctx->d_rem[0], n_small * sizeof(uint64_t)) !=
+                    cudaSuccess ||
+                cudaMalloc(&ctx->d_rem[1], n_small * sizeof(uint64_t)) !=
+                    cudaSuccess) {
+                if (ctx->d_rem[0]) { cudaFree(ctx->d_rem[0]); ctx->d_rem[0] = NULL; }
+                if (ctx->d_rem[1]) { cudaFree(ctx->d_rem[1]); ctx->d_rem[1] = NULL; }
+                return 0;
+            }
+            ctx->rem_cap = (size_t)n_small;
+        }
+        uint64_t pblocks = (n_small + tpb - 1U) / tpb;
+        gpu_sieve_pair_fold_prep_kernel<<<(unsigned)pblocks, tpb, 0,
+                                          ctx->stream>>>(
+            ctx->d_primes, ctx->d_base_mod_p, ctx->d_step_mod_p, ctx->d_inv_p,
+            m_steps, n_small, first_odd_offset0, first_odd_offset1,
+            ctx->d_rem[0], ctx->d_rem[1]);
+
+        uint64_t slots = chunk_slots ? chunk_slots : gpu_mark_split_slots();
+        if (slots < 1) slots = 1;
+        uint64_t chunks = (W_max + slots - 1U) / slots;
+        if (chunks < 1) chunks = 1;
+        if (chunks > 1024U) chunks = 1024U;
+        uint64_t items = n_small * chunks * 2ULL;
+        uint64_t iblocks = (items + tpb - 1U) / tpb;
+        if (iblocks > 0 && iblocks <= (uint64_t)UINT_MAX) {
+            gpu_sieve_pair_fold_dense_kernel<<<(unsigned)iblocks, tpb, 0,
+                                               ctx->stream>>>(
+                ctx->d_bitmap[0], ctx->d_bitmap[1], odd_interval_size0,
+                odd_interval_size1, ctx->d_primes, ctx->d_inv_p,
+                ctx->d_rem[0], ctx->d_rem[1], n_small, (uint32_t)chunks,
+                slots);
+        } else {
+            /* Fail closed to the per-window path rather than marking less. */
+            return 0;
+        }
+    }
+    if (rest_count > 0) {
+        uint64_t rblocks = (rest_count + tpb - 1U) / tpb;
+        if (rblocks > (uint64_t)UINT_MAX) return 0;
+        gpu_sieve_pair_fold_suffix_kernel<<<(unsigned)rblocks, tpb, 0,
+                                            ctx->stream>>>(
+            ctx->d_bitmap[0], ctx->d_bitmap[1], odd_interval_size0,
+            first_odd_offset0, odd_interval_size1, first_odd_offset1, 0,
+            ctx->d_primes + n_small, ctx->d_base_mod_p + n_small,
+            ctx->d_step_mod_p + n_small, ctx->d_inv_p + n_small, m_steps,
+            rest_count);
+    }
+
+    sieve_timing_defer_end(ctx);
+
+    err = cudaGetLastError();
+    if (err != cudaSuccess) {
+        fprintf(stderr, "gpu_sieve: pair fold launch failed: %s\n",
+                cudaGetErrorString(err));
+        return 0;
+    }
+
+    uint64_t end_time = gpu_sieve_clock_us();
+    ctx->last_elapsed_us = end_time >= start_time ? end_time - start_time : 0;
+    return 1;
+}
+
 /* Shared implementation of the gpu_sieve_mark_from_base variants: identical
    in every respect except how base_mod_p is obtained for this window.
      residue_mode = 0: upload base_limbs and run the full O(limbs)-per-prime
@@ -1710,7 +2135,18 @@ static int gpu_sieve_mark_from_base_impl(gpu_sieve_ctx *ctx,
         sieve_res_timing_end(ctx);
     }
 
-    sieve_timing_begin(ctx, 1);
+    /* Fill-pipeline mode: the caller's next GPU call in this chain is an
+       extract on THIS stream and only consumes the mark after that call's own
+       sync, so the trailing stream sync here is a pure host round trip
+       (measured: one of the two bubbles per window).  Defer it -- but never
+       when the caller asked for the bitmap in host memory, because that copy
+       is only valid after a sync. */
+    const int defer_sync = ctx->fill_pipeline && host_bitmap == NULL;
+
+    if (defer_sync)
+        sieve_timing_defer_begin(ctx);
+    else
+        sieve_timing_begin(ctx, 1);
 
     /* Optional split (chunked) dense marking (GPU_MARK_SPLIT): the dense
        domain (p <= odd_interval_size) is the PREFIX of the ascending table and
@@ -1757,7 +2193,10 @@ static int gpu_sieve_mark_from_base_impl(gpu_sieve_ctx *ctx,
             ctx->d_step_mod_p + n_small, ctx->d_inv_p + n_small, m_steps,
             rest_count);
     }
-    sieve_timing_end(ctx);
+    if (defer_sync)
+        sieve_timing_defer_end(ctx);
+    else
+        sieve_timing_end(ctx);
 
     err = cudaGetLastError();
     if (err != cudaSuccess) {
@@ -1781,8 +2220,16 @@ static int gpu_sieve_mark_from_base_impl(gpu_sieve_ctx *ctx,
         }
     }
 
+    if (defer_sync) {
+        /* No sync: the kernels are enqueued in stream order ahead of the
+           caller's extract, which is where the (single) round trip is paid.
+           Launch errors were already caught above. */
+        return 1;
+    }
+
     err = cudaStreamSynchronize(ctx->stream);
     sieve_timing_drain(ctx);
+    sieve_timing_drain_deferred(ctx);
     sieve_res_timing_drain(ctx);
     if (err != cudaSuccess) {
         fprintf(stderr, "gpu_sieve: stream sync failed: %s\n",
@@ -2447,6 +2894,294 @@ __global__ static void gpu_sieve_extract_pack_kernel(
     }
 }
 
+/* ── Parallel ordered extraction (2026-10-05) ──────────────────────────
+   The single-block kernel above is ONE 1024-thread block on ONE SM and owns
+   the whole per-window extract; measured at shift258/min-merit 24 it costs
+   43 us/window against the mark's 51 us, i.e. it is a co-limiting stage of the
+   --gap-hunt fill (and 47 of the 48 SMs are idle while it runs).  This variant
+   keeps the EXACT same output contract -- ascending offsets, contiguous
+   packing from slot_base, count = total keepers with the high bit as the
+   capacity-overflow flag, same candidate values -- but spreads the work over
+   many blocks in three deterministic steps:
+
+     K1 count: one item per EXTRACT_ITEM_BITS-wide bit group; block-reduce the
+               per-item counts into blk_tot[b]
+     K2 scan:  ONE block: exclusive scan of blk_tot[] -> blk_base[b], and the
+               flight total into d_count
+     K3 write: same items, recomputed, scattered at
+               blk_base[b] + within-block prefix + local rank + slot_base
+
+   Determinism is what makes it safe: the output order is (block, item) and
+   items map linearly onto ascending odd positions, so the result is bit-exact
+   the same as the single-block scan however the blocks get scheduled.
+   EXTRACT_MAX_BLOCKS covers 1023 words x 8 items = 8184 items = 32 blocks. */
+#define EXTRACT_ITEM_BITS 8
+#define EXTRACT_TPB 256
+#define EXTRACT_MAX_BLOCKS 64
+/* Below this many items the three launches cost more than the single block
+   saves; small ranges (quarter-mode tail slices) stay on the old kernel. */
+#define EXTRACT_PAR_MIN_ITEMS 512
+
+/* Survivor bits of one item: an EXTRACT_ITEM_BITS-wide group of the marked
+   bitmap (bit = 1 means composite), clipped to [lo_odd, hi_odd) and
+   class-filtered exactly like the single-block kernel.  *pos_base_out gets the
+   word-aligned position base the group's bits are relative to. */
+__device__ static uint64_t extract_item_survivors(
+        const uint64_t *bitmap, uint32_t idx, uint32_t w_lo,
+        uint64_t lo_odd, uint64_t hi_odd,
+        uint32_t half_filter, uint32_t base_mod60, uint64_t class_mask,
+        uint64_t region_start, uint64_t first_odd_offset,
+        uint64_t *pos_base_out)
+{
+    const uint32_t G = 64U / EXTRACT_ITEM_BITS;
+    uint32_t widx = w_lo + (idx / G);
+    uint32_t bit = (idx % G) * EXTRACT_ITEM_BITS;
+    uint64_t pos_base = (uint64_t)widx << 6;
+    uint64_t s = (~bitmap[widx]) &
+                 (((1ULL << EXTRACT_ITEM_BITS) - 1ULL) << bit);
+    if (lo_odd > pos_base) {                 /* clip the low end of the range */
+        uint64_t cut = lo_odd - pos_base;
+        if (cut >= (uint64_t)bit + EXTRACT_ITEM_BITS) s = 0;
+        else if (cut > (uint64_t)bit) s &= ~((1ULL << (cut - bit)) - 1ULL);
+    }
+    uint64_t hi_bit = hi_odd - pos_base;      /* exclusive; always >= 1 here */
+    if (hi_bit < (uint64_t)bit + EXTRACT_ITEM_BITS) {
+        if (hi_bit <= (uint64_t)bit) s = 0;
+        else s &= (1ULL << (hi_bit - bit)) - 1ULL;
+    }
+    if (half_filter && s) {
+        uint64_t keep = 0;
+        uint64_t t = s;
+        while (t) {
+            unsigned int b = (unsigned int)__ffsll((long long)t) - 1U;
+            t &= t - 1ULL;
+            uint64_t offset = first_odd_offset + ((pos_base + b) << 1);
+            if (offset < region_start) {
+                keep |= 1ULL << b;
+            } else {
+                uint32_t v = (uint32_t)((base_mod60 + (offset % 60ULL)) % 60ULL);
+                if ((class_mask >> v) & 1U) keep |= 1ULL << b;
+            }
+        }
+        s = keep;
+    }
+    *pos_base_out = pos_base;
+    return s;
+}
+
+/* Exclusive block-wide scan, one value per thread, in lane-major order (the
+   same order the items are laid out in).  Returns this thread's exclusive
+   prefix and leaves the block total in *sh_total (shared, valid for every
+   thread after the final barrier). */
+__device__ static uint32_t extract_block_scan(uint32_t v, uint32_t *sh_total) {
+    __shared__ uint32_t wsum[EXTRACT_TPB / 32];
+    uint32_t lane = threadIdx.x & 31U;
+    uint32_t warp = threadIdx.x >> 5U;
+    uint32_t nwarps = blockDim.x >> 5U;
+    uint32_t orig = v;
+#pragma unroll
+    for (int o = 1; o < 32; o <<= 1) {
+        uint32_t t = __shfl_up_sync(0xffffffffU, v, (uint32_t)o);
+        if (lane >= (uint32_t)o) v += t;
+    }
+    if (lane == 31U) wsum[warp] = v;
+    __syncthreads();
+    if (warp == 0U) {
+        uint32_t w = (lane < nwarps) ? wsum[lane] : 0U;
+        uint32_t wo = w;
+#pragma unroll
+        for (int o = 1; o < 32; o <<= 1) {
+            uint32_t t = __shfl_up_sync(0xffffffffU, w, (uint32_t)o);
+            if (lane >= (uint32_t)o) w += t;
+        }
+        if (lane < nwarps) wsum[lane] = w - wo;   /* exclusive warp prefix */
+        if (lane == nwarps - 1U) *sh_total = w;   /* last inclusive = total  */
+    }
+    __syncthreads();
+    return (v - orig) + wsum[warp];
+}
+
+__global__ static void gpu_sieve_extract_count_kernel(
+        const uint64_t *bitmap, uint32_t n_items, uint32_t w_lo,
+        uint64_t lo_odd, uint64_t hi_odd,
+        uint32_t half_filter, uint32_t base_mod60, uint64_t class_mask,
+        uint64_t region_start, uint64_t first_odd_offset,
+        uint32_t *blk_tot)
+{
+    __shared__ uint32_t sh_total;
+    uint32_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+    uint32_t cnt = 0;
+    if (idx < n_items) {
+        uint64_t pos_base = 0;
+        uint64_t s = extract_item_survivors(bitmap, idx, w_lo, lo_odd, hi_odd,
+                                            half_filter, base_mod60, class_mask,
+                                            region_start, first_odd_offset,
+                                            &pos_base);
+        cnt = (uint32_t)__popcll(s);
+    }
+    (void)extract_block_scan(cnt, &sh_total);
+    if (threadIdx.x == 0) blk_tot[blockIdx.x] = sh_total;
+}
+
+__global__ static void gpu_sieve_extract_scan_kernel(
+        const uint32_t *blk_tot, uint32_t n_blocks,
+        uint32_t *blk_base, unsigned int *d_count)
+{
+    __shared__ uint32_t sh_total;
+    uint32_t v = (threadIdx.x < n_blocks) ? blk_tot[threadIdx.x] : 0U;
+    uint32_t pre = extract_block_scan(v, &sh_total);
+    if (threadIdx.x < n_blocks) blk_base[threadIdx.x] = pre;
+    if (threadIdx.x == 0 && d_count) *d_count = sh_total;
+}
+
+__global__ static void gpu_sieve_extract_write_kernel(
+        const uint64_t *bitmap, uint32_t n_items, uint32_t w_lo,
+        uint64_t lo_odd, uint64_t hi_odd,
+        uint32_t half_filter, uint32_t base_mod60, uint64_t class_mask,
+        uint64_t region_start, uint64_t first_odd_offset,
+        const uint32_t *blk_base,
+        uint64_t *cands_aos, uint64_t *offsets, unsigned int *d_count,
+        uint32_t max_batch, uint32_t slot_base, int active_limbs,
+        const uint64_t *base_limbs)
+{
+    __shared__ uint32_t sh_total;
+    uint32_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+    uint64_t pos_base = 0;
+    uint64_t s = 0;
+    if (idx < n_items)
+        s = extract_item_survivors(bitmap, idx, w_lo, lo_odd, hi_odd,
+                                   half_filter, base_mod60, class_mask,
+                                   region_start, first_odd_offset, &pos_base);
+    uint32_t pre = extract_block_scan((uint32_t)__popcll(s), &sh_total);
+    uint32_t base = blk_base[blockIdx.x] + pre + slot_base;
+    if (idx >= n_items) return;
+    uint32_t rank = 0;
+    while (s) {
+        unsigned int b = (unsigned int)__ffsll((long long)s) - 1U;
+        s &= s - 1ULL;
+        uint32_t slot = base + rank;
+        rank++;
+        /* Same overflow contract as the single-block kernel: never write past
+           the capacity, never drop a survivor silently -- flag it in the high
+           bit of the count word. */
+        if (slot >= max_batch) {
+            if (d_count) atomicOr(d_count, 0x80000000U);
+            continue;
+        }
+        uint64_t odd_pos = pos_base + (uint64_t)b;
+        uint64_t offset = first_odd_offset + (odd_pos << 1);
+        uint64_t *cand = cands_aos + (uint64_t)slot * (uint64_t)active_limbs;
+        uint64_t carry = offset;
+        for (int i = 0; i < active_limbs; i++) {
+            uint64_t bi = base_limbs[i];
+            uint64_t sum = bi + carry;
+            cand[i] = sum;
+            carry = (sum < bi) ? 1ULL : 0ULL;
+        }
+        offsets[slot] = offset;
+    }
+}
+
+/* ── Single-launch ordered extract (decoupled lookback, 2026-10-06) ─────
+   The three-kernel sweep above pays three launches (~2-3 us each) for a job
+   whose total work is a few thousand threads - measured at shift258 the
+   extract is ~13 us/window of which the kernels themselves are a small part.
+   This variant does count -> block prefix -> write in ONE launch: each block
+   computes its local total, publishes it as a PARTIAL aggregate, then walks
+   BACKWARDS over its predecessors (the classic decoupled lookback) until it
+   reads an INCLUSIVE prefix, which is its base; only then does it write its
+   items' survivors.  Ordering is identical to the sweep - the output is the
+   concatenation of the blocks in blockIdx order, which is ascending odd
+   position - so the result is bit-identical.
+
+   The state word is (epoch << 32) | (flag << 30) | value, written with 64-bit
+   atomics: the epoch is what makes a stale state from the PREVIOUS extraction
+   distinguishable from "this block has not published yet" (without it the
+   walker would sum a previous window's totals - silently wrong bases).  Every
+   block publishes before it walks, so the walk always makes progress. */
+__global__ static void gpu_sieve_extract_fused_kernel(
+        const uint64_t *bitmap, uint32_t n_items, uint32_t w_lo,
+        uint64_t lo_odd, uint64_t hi_odd,
+        uint32_t half_filter, uint32_t base_mod60, uint64_t class_mask,
+        uint64_t region_start, uint64_t first_odd_offset,
+        unsigned long long *states, uint32_t epoch,
+        uint64_t *cands_aos, uint64_t *offsets, unsigned int *d_count,
+        uint32_t max_batch, uint32_t slot_base, int active_limbs,
+        const uint64_t *base_limbs)
+{
+    __shared__ uint32_t sh_total;   /* block total (from the local scan) */
+    __shared__ uint32_t sh_base;    /* exclusive block prefix           */
+
+    uint32_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+    uint64_t pos_base = 0;
+    uint64_t s = 0;
+    if (idx < n_items)
+        s = extract_item_survivors(bitmap, idx, w_lo, lo_odd, hi_odd,
+                                   half_filter, base_mod60, class_mask,
+                                   region_start, first_odd_offset, &pos_base);
+    uint32_t pre = extract_block_scan((uint32_t)__popcll(s), &sh_total);
+
+    if (threadIdx.x == 0) {
+        const unsigned long long partial =
+            ((unsigned long long)epoch << 32) | (1ULL << 30) |
+            (unsigned long long)sh_total;
+        /* Publish the partial, then walk back for an inclusive prefix. */
+        __threadfence();
+        atomicExch(&states[blockIdx.x], partial);
+        uint32_t sum = 0;
+        for (uint32_t p = blockIdx.x; p > 0; ) {
+            p--;
+            unsigned long long st;
+            uint32_t ep, flag, val;
+            do {
+                st = atomicAdd(&states[p], 0ULL);
+                ep = (uint32_t)(st >> 32);
+            } while (ep != epoch);
+            flag = (uint32_t)((st >> 30) & 3ULL);
+            val = (uint32_t)(st & 0x3FFFFFFFULL);
+            sum += val;
+            if (flag == 2) break;      /* inclusive: predecessors counted */
+        }
+        uint32_t incl = sh_total + sum;
+        __threadfence();
+        atomicExch(&states[blockIdx.x],
+                   ((unsigned long long)epoch << 32) | (2ULL << 30) |
+                       (unsigned long long)incl);
+        sh_base = incl - sh_total;
+        /* The highest block's inclusive value IS the window total; only it
+           writes the count (d_count is otherwise untouched, exactly like the
+           three-kernel sweep's scan kernel). */
+        if (blockIdx.x == gridDim.x - 1U && d_count) *d_count = incl;
+    }
+    __syncthreads();
+
+    if (idx >= n_items) return;
+    uint32_t slot = sh_base + pre + slot_base;
+    uint32_t rank = 0;
+    while (s) {
+        unsigned int b = (unsigned int)__ffsll((long long)s) - 1U;
+        s &= s - 1ULL;
+        if (slot + rank >= max_batch) {
+            if (d_count) atomicOr(d_count, 0x80000000U);
+            rank++;
+            continue;
+        }
+        uint64_t odd_pos = pos_base + (uint64_t)b;
+        uint64_t offset = first_odd_offset + (odd_pos << 1);
+        uint64_t slot_i = (uint64_t)(slot + rank);
+        uint64_t *cand = cands_aos + slot_i * (uint64_t)active_limbs;
+        uint64_t carry = offset;
+        for (int i = 0; i < active_limbs; i++) {
+            uint64_t bi = base_limbs[i];
+            uint64_t sum = bi + carry;
+            cand[i] = sum;
+            carry = (sum < bi) ? 1ULL : 0ULL;
+        }
+        offsets[slot_i] = offset;
+        rank++;
+    }
+}
+
 /* Extract survivors + pack candidates from the currently-marked d_bitmap.
    Internal helper: copies count + offsets (and optionally packed candidates)
    back to the host.  host_cands_aos may be NULL to keep candidates on-device
@@ -2633,6 +3368,73 @@ static int gpu_sieve_extract_pack_impl(gpu_sieve_ctx *ctx,
         if (err != cudaSuccess) return 0;
 
         sieve_timing_begin(ctx, 2);
+        /* Parallel ordered extraction when the range is wide enough to pay for
+           the three launches (see the kernel block above): ORDERS ARE
+           IDENTICAL to the single-block scan, so this is a pure throughput
+           switch.  Any failure to set it up falls back to the old kernel. */
+        uint64_t n_words_sel = w_hi - w_lo;
+        uint64_t n_items_sel = n_words_sel * (64U / EXTRACT_ITEM_BITS);
+        uint32_t par_blocks = 0;
+        if (n_items_sel >= (uint64_t)EXTRACT_PAR_MIN_ITEMS &&
+            n_items_sel <= (uint64_t)EXTRACT_MAX_BLOCKS * EXTRACT_TPB) {
+            par_blocks = (uint32_t)((n_items_sel + EXTRACT_TPB - 1) / EXTRACT_TPB);
+            if (!ctx->d_ext_scan) {
+                if (cudaMalloc(&ctx->d_ext_scan,
+                               2U * EXTRACT_MAX_BLOCKS * sizeof(uint32_t)) ==
+                        cudaSuccess)
+                    ctx->ext_scan_ok = 1;
+            }
+            if (!ctx->d_ext_scan) par_blocks = 0;   /* fall back, fail-safe */
+        }
+        int fused = 0;
+        if (par_blocks > 0 && gpu_extract_fused_enabled()) {
+            if (!ctx->d_ext_states &&
+                cudaMalloc(&ctx->d_ext_states,
+                           EXTRACT_MAX_BLOCKS * sizeof(unsigned long long)) ==
+                    cudaSuccess) {
+                /* Zero once so the very first extraction cannot read a
+                   garbage state whose random high bits happen to match the
+                   epoch (the epoch starts at 1). */
+                if (cudaMemsetAsync(
+                        ctx->d_ext_states, 0,
+                        EXTRACT_MAX_BLOCKS * sizeof(unsigned long long),
+                        ctx->stream) != cudaSuccess) {
+                    cudaFree(ctx->d_ext_states);
+                    ctx->d_ext_states = NULL;
+                } else {
+                    ctx->ext_epoch = 0;
+                }
+            }
+            if (ctx->d_ext_states) fused = 1;
+        }
+        if (fused) {
+            ctx->ext_epoch++;
+            gpu_sieve_extract_fused_kernel<<<par_blocks, EXTRACT_TPB, 0,
+                                             ctx->stream>>>(
+                bitmap, (uint32_t)n_items_sel, (uint32_t)w_lo, lo_odd, hi_odd,
+                half_filter, base_mod60, class_mask60, region_start,
+                first_odd_offset, ctx->d_ext_states, ctx->ext_epoch,
+                ctx->d_cands_aos[cand_buf & 1], ctx->d_offsets, ctx->d_count,
+                (uint32_t)ctx->max_candidates, slot_base, active_limbs,
+                ctx->d_base_limbs);
+        } else if (par_blocks > 0) {
+            uint32_t *d_tot = ctx->d_ext_scan;
+            uint32_t *d_base = ctx->d_ext_scan + EXTRACT_MAX_BLOCKS;
+            gpu_sieve_extract_count_kernel<<<par_blocks, EXTRACT_TPB, 0,
+                                             ctx->stream>>>(
+                bitmap, (uint32_t)n_items_sel, (uint32_t)w_lo, lo_odd, hi_odd,
+                half_filter, base_mod60, class_mask60, region_start,
+                first_odd_offset, d_tot);
+            gpu_sieve_extract_scan_kernel<<<1, EXTRACT_TPB, 0, ctx->stream>>>(
+                d_tot, par_blocks, d_base, ctx->d_count);
+            gpu_sieve_extract_write_kernel<<<par_blocks, EXTRACT_TPB, 0,
+                                             ctx->stream>>>(
+                bitmap, (uint32_t)n_items_sel, (uint32_t)w_lo, lo_odd, hi_odd,
+                half_filter, base_mod60, class_mask60, region_start,
+                first_odd_offset, d_base, ctx->d_cands_aos[cand_buf & 1],
+                ctx->d_offsets, ctx->d_count, (uint32_t)ctx->max_candidates,
+                slot_base, active_limbs, ctx->d_base_limbs);
+        } else
         gpu_sieve_extract_pack_kernel<<<1, 1024, 0, ctx->stream>>>(
             bitmap, (uint64_t)words, odd_interval_size,
             first_odd_offset, ctx->d_base_limbs, active_limbs,
@@ -2653,13 +3455,16 @@ static int gpu_sieve_extract_pack_impl(gpu_sieve_ctx *ctx,
            the valid entries.  Using a full-buffer copy would transfer ~1 MB of
            dead slots per window; using synchronous cudaMemcpy would insert
            DEVICE-WIDE syncs that serialize concurrent workers' streams.  The
-           count's high bit is the capacity-overflow flag (see the kernel). */
+           count's high bit is the capacity-overflow flag (see the kernel).
+           This is the ONE stream sync the fill path pays per window in
+           fill-pipeline mode (the offset copy below rides in stream order). */
         cnt = 0;
         ovf = 0;
         err = cudaMemcpyAsync(&cnt, ctx->d_count, sizeof(cnt),
                               cudaMemcpyDeviceToHost, ctx->stream);
         if (err != cudaSuccess) return 0;
         err = cudaStreamSynchronize(ctx->stream);
+        sieve_timing_drain_deferred(ctx);
         sieve_timing_drain(ctx);
         if (err != cudaSuccess) {
             fprintf(stderr, "gpu_sieve: extract_pack count sync: %s\n",
@@ -2670,6 +3475,16 @@ static int gpu_sieve_extract_pack_impl(gpu_sieve_ctx *ctx,
             ovf = 1;
             cnt &= 0x7FFFFFFFU;
         }
+        /* Overflow detection independent of the kernel flag: the highest slot
+           a survivor can be assigned in this call is slot_base + cnt - 1, so
+           slot_base + cnt > capacity is EXACTLY equivalent to the kernels'
+           `slot >= max_batch` test - and unlike the flag it cannot be lost to a
+           write order (the single-launch fused extract writes the count from
+           its last block while another block may set the flag later, which
+           would otherwise drop survivors silently). */
+        if (!ovf && (uint64_t)slot_base + (uint64_t)cnt >
+                        (uint64_t)ctx->max_candidates)
+            ovf = 1;
 
         if (!ovf) break;
 
@@ -2737,11 +3552,21 @@ static int gpu_sieve_extract_pack_impl(gpu_sieve_ctx *ctx,
                                   cudaMemcpyDeviceToHost, ctx->stream);
             if (err != cudaSuccess) return 0;
         }
-        err = cudaStreamSynchronize(ctx->stream);
-        if (err != cudaSuccess) {
-            fprintf(stderr, "gpu_sieve: extract_pack sync: %s\n",
-                    cudaGetErrorString(err));
-            return 0;
+        /* Fill-pipeline mode: leave this copy in flight.  It is ordered ahead
+           of the caller's next sieve-stream sync (the next window's count read
+           inside this same function, or gpu_sieve_sync_stream() at a flight
+           boundary), and the offsets are only ever consumed by the caller after
+           that -- so the second round trip per window disappears without
+           widening any buffer or moving any data.  Every other caller keeps the
+           synchronous behaviour. */
+        if (!ctx->fill_pipeline) {
+            err = cudaStreamSynchronize(ctx->stream);
+            sieve_timing_drain_deferred(ctx);
+            if (err != cudaSuccess) {
+                fprintf(stderr, "gpu_sieve: extract_pack sync: %s\n",
+                        cudaGetErrorString(err));
+                return 0;
+            }
         }
     }
 
@@ -3013,11 +3838,17 @@ void gpu_sieve_destroy(gpu_sieve_ctx *ctx) {
     if (ctx->d_step_mod_p) cudaFree(ctx->d_step_mod_p);
     if (ctx->d_residues_scratch) cudaFree(ctx->d_residues_scratch);
     if (ctx->d_mismatch) cudaFree(ctx->d_mismatch);
+    if (ctx->d_ext_scan) cudaFree(ctx->d_ext_scan);
+    if (ctx->d_ext_states) cudaFree(ctx->d_ext_states);
+    if (ctx->d_rem[0]) cudaFree(ctx->d_rem[0]);
+    if (ctx->d_rem[1]) cudaFree(ctx->d_rem[1]);
     if (ctx->t_inited) {
         cudaEventDestroy(ctx->t_start);
         cudaEventDestroy(ctx->t_end);
         cudaEventDestroy(ctx->t_res_start);
         cudaEventDestroy(ctx->t_res_end);
+        cudaEventDestroy(ctx->t_def_start);
+        cudaEventDestroy(ctx->t_def_end);
     }
     if (ctx->stream) cudaStreamDestroy(ctx->stream);
 

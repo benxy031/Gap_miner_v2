@@ -299,6 +299,43 @@ void gpu_sieve_set_extract_accum(gpu_sieve_ctx *ctx, uint32_t k);
    oversize extraction fail closed instead of overrunning the host array. */
 void gpu_sieve_set_cand_cap_limit(gpu_sieve_ctx *ctx, uint64_t slots);
 
+/* Fill-pipeline mode (opt-in, default off): the caller walks windows in a
+   chain on this context's stream, marking window i and extracting it right
+   after, and consumes results only at a flight boundary.  In this mode the
+   mark call does NOT synchronize (its trailing stream sync is a pure host
+   round trip in a chain) and the extract pays ONE stream sync per window
+   instead of two (the offset copy stays in flight until the next sync), which
+   measured as the two dominant bubbles of the --gap-hunt fill.  Requires:
+   the caller's next GPU call is on this same stream, and a
+   gpu_sieve_sync_stream() at every flight boundary before the host reads
+   offsets/counts.  Every other caller keeps the synchronizing default. */
+int gpu_sieve_set_fill_pipeline(gpu_sieve_ctx *ctx, int on);
+
+/* Drain the sieve stream (deferred mark work and offset copies).  Mandatory at
+   a fill-pipeline flight boundary. */
+int gpu_sieve_sync_stream(gpu_sieve_ctx *ctx);
+
+/* Folded PAIR mark: mark TWO consecutive walk windows in one round (window 0
+   with fold offset `m_steps` into d_bitmap[0], window 1 with `m_steps + 1`
+   into d_bitmap[1]), zeroing both bitmaps.  Each window carries its OWN
+   geometry (odd_interval_sizeN / first_odd_offsetN): consecutive walk windows
+   differ by the odd CRT step, so the base parity - and with it the offset and
+   the odd-slot count - flips between them.  The residue/step tables are read
+   ONCE per prime for both windows, which is what makes the --gap-hunt fill's
+   two-window staging round cheaper than two single marks; it needs the same
+   cached step table as the folded single-window mark (`m_steps + 1` must be
+   within the fold limit).  Returns 1 on success, 0 fail-closed. */
+int gpu_sieve_mark_pair_fold(gpu_sieve_ctx *ctx,
+                             uint64_t odd_interval_size0,
+                             uint64_t first_odd_offset0,
+                             uint64_t odd_interval_size1,
+                             uint64_t first_odd_offset1,
+                             uint64_t m_steps,
+                             const uint64_t *primes,
+                             const uint64_t *inv_p,
+                             size_t prime_count,
+                             uint64_t chunk_slots);
+
 /* Per-window candidate capacity the extract buffers start with for a given
    window geometry (max(4096, odd_interval/8), capped at the odd interval).
    The buffers hold SURVIVORS, not one slot per odd position, and the capacity

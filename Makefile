@@ -117,6 +117,7 @@ TEST_GAP_HUNT = $(BIN_DIR)/test_gap_hunt
 TEST_STRATUM = $(BIN_DIR)/test_stratum
 BENCH_FERMAT = $(BIN_DIR)/bench_fermat
 BENCH_MARK = $(BIN_DIR)/bench_mark
+BENCH_HUNT_MARK = $(BIN_DIR)/bench_hunt_mark
 BENCH_P0SIEVE = $(BIN_DIR)/bench_p0sieve
 CUDA_INT = $(BIN_DIR)/cuda_int_throughput
 COVER_MAX = $(BIN_DIR)/cover_max
@@ -244,6 +245,12 @@ $(PHASE0_SCAN_GPU_SPLIT): $(BUILD_DIR)/tools/phase0_scan_gpu_hdll.o $(BUILD_DIR)
 $(BUILD_DIR)/tools/phase0_scan_gpu_hdll.o: tools/phase0_scan_gpu.cu tools/phase0gpu_api.h tools/p0_types.h
 	@mkdir -p $(dir $@)
 	$(CXX) -x c++ -O2 -std=gnu++17 -MMD -MP -DPHASE0_KERNEL_DLL -Itools -c $< -o $@
+
+# Per-kernel cost split of the --gap-hunt window MARK at production geometry
+# (dev tool, CUDA only; includes gpu_sieve.cu so it drives the real kernels).
+$(BENCH_HUNT_MARK): $(BUILD_DIR)/tools/bench_hunt_mark.o | $(BIN_DIR)
+	$(NVCC) $(BUILD_DIR)/tools/bench_hunt_mark.o -L$(CUDA_LIBDIR) -lcudart -lm -o $@
+	@echo "✓ Built: $@"
 
 # GPU bitmap-mark kernel cost-model microbenchmark (dev tool, CUDA only).
 # Standalone TU (does not link the miner objects); needs nvcc.

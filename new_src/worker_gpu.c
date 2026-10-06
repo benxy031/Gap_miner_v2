@@ -1705,8 +1705,26 @@ candidate_capacity x K (see the loud alloc-failure message below). */
    or more workers per GPU.  At ONE worker per GPU chunk 12 (7298) matches
    the old default 32 (7305) and beats 16 (7168), so 12 regresses nothing.
    Emitted-set parity vs a full scan is verified at chunk 12/16/24/32
-   (bad_windows=0 bad_pairs=0 over ~900 flights each at --merit 16). */
-#define MINING_JUMP2_CHUNK_DEFAULT 12
+   (bad_windows=0 bad_pairs=0 over ~900 flights each at --merit 16).
+
+   RE-SWEPT 2026-10-06 on the CURRENT build (dev 3070, shift507 p74_lex_m30,
+   live difficulty 23.22, fused chain, 4 workers, interleaved arms): the
+   table above is stale in the small-chunk direction -- 8 now beats 12 by
+   3-8% (5 interleaved batches: 19456 vs 20427 win/s pooled, i.e. +5.0%),
+   with MR tests/window 70.2 -> 65.1 (-7.3%) in EVERY batch, and the extra
+   rounds are nearly free because the card is 100% busy at this worker
+   count.  The chunk window/cost model (measured on the same build: wall per
+   window = 22.0 us of mark/extract/resid + 0.44 us x MR tests, i.e. MR is
+   58% of the wall and 42% is the per-window sieve floor) is why: a slice
+   costs the survivors it contains, so shrinking C removes the average C/2
+   survivors of the slice that contains the found prime, while the round
+   count only matters on the host side.  4 is worse again (round count) and
+   2 collapses.  At ONE worker the per-round host cost IS exposed, and there
+   the change is neutral-to-slightly-negative (C=8/W=6 11264 vs C=12/W=6
+   11285 win/s) because that configuration is host-bound, not GPU-bound --
+   the ROUND count, not the tests, is the lever there.  Parity re-verified
+   at the new default (bad_windows=0 bad_pairs=0, see the verifier). */
+#define MINING_JUMP2_CHUNK_DEFAULT 8
 /* BEACON-style wave start for the mining chain (MINING_JUMP2_WAVE env):
    each window's scan tests chunks w0, 2*w0, 4*w0 ... capped at
    MINING_JUMP2_CHUNK, so small slices are used near the anchor (where the
@@ -1720,7 +1738,12 @@ candidate_capacity x K (see the loud alloc-failure message below). */
    tests/window 79.6 -> 76.9 (-3.4%); parity MINING_JUMP2_VERIFY: 2048-
    window full-flight replays all bad_windows=0 bad_pairs=0.  One 2965 win/s
    outlier appeared under external load and did NOT reproduce (repeat 8913)
-   -- check before theorizing (the arm's tests/window matched all the rest). */
+   -- check before theorizing (the arm's tests/window matched all the rest).
+   RE-CHECKED 2026-10-06 with the new chunk default 8 (4 workers, interleaved
+   arms): wave 6 19977 vs wave 2 20075 win/s (i.e. 2, which matches the
+   hunt's small-slice-shortly-after-the-anchor shape, is within noise of 6
+   and wave 2 costs ~2% at ONE worker, where the extra rounds are exposed),
+   so the default stays 6 -- at chunk 8 that still means slices 6, 8, 8. */
 #define MINING_JUMP2_WAVE_DEFAULT 6
 static int g_mj2_wave = MINING_JUMP2_WAVE_DEFAULT;
 

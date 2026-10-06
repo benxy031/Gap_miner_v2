@@ -30,6 +30,11 @@ __device__ __constant__ int8_t c30_clsidx[30];
 __device__ __constant__ uint32_t c30_perm[30];
 __device__ __constant__ uint32_t c30_pinv[30];
 
+/* Item-loop partition cut (see class30_sieve_kernel): tables at or below this
+   many item rows use the per-thread contiguous slices (setup reuse), larger
+   ones the warp-strided coalesced walk. */
+#define P0_ITEM_STRIDE_CUT 5000u
+
 /* x * invp >> 64 (Granlund-Montgomery quotient estimate); was
    ((u128)x * (u128)invp) >> 64. */
 __device__ static inline uint64_t t_fastmod64(uint64_t x, uint64_t p, uint64_t invp) {
@@ -75,6 +80,43 @@ __global__ static void class30_sieve_kernel(const uint64_t * __restrict__ primes
     extern __shared__ uint64_t sh[];
     __shared__ uint64_t wpat[127];
     __shared__ uint32_t wpj[24];
+    /* Step tables for the item loop (built once per CTA, ~15 ops per thread).
+       A mark of prime p sits at a value p*m with m coprime to 30; moving to
+       the next mark advances m by dm (one of the coprime gaps 2,4,6) and the
+       VALUE by dm*p, which is a SLOT advance of
+           8*dm*(p/30) + 8*floor((cv + dm*(p%30))/30)
+                       + clsidx[(cv + dm*(p%30)) % 30] - clsidx[cv]
+       where cv is the current value's class and dm follows the fixed cyclic
+       class order, so the whole bracket depends only on
+       (m-class index, p%30, position in the cycle).  s_step[jstart][unit][st]
+       holds that bracket and s_dm8 the dm at each position, so an item's
+       eight steps are 8 IMAD + 8 shared loads instead of the ~24 arithmetic
+       ops (two /30, two %30, two clsidx lookups, ~8 table reads) per step the
+       loop used to run for EVERY item. */
+    __shared__ uint32_t s_step[8 * 8 * 8];   /* [jstart][unit p%30][st] */
+    __shared__ uint32_t s_dm8[8];
+    __shared__ uint8_t  s_unit[30];
+    if (threadIdx.x < 30u) {
+        uint32_t r = threadIdx.x, j = 0xFFu;
+        for (uint32_t t = 0; t < 8u; t++) if (c30_cls[t] == r) j = t;
+        s_unit[r] = (uint8_t)j;
+    }
+    if (threadIdx.x >= 32u && threadIdx.x < 40u) {
+        uint32_t j = threadIdx.x - 32u, j2 = (j + 1u) & 7u;
+        s_dm8[j] = c30_cls[j2] - c30_cls[j] + ((j2 == 0u) ? 30u : 0u);
+    }
+    if (threadIdx.x < 512u) {
+        uint32_t i = threadIdx.x;
+        uint32_t jstart = i >> 6, ri = (i >> 3) & 7u, st = i & 7u;
+        uint32_t pmod = c30_cls[ri];
+        uint32_t js = (jstart + st) & 7u, js2 = (js + 1u) & 7u;
+        uint32_t dm = c30_cls[js2] - c30_cls[js] + ((js2 == 0u) ? 30u : 0u);
+        uint32_t cv = (pmod * c30_cls[js]) % 30u;
+        uint32_t w = cv + dm * pmod;
+        s_step[i] = 8u * (w / 30u) + (uint32_t)c30_clsidx[w % 30u]
+                  - (uint32_t)c30_clsidx[cv];
+    }
+    __syncthreads();
     for (uint64_t tile = blockIdx.x; tile < ntiles; tile += gridDim.x) {
         for (uint32_t w = threadIdx.x; w < tileWords; w += blockDim.x) sh[w] = 0;
         __syncthreads();
@@ -117,15 +159,33 @@ __global__ static void class30_sieve_kernel(const uint64_t * __restrict__ primes
             for (int st = 0; st < 8; st++) { wpj[threadIdx.x * 8 + st] = (uint32_t)pos + cum; cum += step[st]; }
         }
         {
+        /* Item loop, two partitionings (measured 2026-10-06, 2e13, mark-only):
+           - SMALL item tables (P0_ITEM_STRIDE_CUT items ~= 40 KB of rows; the
+             production depth is 3568 items = 28 KB): per-THREAD contiguous
+             slices, so consecutive items of one prime share a setup
+             (`pi != cur_pi`) - that reuse is worth 2.5 s of mark at P=15000.
+           - LARGE tables: warp-STRIDED, so the warp's 32 lanes read 32
+             CONSECUTIVE items = one 128-byte sector.  With contiguous slices
+             the lanes sit nitems/nthreads items apart (157 at P=1e6 = 628 B):
+             one sector per lane, 32 L1 misses per load, and the table lives in
+             L2 (the 64 KB shared tile leaves ~28 KB of L1), so the mark paid a
+             full L2 latency per item.  Measured head to head: P=150000
+             50.8 -> 25.5 s, P=1e6 251.6 -> 85.1 s, while at P=15000 the
+             contiguous slices stay 2.5 s cheaper (15.4 vs 17.9 s) - hence the
+             split.  See section 23 of docs/PHASE0_scan_bench.md. */
         uint32_t nthreads = blockDim.x;
-        uint32_t per = nitems / nthreads, rem = nitems - per * nthreads;
-        uint32_t it0 = threadIdx.x * per + (threadIdx.x < rem ? threadIdx.x : rem);
-        uint32_t itn = per + (threadIdx.x < rem ? 1u : 0u);
+        uint32_t it_first = threadIdx.x, it_end = nitems, it_step = nthreads;
+        if (nitems <= P0_ITEM_STRIDE_CUT) {
+            uint32_t per = nitems / nthreads, rem = nitems - per * nthreads;
+            it_first = threadIdx.x * per + (threadIdx.x < rem ? threadIdx.x : rem);
+            it_end = it_first + per + (threadIdx.x < rem ? 1u : 0u);
+            it_step = 1;
+        }
         int cur_pi = -1;
         uint32_t cur_p = 0;
         uint32_t pos_base = 0;
         uint32_t step[8];
-        for (uint32_t it = it0; it < it0 + itn; it++) {
+        for (uint32_t it = it_first; it < it_end; it += it_step) {
             int pi = (int)itemPidx[it];
             uint32_t k0 = itemK0[it];
             if (pi != cur_pi) {
@@ -147,16 +207,15 @@ __global__ static void class30_sieve_kernel(const uint64_t * __restrict__ primes
                 uint32_t r = phi % 30u;
                 pos_base = (phi / 30u) * 8u + (uint32_t)c30_clsidx[r];
                 uint32_t j = (uint32_t)c30_clsidx[(r * c30_pinv[pm30]) % 30u];
-                uint32_t ph = phi;
-                for (int st = 0; st < 8; st++) {
-                    uint32_t j2 = (j + 1u) & 7u;
-                    uint32_t dm = (uint32_t)c30_cls[j2] - (uint32_t)c30_cls[j];
-                    if (j2 == 0u) dm += 30u;
-                    uint32_t ph2 = ph + dm * cur_p;
-                    step[st] = (ph2 / 30u) * 8u + (uint32_t)c30_clsidx[ph2 % 30u]
-                             - ((ph / 30u) * 8u + (uint32_t)c30_clsidx[ph % 30u]);
-                    ph = ph2; j = j2;
-                }
+                uint32_t k8 = (cur_p / 30u) * 8u;
+                /* & 7u keeps the index in range should a caller ever feed a
+                   prime ≡ 0 mod 30 (s_unit maps non-units to 0xFF); the item
+                   table only ever holds primes > 13, so this is a guard. */
+                uint32_t ri = s_unit[pm30] & 7u;
+                const uint32_t *tp = &s_step[(j << 6) + (ri << 3)];
+#pragma unroll
+                for (int st = 0; st < 8; st++)
+                    step[st] = k8 * s_dm8[(j + (uint32_t)st) & 7u] + tp[st];
             }
             uint32_t p32 = pos_base + 256u * cur_p * k0;
             if (p32 >= (uint32_t)tileSlots) continue;

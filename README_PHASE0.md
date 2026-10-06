@@ -78,7 +78,7 @@ Defaults:
 | `--merit-min M` | `20.0` | gaps >= M are written to the log and GMP-verified; bands/top-4/records still see every gap with merit >= 6 (internal gate) |
 | `--engine sieve\|walk` | `sieve` | `walk` selects the class-30 bitmap sieve + batched jump-walk engine (~10.6x the sieve engine's throughput at the production default: measured 5.2 s vs 55.8 s for 1e12 integers, identical 5-gap output, 2026-10-02; same log/records/verify/top-4/resume path). `--check`, `--gpu-sieve`/`--cpu-sieve`, `--legacy-mr` and `--sieve-limit` apply to the sieve engine only; combining them with `--engine walk` is an error (or ignored where noted) |
 | `--gap-min G` | `ceil(--merit-min * ln(start))` | walk engine only: report every gap >= G (GMP-verified). G in [100, 1e7]; values < 300 print a warning (walk cost scales ~1/G). Passing `--gap-min` explicitly removes the merit gate; an explicit `--merit-min` stays as an additional bar |
-| `--walk-primes P` | `15000` | walk engine: sieve/item primes 17..P (measured optimum at this geometry) |
+| `--walk-primes P` | `15000` | walk engine: sieve/item primes 17..P (measured wall optimum at this range geometry; the curve is flat 15000..30000 since the 2026-10-06 item-loop coalescing, §23) |
 | `--walk-batch B` | `64` | walk engine: super-batch = B x 30-blocks (**default 64 since 2026-10-03**, was 32; range **4..96**, raised from 4..32 the same day). ABBA on 1e13 at `--gap-min 702` (dev 3070, 4 arms): K32 63.68 s vs **K64 62.12 s = +2.45 %**, K96 62.26 s (+2.23 %, no better than 64 but 6.5 GB); both K64 arms beat both K32 arms and the emitted sets are identical (parity K32==K64==K96 exact, 1624/1624 on 1e12). VRAM = 2 regions x (B+1) x 33.6 MB + gap buffer: default K=64 -> 4.4 GB, K=32 -> 2.2 GB, K=96 -> 6.5 GB (an over-large K fails the bitmap alloc loudly, never silently) |
 | `--log FILE` | none | appended; one `# phase0-gpu session ...` header per run |
 | `--state FILE` / `--state-every S` | none / `30` s | checkpoint for resume; **deleted when the range completes** |
@@ -158,6 +158,26 @@ the campaign geometry (2e13, `--gap-min 1586`, K=64): 57.5 s -> 50.9 s =
 gap-set parity on 5 geometries + P-invariance + split parity all green).
 `--walk-primes 15000` remains the wall optimum (60000 -> 29.4 s vs 25.9 s at
 1e13) - see `docs/PHASE0_scan_bench.md` §22.
+
+Item loop (2026-10-06): two changes in the class-30 sieve's item loop, both
+bit-identical in output.  (a) The item table is read UNCOALESCED once it
+outgrows the L1: with per-thread contiguous slices a warp's 32 lanes sit
+`nitems/nthreads` items apart (157 rows = 628 B at `--walk-primes 1e6`), so
+every read was a 32-sector fetch with L2 latency behind it.  Above
+`P0_ITEM_STRIDE_CUT` (5000 rows, ~40 KB) the loop now switches to a
+**warp-strided** walk that reads 32 consecutive items per load: mark at
+P=1e6 251.6 s -> **81.8 s**, P=150000 50.8 -> 25.7 s.  (b) A prime's eight
+step deltas are **table-driven** (an 8x8x8 bracket table built in shared
+memory once per CTA) instead of ~24 arithmetic ops per step, which also pays
+for the production depth: mark solo 15.4 -> **14.6 s** at the default
+`--walk-primes 15000`.  The wall is unchanged at the default (ABBA reps=2,
+2e13, g1586: 51.28 s vs 51.00 s = -0.56 %, inside the +-2.3 % spread), and
+the *cost of depth* collapsed - the depth curve is flat 15000..30000 and the
+walk side's 1/ln P tail (~40 s of walk span at 60000) is now reachable.
+Gates after the change: walk fixture 22/22 rows, 1e12 `--gap-min 500` sorted
+gap-set parity 201,575 rows, split-vs-main parity 201,575 rows, `--check
+200000`/`2000000` and `bench_p0sieve --verify 3` all green.  See
+`docs/PHASE0_scan_bench.md` §23.
 
 Reproduce: `python3 scripts/p0_bench.py --bin-b <pre-P0_PIPE binary>
 --length 2e13 --gap-min 1586 --label P0_PIPE` (~8 min ABBA; raw lines in

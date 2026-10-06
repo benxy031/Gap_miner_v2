@@ -26,7 +26,8 @@
    per-prime row walk; measured +47-55% end-to-end windows/s and 14x less mark
    kernel time in the fused chain, shift512 p75, RTX 3070 -- see README and
    docs/GPU_SCREEN_ANALYSIS.md).  GPU_MARK_SPLIT=0 disables it; the chunk size
-   in odd slots is GPU_MARK_SPLIT_SLOTS (default 160, clamped to [32, 4096]).
+   in odd slots is GPU_MARK_SPLIT_SLOTS (default 4096 since 2026-10-06, was
+   160, clamped to [32, 4096] -- see the note in gpu_mark_split_slots()).
    Isolated measurement: 25-38x faster marking (21-30 us vs 700-810 us for
    W=10175, rows=8, 2M primes) with 0 differing bitmap bits. */
 static int gpu_mark_split_enabled(void) {
@@ -46,7 +47,24 @@ static int gpu_extract_fused_enabled(void) {
 
 static uint64_t gpu_mark_split_slots(void) {
     const char *v = getenv("GPU_MARK_SPLIT_SLOTS");
-    uint64_t s = 160;
+    /* DEFAULT 4096 since 2026-10-06 (was 160).  The split kernel maps one
+       thread per (prime, row, chunk) work item and most items find no
+       multiple of their prime inside a chunk, so the item count -- and with
+       it the SM time the mark steals from the MR kernel -- scales with the
+       CHUNK COUNT and not with the marks that are actually set.  Measured
+       end-to-end in the fused chain (dev 3070, shift507 p74_lex_m30, live
+       difficulty, 4 workers, interleaved arms, tests/window identical at
+       65.1): 152 chunks (160 slots) 19,148 win/s -> 10 chunks (2560) 20,355
+       -> 6 chunks (4096) 20,162, i.e. **+5-6%**, with the same change at
+       2 workers (+5.1%) and neutral at 1 worker (+0.3%; that configuration
+       is host-bound).  shift1017 was re-checked too: 4,179 -> 4,255 win/s
+       (+1.8%, within arm spread, no regression).  The isolated kernel bench
+       in the header comment prefers more chunks because it measures the
+       kernel alone; end-to-end the coarser grid wins because the card is
+       saturated with MR work.  The clamp [32, 4096] is unchanged, so 4096
+       is the coarsest expressible value -- a geometry that needs finer
+       chunking (or an isolated mark benchmark) can pin 160. */
+    uint64_t s = 4096;
     if (v && v[0]) {
         unsigned long long parsed = strtoull(v, NULL, 10);
         if (parsed > 0) s = (uint64_t)parsed;

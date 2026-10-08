@@ -1267,7 +1267,14 @@ static void *monitor_thread(void *arg) {
                 batches+= __atomic_load_n(&g_jobs[t].batches, __ATOMIC_RELAXED);
                 gaps   += __atomic_load_n(&g_jobs[t].gaps_reported, __ATOMIC_RELAXED);
             }
-            double rate = (now > g_t0) ? (double)done / (now - g_t0) : 0.0;
+            /* rate and ETA must describe THIS session: `done` includes the
+               integers finished before a resume (g_pre_ints), so dividing it
+               by the current session's elapsed time overstates the rate by
+               the resume fraction (measured 2026-10-08: a slice resumed at
+               83 % printed 4.6e13 ints/s and eta=35s while actually running
+               at 2.2e11 ints/s with 2.1 h left). */
+            double rate = (now > g_t0 && done > g_pre_ints)
+                        ? (double)(done - g_pre_ints) / (now - g_t0) : 0.0;
             char eta[32];
             double remain = (g_total_ints > done) ? (double)(g_total_ints - done) : 0.0;
             fmt_eta((rate > 0) ? remain / rate : -1.0, eta, sizeof eta);
@@ -1698,11 +1705,23 @@ static int run_walk_engine(void) {
     {
         uint64_t ints = g_pre_ints + wj.ints;
         if (ints > g_len) ints = g_len;
+        /* end_to_end is THIS session's rate: a slice resumed at X% must not
+           divide the whole slice by the remainder's wall time (the same trap
+           as the monitor's; for a fresh run g_pre_ints is 0 so every
+           previously documented number is unchanged). */
+        double session_ints = (double)wj.ints;
         double per14 = (ints > 0) ? (1e14 / (double)ints) : 0.0;
         printf("[phase0-gpu] --- results ---\n");
         printf("[phase0-gpu] wall=%.2f s  ints=%llu  end_to_end=%.3e ints/s%s\n",
-               wall, (unsigned long long)ints, (double)ints / wall,
+               wall, (unsigned long long)ints,
+               wall > 0 ? session_ints / wall : 0.0,
                all_done ? "" : "  (STOPPED early)");
+        if (g_pre_ints)
+            printf("[phase0-gpu]   (session start offset %llu ints = %.2f%% of the "
+                   "slice; the rate above covers only this session's %llu ints)\n",
+                   (unsigned long long)g_pre_ints,
+                   g_len ? 100.0 * (double)g_pre_ints / (double)g_len : 0.0,
+                   (unsigned long long)wj.ints);
         printf("[phase0-gpu] gpu batches=%llu  tests=%llu  test_rate=%.3e tests/s  "
                "tests/jump=%.2f\n",
                (unsigned long long)wj.batches, (unsigned long long)wj.tests,

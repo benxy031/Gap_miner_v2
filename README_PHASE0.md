@@ -86,7 +86,7 @@ Defaults:
 | `--walk-batch B` | `64` | walk engine: super-batch = B x 30-blocks (**default 64 since 2026-10-03**, was 32; range **4..96**, raised from 4..32 the same day). ABBA on 1e13 at `--gap-min 702` (dev 3070, 4 arms): K32 63.68 s vs **K64 62.12 s = +2.45 %**, K96 62.26 s (+2.23 %, no better than 64 but 6.5 GB); both K64 arms beat both K32 arms and the emitted sets are identical (parity K32==K64==K96 exact, 1624/1624 on 1e12). VRAM = 2 regions x (B+1) x 33.6 MB + gap buffer: default K=64 -> 4.4 GB, K=32 -> 2.2 GB, K=96 -> 6.5 GB (an over-large K fails the bitmap alloc loudly, never silently) |
 | `--log FILE` | none | appended; one `# phase0-gpu session ...` header per run |
 | `--state FILE` / `--state-every S` | none / `30` s | checkpoint for resume; **deleted when the range completes** |
-| `--progress S` | `10` s | progress + ETA line every S seconds (`0` = off) |
+| `--progress S` | `10` s | progress + ETA line every S seconds (`0` = off); after a `--state` resume the line's `ints/s` and the final `end_to_end` cover only the current session (the `%` and `ints=` stay whole-slice) |
 | `--device D` | `0` | CUDA device |
 | `--records FILE` / `--no-records` | `data/prime_gap_merits.txt` if present | record check: gap length in table AND merit > best known; a beat is logged even below `--merit-min` |
 | sieve mode | `--gpu-sieve` | `--cpu-sieve` selects the (slow) CPU marking path |
@@ -238,6 +238,8 @@ The monitor thread prints exactly this status line; end of run:
 
 ```
 [phase0-gpu] wall=... end_to_end=... ints/s
+[phase0-gpu]   (session start offset <N> ints = <X>% of the slice; the rate
+                above covers only this session's <M> ints)
 [phase0-gpu] survivors=... u=...% of ints
 [phase0-gpu] fast split (GPU-s sums): wheel+mark=... MR=... copies=...
 [phase0-gpu] gaps per merit threshold (this session -> per 1e14 ints):

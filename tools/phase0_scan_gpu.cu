@@ -1598,9 +1598,19 @@ static int run_walk_engine(void) {
                            wk_grid, wk_block, sB) != 0)
                 die("p0gpu_walk failed");
 #else
-            walk_kernel7<<<wk_grid, wk_block, 0, sB>>>(bm, cnb * cWords,
-                (uint64_t)Ab, (uint64_t)(Ab >> 64), d_wtab, (uint32_t)gapmin,
-                out_r, 1u << 20, st_r);
+            /* the test variant is selected per launch (the three instantiations
+               keep ptxas from pricing the widest test into the perig path) */
+            switch (w_test_mode((uint64_t)(Ab >> 64))) {
+            case 2: walk_kernel7<2><<<wk_grid, wk_block, 0, sB>>>(bm, cnb * cWords,
+                        (uint64_t)Ab, (uint64_t)(Ab >> 64), d_wtab,
+                        (uint32_t)gapmin, out_r, 1u << 20, st_r); break;
+            case 1: walk_kernel7<1><<<wk_grid, wk_block, 0, sB>>>(bm, cnb * cWords,
+                        (uint64_t)Ab, (uint64_t)(Ab >> 64), d_wtab,
+                        (uint32_t)gapmin, out_r, 1u << 20, st_r); break;
+            default: walk_kernel7<0><<<wk_grid, wk_block, 0, sB>>>(bm, cnb * cWords,
+                        (uint64_t)Ab, (uint64_t)(Ab >> 64), d_wtab,
+                        (uint32_t)gapmin, out_r, 1u << 20, st_r); break;
+            }
 #endif
             e = cudaGetLastError(); if (e != cudaSuccess) die_cuda(e, "walk launch");
             e = cudaEventRecord(evW[r], sB); if (e != cudaSuccess) die_cuda(e, "record evW");

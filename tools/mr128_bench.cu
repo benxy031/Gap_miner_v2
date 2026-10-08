@@ -442,8 +442,17 @@ __global__ static void k_v3(const uint32_t * __restrict__ c, uint8_t * __restric
     }
 }
 
-/* variant 9: the walk engine's existing perig test (2 x 64-bit limbs) - the
-   speed yardstick for a 64-bit-limb rework; correct only up to 120 bits. */
+/* variant 13: the lazy-ladder kernel from mr128_64_kernel.cuh
+   (mr128_64_base2_lazy) — kept in the harness to A/B against v10. */
+__global__ static void k_v13(const uint32_t * __restrict__ c, uint8_t * __restrict__ r,
+                             uint32_t count) {
+    uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= count) return;
+    uint64_t lo = (uint64_t)c[(size_t)i * 4 + 0] | ((uint64_t)c[(size_t)i * 4 + 1] << 32);
+    uint64_t hi = (uint64_t)c[(size_t)i * 4 + 2] | ((uint64_t)c[(size_t)i * 4 + 3] << 32);
+    r[i] = (uint8_t)mr128_64_base2_lazy_u128(lo, hi);
+}
+
 __global__ static void k_v9(const uint32_t * __restrict__ c, uint8_t * __restrict__ r,
                             uint32_t count) {
     uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
@@ -482,6 +491,7 @@ static void launch(int variant, uint32_t batch, int tpb,
         case 9: k_v9<<<grid, tpb>>>(d_c, d_r, batch); break;
         case 10: k_v10<<<grid, tpb>>>(d_c, d_r, batch); break;
         case 11: k_v11<<<grid, tpb>>>(d_c, d_r, batch); break;
+        case 13: k_v13<<<grid, tpb>>>(d_c, d_r, batch); break;
         default: k_v3<<<grid, tpb>>>(d_c, d_r, batch); break;
     }
 }
@@ -570,7 +580,9 @@ static int run_bench(uint32_t batch, int iters, int variant, int tpb, int bits) 
                    : (variant == 2) ? (const void *)k_v2
                    : (variant == 9) ? (const void *)k_v9
                    : (variant == 10) ? (const void *)k_v10
-                   : (variant == 11) ? (const void *)k_v11 : (const void *)k_v3;
+                   : (variant == 11) ? (const void *)k_v11
+                   : (variant == 13) ? (const void *)k_v13
+                   : (variant == 13) ? (const void *)k_v13 : (const void *)k_v3;
     if (cudaFuncGetAttributes(&fa, fn) == cudaSuccess)
         printf("[mr128] variant %d: regs/thread=%d  maxThreadsPerBlock=%d  localBytes=%zu\n",
                variant, fa.numRegs, fa.maxThreadsPerBlock, fa.localSizeBytes);

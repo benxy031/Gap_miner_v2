@@ -276,16 +276,32 @@ __global__ static void class30_sieve_kernel(const uint64_t * __restrict__ primes
    scan range's high word passed at runtime (ciosFermatTest128_hi). */
 /* Primality test dispatch.  perig's ciosFermatTest128_hi is exact up to 120
    bits but rejects real primes from 121 bits on (a false negative silently
-   splits a gap - see tools/mr128_64_kernel.cuh), so at and above 2^120 the
-   2 x 64-bit CIOS base-2 test takes over.  Values below 2^120 keep the perig
-   verdict, so the <= 96-bit production path is bit-for-bit unchanged. */
+   splits a gap - see tools/mr128_64_kernel.cuh).  Bands: perig below 2^120,
+   the lazy ladder (mr128_64_base2_lazy, exact < 2^126, +37%) in
+   2^120..2^126, and the canonical kernel above 2^126.  Values below 2^120
+   keep the perig verdict, so the <= 96-bit production path is bit-for-bit
+   unchanged. */
 #define W_PERIG_MAX_HI  (1ULL << 56)     /* value < 2^120 */
+#define W_LAZY_MAX_HI   (1ULL << 62)     /* value < 2^126 */
 
+/* The test is selected at kernel-compile time, not per call: instantiating
+   three variants in one kernel lets ptxas allocate registers for the worst
+   branch, which cost the production (perig) path 18%.  The host launches the
+   variant matching the super-batch's high word. */
+template<int MODE>
 __device__ static inline int w_is_probable_prime(uint64_t v, uint64_t Ahi) {
-    if (Ahi >= W_PERIG_MAX_HI) return mr128_64_base2_u128(v, Ahi);
+    if (MODE == 2) return mr128_64_base2_u128(v, Ahi);
+    if (MODE == 1) return mr128_64_base2_lazy_u128(v, Ahi);
     return ciosFermatTest128_hi(v, Ahi) ? 1 : 0;
 }
 
+__host__ static inline int w_test_mode(uint64_t Ahi) {
+    if (Ahi >= W_LAZY_MAX_HI)  return 2;
+    if (Ahi >= W_PERIG_MAX_HI) return 1;
+    return 0;
+}
+
+template<int TESTMODE>
 __global__ static void walk_kernel7(const uint64_t *__restrict__ bm, uint64_t nwords,
                                     uint64_t Alo, uint64_t Ahi,
                                     const uint32_t *__restrict__ wtab,
@@ -308,7 +324,7 @@ __global__ static void walk_kernel7(const uint64_t *__restrict__ bm, uint64_t nw
     while (c >= 0) {
         tests++;
         uint64_t v = Alo + 30ull * ((uint64_t)c >> 3) + (uint64_t)scls[c & 7u];
-        if (w_is_probable_prime(v, Ahi)) break;
+        if (w_is_probable_prime<TESTMODE>(v, Ahi)) break;
         c = w_nextCand(bm, nwords, c + 1);
     }
     if (c < 0) { atomicAdd(&stats[0], tests); return; }
@@ -326,7 +342,7 @@ __global__ static void walk_kernel7(const uint64_t *__restrict__ bm, uint64_t nw
                 if (q < 0) goto done7;
                 tests++;
                 uint64_t vq = Alo + 30ull * ((uint64_t)q >> 3) + (uint64_t)scls[q & 7u];
-                if (w_is_probable_prime(vq, Ahi)) {
+                if (w_is_probable_prime<TESTMODE>(vq, Ahi)) {
                     uint64_t vp = Alo + 30ull * ((uint64_t)p >> 3) + (uint64_t)scls[p & 7u];
                     uint32_t gap = (uint32_t)(vq - vp);
                     if (gap >= minGapVal) {
@@ -345,7 +361,7 @@ __global__ static void walk_kernel7(const uint64_t *__restrict__ bm, uint64_t nw
         }
         tests++;
         uint64_t vs = Alo + 30ull * ((uint64_t)s >> 3) + (uint64_t)scls[s & 7u];
-        if (w_is_probable_prime(vs, Ahi)) {
+        if (w_is_probable_prime<TESTMODE>(vs, Ahi)) {
             p = s;
             jumps++;
             s = p + (int64_t)wtab[p & 7];

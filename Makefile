@@ -124,6 +124,7 @@ COVER_MAX = $(BIN_DIR)/cover_max
 PHASE0_SCAN = $(BIN_DIR)/phase0_scan
 PHASE0_SCAN_GPU = $(BIN_DIR)/phase0_scan_gpu
 MR68_GPU = $(BIN_DIR)/mr68_gpu
+MR128_BENCH = $(BIN_DIR)/mr128_bench
 
 # Phony targets
 .PHONY: all clean test help update-merits
@@ -223,6 +224,13 @@ $(MR68_GPU): $(BUILD_DIR)/tools/mr68_gpu.o | $(BIN_DIR)
 	$(NVCC) $(BUILD_DIR)/tools/mr68_gpu.o -L$(CUDA_LIBDIR) -lcudart -lgmp -lm -o $@
 	@echo "✓ Built: $@"
 
+# 128-bit walk-engine primality test: GMP cross-check (--validate) + benchmark
+# of the production kernel and its experimental faster variants.
+# Build: make bin/mr128_bench WITH_CUDA=1
+$(MR128_BENCH): $(BUILD_DIR)/tools/mr128_bench.o | $(BIN_DIR)
+	$(NVCC) $(BUILD_DIR)/tools/mr128_bench.o -L$(CUDA_LIBDIR) -lcudart -lgmp -lm -o $@
+	@echo "✓ Built: $@"
+
 # GPU live Phase-0 scanner: CPU bucketed sieve + the shared mr68 kernel;
 # GMP host-side for --check and for verifying every reported gap.
 # Build: make bin/phase0_scan_gpu WITH_CUDA=1
@@ -262,6 +270,10 @@ $(BENCH_MARK): $(BUILD_DIR)/tools/bench_mark.o | $(BIN_DIR)
 # measures the full per-segment GPU cycle (memset + mark kernel + D2H of the
 # 64 KB bitmap) and verifies segment bitmaps against a naive CPU marker.
 # Build: make bin/bench_p0sieve WITH_CUDA=1
+$(MR128_BENCH): $(BUILD_DIR)/tools/mr128_bench.o tools/mr128_kernel.cuh | $(BIN_DIR)
+	$(NVCC) $(BUILD_DIR)/tools/mr128_bench.o -L$(CUDA_LIBDIR) -lcudart -lgmp -lm -o $@
+	@echo "✓ Built: $@"
+
 $(BENCH_P0SIEVE): $(BUILD_DIR)/tools/bench_p0sieve.o | $(BIN_DIR)
 	$(NVCC) $(BUILD_DIR)/tools/bench_p0sieve.o -L$(CUDA_LIBDIR) -lcudart -lm -o $@
 	@echo "✓ Built: $@"

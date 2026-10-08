@@ -29,6 +29,10 @@ Current performance (RTX 3070, i3-10100, 8 threads):
 | `bin/phase0_scan` | `tools/phase0_scan.c` | CPU-only reference scanner (same gates, slow; no GPU) |
 | `bin/bench_p0sieve` | `tools/bench_p0sieve.cu` | GPU marking probe: rate + **bit-exact check** vs a naive CPU marker |
 | `bin/mr68_gpu` | `tools/mr68_gpu.cu` | 96-bit Miller-Rabin kernel validator (`--validate`, GMP cross-check) + benchmark |
+| `tools/mr128_kernel.cuh`, `tools/mr128_64_kernel.cuh` | | base-2 CIOS tests for 2^96 < n < 2^128 (4 x 32-bit and 2 x 64-bit limbs); the walk engine uses the 2 x 64-bit one at and above 2^120 |
+| `bin/mr128_bench`, `tools/mr128_bench.cu` | | 128-bit test validator (`--validate`, GMP cross-check) + benchmark of the production kernel and its faster experimental variants |
+| `tools/mr128_64_range.cpp`, `tools/mr128_64_sqr_range.cpp` | | host-only GMP harnesses for the 2 x 64-bit test and its square (the second one unit-tests the square against the validated generic multiply) |
+| `tools/mr128_range.cpp`, `tools/perig_range.cpp` | | host-only GMP harnesses: MR verdicts vs `mpz_probab_prime_p` per bit length (`g++ -O2 -I tools <harness>.cpp -lgmp`; the headers define the CUDA qualifiers away when not compiled by nvcc) |
 | `scripts/p0_bench.py` | | fixed-range walk-engine bench: runs arms, parses wall/e2e/tests + the GPU-event stage split; `--bin-b` gives the ABBA order; results append to `data/p0_bench_results.txt` |
 | `scripts/phase0_hl_compare.py` | | merit-tail comparison vs HL-1t / HL-4p models (figure) |
 
@@ -69,7 +73,7 @@ Defaults:
 
 | flag | default | notes |
 |---|---|---|
-| `--start DEC` | `200000000000000000000` (2e20) | any integer; range must stay < 2^96 |
+| `--start DEC` | `200000000000000000000` (2e20) | any integer; the walk engine accepts up to 2^128 (auto-nudge over the 64-bit block window), the sieve engine up to 2^96 |
 | `--length DEC` | `10000000000` (1e10) | |
 | `--sieve-limit P` | `1e7` (GPU sieve) / `3e4` (CPU sieve) | marking primes 17..P; 1e7 is the measured optimum (deeper sieving loses: item count scales with pi(P)) |
 | `--threads T` | `8` | one CUDA stream + one slice per thread |
@@ -78,7 +82,7 @@ Defaults:
 | `--merit-min M` | `20.0` | gaps >= M are written to the log and GMP-verified; bands/top-4/records still see every gap with merit >= 6 (internal gate) |
 | `--engine sieve\|walk` | `sieve` | `walk` selects the class-30 bitmap sieve + batched jump-walk engine (~10.6x the sieve engine's throughput at the production default: measured 5.2 s vs 55.8 s for 1e12 integers, identical 5-gap output, 2026-10-02; same log/records/verify/top-4/resume path). `--check`, `--gpu-sieve`/`--cpu-sieve`, `--legacy-mr` and `--sieve-limit` apply to the sieve engine only; combining them with `--engine walk` is an error (or ignored where noted) |
 | `--gap-min G` | `ceil(--merit-min * ln(start))` | walk engine only: report every gap >= G (GMP-verified). G in [100, 1e7]; values < 300 print a warning (walk cost scales ~1/G). Passing `--gap-min` explicitly removes the merit gate; an explicit `--merit-min` stays as an additional bar |
-| `--walk-primes P` | `15000` | walk engine: sieve/item primes 17..P (measured wall optimum at this range geometry; the curve is flat 15000..30000 since the 2026-10-06 item-loop coalescing, §23) |
+| `--walk-primes P` | `40000` | walk engine: sieve/item primes 17..P.  Deeper sieving cuts the number of primality tests, and at the container wall that is worth more than the extra marking: 1.48e11 -> **1.79e11 ints/s** from 15000 to 40000 (+20 %, §26.5).  At the 2e20 campaign geometry the two depths are equal within noise (3.93e11 vs 3.92e11) and 60000 is 2 % worse, so 40000 is the single default; raise it (60000..250000) for starts at or above 2^120, where tests get ~1.5x more expensive.  Gap sets are identical across depths |
 | `--walk-batch B` | `64` | walk engine: super-batch = B x 30-blocks (**default 64 since 2026-10-03**, was 32; range **4..96**, raised from 4..32 the same day). ABBA on 1e13 at `--gap-min 702` (dev 3070, 4 arms): K32 63.68 s vs **K64 62.12 s = +2.45 %**, K96 62.26 s (+2.23 %, no better than 64 but 6.5 GB); both K64 arms beat both K32 arms and the emitted sets are identical (parity K32==K64==K96 exact, 1624/1624 on 1e12). VRAM = 2 regions x (B+1) x 33.6 MB + gap buffer: default K=64 -> 4.4 GB, K=32 -> 2.2 GB, K=96 -> 6.5 GB (an over-large K fails the bitmap alloc loudly, never silently) |
 | `--log FILE` | none | appended; one `# phase0-gpu session ...` header per run |
 | `--state FILE` / `--state-every S` | none / `30` s | checkpoint for resume; **deleted when the range completes** |
@@ -156,8 +160,10 @@ the campaign geometry (2e13, `--gap-min 1586`, K=64): 57.5 s -> 50.9 s =
 **another -11.5 %** (3.48e11 -> 3.93e11 ints/s; ABBA reps=2, mark span
 58.1 -> 50.0 s, walk unchanged, `tests` identical 35,646,342,874; sorted
 gap-set parity on 5 geometries + P-invariance + split parity all green).
-`--walk-primes 15000` remains the wall optimum (60000 -> 29.4 s vs 25.9 s at
-1e13) - see `docs/PHASE0_scan_bench.md` §22.
+`--walk-primes 15000` is the optimum at THIS campaign geometry within noise
+(60000 -> 29.4 s vs 25.9 s at 1e13, old binary); at the 2^96 container wall the
+optimum moved to 40000 after the 2026-10-08 audit - see § 26.5 and the
+`--walk-primes` default row above - see `docs/PHASE0_scan_bench.md` §22.
 
 Item loop (2026-10-06): two changes in the class-30 sieve's item loop, both
 bit-identical in output.  (a) The item table is read UNCOALESCED once it
@@ -199,10 +205,17 @@ Higher-yield sweep (report every gap >= 500, ~10.7 merit at 2e20; expect
     --log data/p0_walk_g500.log
 ```
 
-Constraints (checked at startup, both abort with a message): the whole
-range must stay inside one 64-bit window of the aligned block base (always
-true for campaign ranges spanning < 1.8e19 integers), and `--start` must
-exceed `--walk-primes`.  One worker only (the sieve engine's `--threads`
+Container and constraints.  The walk path is exact up to
+`start + length <= 2^128` (its perig Fermat test covers <= 2^120, the 4 x 32-bit
+`tools/mr128_kernel.cuh` covers 2^120..2^128; see `docs/PHASE0_scan_bench.md`
+§ 25).  The kernel builds each candidate as a 64-bit low word plus a constant
+high word, so the aligned block base must keep `(blocks + 2) * 1.006e9`
+numbers inside one 64-bit window; a start that violates it - every power of two
+does, e.g. 2^100 -> base 2^100-16 -> low word 2^64-16 - is advanced to the next
+class-30 base past the wrap and reported on stdout (shift < (blocks + 2) *
+1.006e9 numbers, < 0.02 s of scan time; the effective start is what the log
+header and the state file carry).  Within ~3.1e9 numbers of 2^128 the shift
+cannot fit and the tool says so.  `--start` must exceed `--walk-primes`.  One worker only (the sieve engine's `--threads`
 does not apply); `--state`/`--state-every`/`--progress` work as usual.
 Larger super-batches (fewer event syncs, more VRAM) and a deeper sieve:
 
@@ -421,6 +434,50 @@ nohup setsid python3 scripts/p0_walk_chain.py \
     > data/p0_walk_1p33e20_chain.out 2>&1 &
 ```
 
+**Record harvest watcher (`scripts/p0_records_to_submit.py`, 2026-10-08).**
+Turns any walk log into a submit-ready batch file while the chain runs.  The
+walk engine flushes one line per logged gap
+(`<epoch> <lower> <gap> <merit> <upper> verified=<0|1> record=<NEW|no|absent|off> table=<best>`),
+so the watcher harvests the `record=NEW` lines, keeps the strongest start prime
+per gap length, recomputes `merit = gap/ln(lower)` (the site's convention) and
+regenerates `records_to_submit_phase0.txt` (`gap merit prime_start`, comments
+ignored by `scripts/submit_records.py`).  Every row is re-verified independently
+with `scripts/verify_gap_candidate.py` (OpenSSL endpoints + strict scan of all
+odd intermediates, ~2.5 s per row) before it enters the data section; failed
+rows, rows already POSTed and rows the table has caught are listed as comments
+only.  The file is a pure function of (logs, sent-file, verify-cache), so
+restarting the watcher is harmless.
+
+| flag | default | effect |
+|---|---|---|
+| `--logs GLOB...` | `data/p0_*.log` | gap logs to harvest |
+| `--max-log-mb N` | `64` | skip logs larger than N MB (0 = no limit); oversized files are named in a warning |
+| `--out FILE` | `records_to_submit_phase0.txt` | generated batch |
+| `--interval S` | `30` | watch poll interval (>= 5) |
+| `--once` | off | one pass, then exit (cron/systemd friendly) |
+| `--discoverer NAME` | `D.Benko` | name written into the suggested send command |
+| `--sent-file FILE` | `data/p0_records_sent.txt` | POSTed rows, excluded from the batch |
+| `--state-file FILE` | `data/p0_records_watch.state` | liveness line (`pass=`, `rows=`, `time=`) |
+| `--verify-cache FILE` | `data/p0_records_verify.json` | per-row verification verdicts |
+| `--no-verify` | verification ON | write rows without independent verification |
+| `--reverify` | off | ignore cached verdicts and re-run them |
+| `--check-live` / `--live-interval S` | off / `1800` | fetch merits.txt and exclude rows the live table has caught |
+| `--mark-sent FILE` | — | append FILE's rows to the sent-file, then do one pass |
+| `--dry-run` / `--quiet` | off | print the batch instead of writing / no heartbeat |
+
+```bash
+nohup setsid python3 -u scripts/p0_records_to_submit.py --check-live \
+    >> data/p0_records_watch.out 2>&1 &
+tail -f data/p0_records_watch.out          # progress; data/p0_records_watch.state = liveness
+
+python3 scripts/p0_records_to_submit.py --once --dry-run    # inspect, write nothing
+python3 scripts/p0_records_to_submit.py --mark-sent records_to_submit_phase0.txt
+```
+
+Submit the batch only while the site's commit limiter is idle - a refused POST
+shadows those numbers for ~9 h (the site then answers `Already processed`) - and
+mark it afterwards so the watcher stops offering it.
+
 Hygiene: stop any miner on the GPU before a timed run; use a fresh `--log`
 per campaign (the tool appends headers, but per-file datasets keep the
 analysis simple); keep `--state` file names unique per campaign geometry.
@@ -435,6 +492,10 @@ analysis simple); keep `--state` file names unique per campaign geometry.
 | `data/p0_campaign_2e20.out` | console transcript of the same campaign (bands, top-4, split) |
 | `data/p0_hl_compare.png`, `data/p0_hl_compare_dark.png` | merit-tail vs HL-1t / HL-4p figure |
 | `data/prime_gap_merits.txt` | best-known gap-length merit table used by the record check (123,436 lengths) |
+| `records_to_submit_phase0.txt` | GENERATED submit batch (own records, `D.Benko`); see the harvest watcher in § 6 |
+| `data/p0_records_sent.txt` | rows already POSTed - excluded from the batch (written by `--mark-sent`) |
+| `data/p0_records_watch.state`, `data/p0_records_watch.out` | watcher liveness line + progress log |
+| `data/p0_records_verify.json` | per-row independent-verification verdicts |
 | `p0.state` | leftover checkpoint of an aborted 6-thread attempt (~1-3% done, done Sep 30); not used by production runs |
 | `docs/PHASE0_scan_bench.md` | full measurement history (sections 1-13), gates provenance, HL comparison, rejected experiments |
 

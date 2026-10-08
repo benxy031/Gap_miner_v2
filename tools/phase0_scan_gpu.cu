@@ -29,8 +29,9 @@
  * cannot create a false gap, and every reported gap is GMP-re-verified below.
  *
  * Limits: start > sieve-limit (primes in range must exceed the sieve), and
- * start + length <= 2^96 (the kernel container is 3 x 32-bit limbs);
- * length < 2^63.
+ * start + length <= 2^128 with --engine walk (its Fermat test is two 64-bit
+ * limbs with an explicit carry chain, exact for any odd n < 2^128) or <= 2^96
+ * with the sieve engine (3 x 32-bit CIOS MR container); length < 2^63.
  *
  * Live-tuned defaults (re-measured 2026-09-30 AFTER removing the per-candidate
  * cross-core atomics, which had dominated walk+proc): --threads 8 and
@@ -156,7 +157,9 @@ static int g_fast_mr = 1;           /* bitmap-verdict MR pipeline (--legacy-mr d
 /* --engine walk (class-30 sieve + batched jump-walk) */
 static int      g_walk_engine = 0;
 static uint64_t g_walk_gapmin = 0;      /* 0 = derive from merit_min */
-static uint32_t g_walk_primes = 15000;  /* sieve/item primes 17..P */
+static uint32_t g_walk_primes = 40000;  /* sieve/item primes 17..P; 40000 is the
+                                           re-measured optimum (2026-10-08):
+                                           1.48e11 -> 1.79e11 ints/s at 7.9e28 */
 static uint32_t g_walk_batch = 64;      /* blocks per super-batch (4..96);
                                            default 64 since 2026-10-03 (+2.45%
                                            ABBA vs 32; K=96 no better) */
@@ -1841,11 +1844,13 @@ static void usage(const char *p) {
         "         engine (approx. 10x faster than the exhaustive sieve path):\n"
         "         it reports every gap >= --gap-min (default ceil(merit-min *\n"
         "         ln(start))) through the same log/records/verify path, with\n"
-        "         --walk-primes (sieve depth, default 15000) and --walk-batch\n"
+        "         --walk-primes (sieve depth, default 40000, the measured\n         optimum; raise it further at >= 2^120) and --walk-batch\n"
         "         (blocks per super-batch, default 64, range 4..96; VRAM =\n"
         "         2 x (K+1) x 33.6 MB: K=32 2.2 GB, K=64 4.4 GB, K=96 6.5 GB).  The range\n"
         "         must fit one 64-bit window of the block base (true for all\n"
-        "         realistic ranges; the check aborts otherwise).  --check,\n"
+        "         realistic ranges; the check aborts otherwise).  The walk path is\n"
+        "         valid up to start + length <= 2^128 (two 64-bit limbs); the\n"
+        "         sieve engine's MR container is 3 x 32-bit limbs (2^96).  --check,\n"
         "         --gpu-sieve/--cpu-sieve, --legacy-mr and --sieve-limit apply\n"
         "         to the sieve engine only.\n"
         "  MR pipeline (--gpu-sieve, test stage, no --check): default is the\n"
@@ -1926,7 +1931,53 @@ int main(int argc, char **argv) {
     if (!g_walk_engine && g_use_gpu_sieve && !do_test) { fprintf(stderr, "[phase0-gpu] --gpu-sieve requires the test stage\n"); return 2; }
     if (length >= ((uint64_t)1 << 63)) { fprintf(stderr, "[phase0-gpu] --length must be < 2^63\n"); return 2; }
     if (!g_walk_engine && start <= (u128)sieve_limit) { fprintf(stderr, "[phase0-gpu] --start must exceed --sieve-limit\n"); return 2; }
-    if (start + (u128)length > ((u128)1 << 96)) { fprintf(stderr, "[phase0-gpu] range exceeds the 96-bit kernel container\n"); return 2; }
+    /* Container wall.  The walk engine's Fermat test (perig.cuh) is two 64-bit
+       limbs with an explicit carry chain - exact for any odd n < 2^128.  The
+       sieve engine's MR kernel is 3 x 32-bit CIOS (mr68_kernel.cuh) - n < 2^96. */
+    {
+        /* limit = largest representable end-1 (no shift by the type width: that
+           is UB); the walk container is the full unsigned __int128 range. */
+        const u128 limit = g_walk_engine ? ~(u128)0 : ((u128)1 << 96);
+        if (start > limit || (u128)length > limit - start) {
+            fprintf(stderr, "[phase0-gpu] range exceeds the %u-bit kernel container (%s)\n",
+                    g_walk_engine ? 128u : 96u,
+                    g_walk_engine ? "walk Fermat test, 2 x 64-bit limbs"
+                                  : "sieve MR, 3 x 32-bit limbs");
+            if (!g_walk_engine)
+                fprintf(stderr, "[phase0-gpu] above 2^96 use --engine walk\n");
+            return 2;
+        }
+    }
+    /* Walk engine: the kernel computes each candidate as a 64-bit low word plus
+       a constant high word, so the block base must keep (b_total + 2) blocks
+       inside one 64-bit window.  A start sitting within a few 1e9 numbers below
+       the wrap - every power of two does, e.g. 2^100 -> base 2^100-16 -> low
+       word 2^64-16 - is advanced to the next class-30 base past the wrap.  The
+       shift is < (b_total + 2) * 1.006e9 numbers, and the effective start is
+       what the log header and the state file carry. */
+    if (g_walk_engine) {
+        const u128 blk = (u128)1006632960;               /* 30 * 2^25 numbers */
+        u128 A = ((start | 1) / 30u) * 30u;
+        u128 b_total = ((start + (u128)length - A) + blk - 1) / blk;
+        if ((u128)(uint64_t)A + (b_total + 2) * blk >= ((u128)1 << 64)) {
+            /* cross the low-word boundary and keep the headroom on the far side */
+            u128 need = (((u128)1 << 64) - (u128)(uint64_t)A) + (b_total + 2) * blk;
+            u128 newA = A + ((need + 29) / 30) * 30u;
+            char s_old[48], s_new[48], s_base[48];
+            u128_str(start, s_old, sizeof s_old);
+            u128_str(A, s_base, sizeof s_base);
+            u128_str(newA, s_new, sizeof s_new);
+            if (newA > ~(u128)0 - (u128)length) {
+                fprintf(stderr, "[phase0-gpu] walk: start %s sits too close to the"
+                                " 64-bit block window and cannot be cleared within"
+                                " the 128-bit container; use --engine sieve\n", s_old);
+                return 2;
+            }
+            printf("[phase0-gpu] walk: --start %s would wrap the 64-bit block window"
+                   " (block base %s); advancing to %s\n", s_old, s_base, s_new);
+            start = newA;
+        }
+    }
 
     setvbuf(stdout, NULL, _IOLBF, 0);
     signal(SIGINT, on_signal);

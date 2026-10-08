@@ -23,7 +23,9 @@
 
 #include <stdint.h>
 #include "p0_types.h"   /* w_gaprec_t */
-#include "perig.cuh"    /* ciosFermatTest128_hi */
+#include "perig.cuh"           /* ciosFermatTest128_hi - exact to 120 bits */
+#include "mr128_64_kernel.cuh"  /* >= 2^120: exact 2x64-bit CIOS, 1.1x faster
+                                   than the 4x32 kernel (tools/mr128_bench.cu) */
 
 __device__ __constant__ uint32_t c30_cls[8] = {1, 7, 11, 13, 17, 19, 23, 29};
 __device__ __constant__ int8_t c30_clsidx[30];
@@ -272,6 +274,18 @@ __global__ static void class30_sieve_kernel(const uint64_t * __restrict__ primes
 /* class-30 walk: slot->value uses the class map, the window advance comes
    from wtab[class of anchor]; primality = Perig base-2 Euler test with the
    scan range's high word passed at runtime (ciosFermatTest128_hi). */
+/* Primality test dispatch.  perig's ciosFermatTest128_hi is exact up to 120
+   bits but rejects real primes from 121 bits on (a false negative silently
+   splits a gap - see tools/mr128_64_kernel.cuh), so at and above 2^120 the
+   2 x 64-bit CIOS base-2 test takes over.  Values below 2^120 keep the perig
+   verdict, so the <= 96-bit production path is bit-for-bit unchanged. */
+#define W_PERIG_MAX_HI  (1ULL << 56)     /* value < 2^120 */
+
+__device__ static inline int w_is_probable_prime(uint64_t v, uint64_t Ahi) {
+    if (Ahi >= W_PERIG_MAX_HI) return mr128_64_base2_u128(v, Ahi);
+    return ciosFermatTest128_hi(v, Ahi) ? 1 : 0;
+}
+
 __global__ static void walk_kernel7(const uint64_t *__restrict__ bm, uint64_t nwords,
                                     uint64_t Alo, uint64_t Ahi,
                                     const uint32_t *__restrict__ wtab,
@@ -294,7 +308,7 @@ __global__ static void walk_kernel7(const uint64_t *__restrict__ bm, uint64_t nw
     while (c >= 0) {
         tests++;
         uint64_t v = Alo + 30ull * ((uint64_t)c >> 3) + (uint64_t)scls[c & 7u];
-        if (ciosFermatTest128_hi(v, Ahi)) break;
+        if (w_is_probable_prime(v, Ahi)) break;
         c = w_nextCand(bm, nwords, c + 1);
     }
     if (c < 0) { atomicAdd(&stats[0], tests); return; }
@@ -312,7 +326,7 @@ __global__ static void walk_kernel7(const uint64_t *__restrict__ bm, uint64_t nw
                 if (q < 0) goto done7;
                 tests++;
                 uint64_t vq = Alo + 30ull * ((uint64_t)q >> 3) + (uint64_t)scls[q & 7u];
-                if (ciosFermatTest128_hi(vq, Ahi)) {
+                if (w_is_probable_prime(vq, Ahi)) {
                     uint64_t vp = Alo + 30ull * ((uint64_t)p >> 3) + (uint64_t)scls[p & 7u];
                     uint32_t gap = (uint32_t)(vq - vp);
                     if (gap >= minGapVal) {
@@ -331,7 +345,7 @@ __global__ static void walk_kernel7(const uint64_t *__restrict__ bm, uint64_t nw
         }
         tests++;
         uint64_t vs = Alo + 30ull * ((uint64_t)s >> 3) + (uint64_t)scls[s & 7u];
-        if (ciosFermatTest128_hi(vs, Ahi)) {
+        if (w_is_probable_prime(vs, Ahi)) {
             p = s;
             jumps++;
             s = p + (int64_t)wtab[p & 7];

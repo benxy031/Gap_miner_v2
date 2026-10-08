@@ -1,6 +1,21 @@
 /* Perig/ciosFermatTest128 port from prime_gaps.cu (PGS), used under its license. */
 #ifndef PERIG_CUH
 #define PERIG_CUH
+
+/* Host-compilable: outside nvcc the CUDA qualifiers mean nothing, so the host
+   harness tools/perig_range.cpp builds with a plain
+     g++ -O2 -I tools tools/perig_range.cpp -lgmp                          */
+#if !defined(__CUDACC__)
+#  ifndef __device__
+#    define __device__
+#  endif
+#  ifndef __host__
+#    define __host__
+#  endif
+#  ifndef __forceinline__
+#    define __forceinline__ inline
+#  endif
+#endif
 #include <stdint.h>
 /* 128-bit integer.  Native __int128 everywhere except MSVC (the Windows host
    compiler nvcc requires), which has no 128-bit type at all.  The software

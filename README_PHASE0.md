@@ -37,6 +37,7 @@ Current performance (RTX 3070, i3-10100, 8 threads):
 | `scripts/phase0_hl_compare.py` | | merit-tail comparison vs HL-1t / HL-4p models (figure) |
 | `scripts/p0_walk_hl_compare.py` | | walk-scan census + first-occurrence comparison vs titanV's HL tables (figure) |
 | `scripts/p0_record_forecast.py` | | what records are still available at a fixed scan scale: deterministic winnable set, expected yield, durability |
+| `scripts/p0_pgs_bench.py` | | head-to-head vs PGS (`briankehrig/prime-gaps-cuda`): same box, same start, identical ranges; steady + startup rates and a cross-tool gap-set audit |
 
 Shared device code: `tools/mr68_kernel.cuh` (CIOS Montgomery + base-2 MR +
 bitmap-fed stages), `tools/p0_mark.cuh` (wheel fill + marking kernel).
@@ -404,6 +405,47 @@ monotonicity of the winnable set in the merit, and that the windowed mean of
 `rho_g` falls with `g` (`rho_g` itself is NOT monotone - `S_g` oscillates with
 `g` mod small primes).
 
+`scripts/p0_pgs_bench.py` - head-to-head against PGS
+(`briankehrig/prime-gaps-cuda`), the threshold-search tool class that drives the
+Mersenne-forum distributed search:
+
+```
+scripts/p0_pgs_bench.py [--pgs-dir /tmp/pgcuda] [--start 2e20]
+                        [--thresholds 900,1260] [--lengths 1e12,1e13]
+                        [--out FILE] [--no-pgs | --no-ours] [--no-audit]
+                        [--no-warmup] [--with-sieve] [--tmp DIR]
+```
+Protocol is the one in `docs/PHASE0_scan_bench.md` sections 16-17: same box,
+same start, identical ranges for both tools.  Wall for us = process wall; wall
+for PGS = the interval between the "Start time" and "End time" lines of their
+`GapReport` file - their printed "Speed" meter runs 1.5-2x above that and is not
+comparable.  Both walls include their own setup.  The script solves `wall = N x
+steady + S` from the two `--lengths`, prints steady rates in ints/s and in B/s
+(= 1e9 ints/s, PGS's own unit), the startup constants, and then the cross-tool
+audit: the `(gap, lower prime)` sets of both tools must be identical.
+
+PGS needs a tty (the wrapper draws progress, so it is run under `script(1)`) and
+a build (`nvcc` compiles `prime_gaps.cu` on the first run; the default warm-up
+spends one 1e12 run on it, `--no-warmup` skips that).  Their `settings.json` is
+edited in place and restored on exit.  Per-threshold kernel settings are their
+recommendation plus the values that ran clean on an 8 GB card - minGap 900 ->
+`WORD_LENGTH 120`, `BLOCK_SIZE 60e9`; minGap 1260 -> `240` / `140e9` (their auto
+value OOMs at 8 GB).  Thresholds missing from `PGS_PROFILE` use 240/140e9; add a
+row there to tune another one.  Run it on an idle GPU only: the script warns via
+`pgrep` if another scanner is alive, and a contended run reads low.
+
+Scope: our walk engine and PGS are both threshold searches here ("every gap >=
+minGap, no completeness claim below it"), which is NOT what the sieve engine does
+(full enumeration: every prime, every gap >= merit 15).  Comparing the sieve
+engine against PGS compares two different tasks; the walk engine is the
+like-for-like one.  Our walk additionally runs MR and GMP-verifies every reported
+gap, where PGS uses a Perig Fermat test (their PSP caveat starts below gap
+1200).  `--with-sieve` also times the sieve engine at the same threshold (the
+merit that lands exactly on `minGap` is `(minGap - 0.5)/ln(start)`, since its
+threshold is `ceil(merit_min * ln(start))`); it is printed on its own line
+because its wall includes work a threshold search never does - the enumeration
+itself.  Measured results: `docs/PHASE0_scan_bench.md` sections 16-17 and 27.
+
 ---
 
 ## 5. Acceptance gates (run after ANY kernel/pipeline change)
@@ -519,8 +561,13 @@ below 0.13.  `--no-forecast` disables the lines; `--forecast-top N` (default 3)
 sets how many open targets are listed; `--rate` (default 2.254e11 ints/s) is the
 rate used for the h/record figures.  The forecast never takes the chain down: a
 missing table or an unparseable log degrades to a single `forecast: unavailable`
-line.  `--r-total` for the "remaining" branch is `--slices * --length`, so a
-`--slices 0` (forever) chain reports the per-1e16 yield instead.
+line.  The "remaining" branch needs the WHOLE campaign's integers: that is
+`--r-total` (default 0 = `--slices * --length`, which is only right on a chain's
+first run).  Since `--slices` is per-invocation, a restart would otherwise
+understate the remaining work - pass the campaign total in `--r-total` and let
+`--slices` set how many slices THIS run adds (e.g. restart with `--slices 16
+--r-total 2e17` for slices 5..20 of a 2e17 campaign).  A `--slices 0` (forever)
+chain without `--r-total` reports the per-1e16 yield instead.
 
 ```bash
 # one GPU / two GPUs (fleet box):  add --devices 0,1

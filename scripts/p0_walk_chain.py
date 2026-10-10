@@ -113,6 +113,11 @@ def main(argv=None):
                     help="open targets shown in the forecast summary (default 3)")
     ap.add_argument("--rate", type=float, default=2.254e11,
                     help="scan rate in ints/s used for the forecast ETA")
+    ap.add_argument("--r-total", type=float, default=0.0,
+                    help="total integers in the WHOLE campaign, for the forecast's "
+                         "remaining-work lines (default 0 = --slices x --length, which "
+                         "is only right on a chain's first run; set it when restarting "
+                         "a campaign so the remaining R stays correct)")
     ap.add_argument("--dry-run", action="store_true")
     a = ap.parse_args(argv)
 
@@ -267,7 +272,7 @@ def main(argv=None):
                     if not a.no_forecast:
                         for line in forecast_lines(
                                 a.tag, G, a.state_dir, a.table,
-                                (a.slices * L) if a.slices else None,
+                                a.r_total or ((a.slices * L) if a.slices else None),
                                 top=a.forecast_top, rate=a.rate):
                             print(line, flush=True)
                 else:

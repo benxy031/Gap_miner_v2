@@ -74,6 +74,23 @@ def shortest_winnable(L, table):
     return None, None
 
 
+def forecast_lines(tag, gmin, state_dir, table, r_total, top=3, rate=2.254e11):
+    """The p0_record_forecast summary for this chain, or a one-line apology.
+
+    Never raises: the chain must keep scanning even when the forecast cannot be
+    computed (missing table, unreadable log, ...).
+    """
+    try:
+        import p0_record_forecast as fc
+        an = fc.analyze([os.path.join(state_dir, f"p0_walk_{tag}*_g{gmin}.log")],
+                        table_path=table, r_total=r_total)
+        return fc.compact(an, top=top, rate=rate)
+    except (Exception, SystemExit) as exc:
+        # SystemExit included on purpose: a library that calls sys.exit() must
+        # never be able to take the scanning chain down with it.
+        return [f"[chain] forecast: unavailable ({type(exc).__name__}: {exc})"]
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -89,6 +106,13 @@ def main(argv=None):
     ap.add_argument("--bin", default=os.path.join(REPO, "bin/phase0_scan_gpu"))
     ap.add_argument("--state-dir", default=os.path.join(REPO, "data"))
     ap.add_argument("--table", default=os.path.join(REPO, "data/prime_gap_merits.txt"))
+    ap.add_argument("--no-forecast", action="store_true",
+                    help="do not print the p0_record_forecast summary after each "
+                         "completed slice")
+    ap.add_argument("--forecast-top", type=int, default=3,
+                    help="open targets shown in the forecast summary (default 3)")
+    ap.add_argument("--rate", type=float, default=2.254e11,
+                    help="scan rate in ints/s used for the forecast ETA")
     ap.add_argument("--dry-run", action="store_true")
     a = ap.parse_args(argv)
 
@@ -240,6 +264,12 @@ def main(argv=None):
                 del running[dev]
                 if ok:
                     completed += 1
+                    if not a.no_forecast:
+                        for line in forecast_lines(
+                                a.tag, G, a.state_dir, a.table,
+                                (a.slices * L) if a.slices else None,
+                                top=a.forecast_top, rate=a.rate):
+                            print(line, flush=True)
                 else:
                     print(f"[chain] slice c{k} did NOT complete; draining "
                           f"(no new launches). Rerun the same command to requeue "

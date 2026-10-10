@@ -35,6 +35,8 @@ Current performance (RTX 3070, i3-10100, 8 threads):
 | `tools/mr128_range.cpp`, `tools/perig_range.cpp` | | host-only GMP harnesses: MR verdicts vs `mpz_probab_prime_p` per bit length (`g++ -O2 -I tools <harness>.cpp -lgmp`; the headers define the CUDA qualifiers away when not compiled by nvcc) |
 | `scripts/p0_bench.py` | | fixed-range walk-engine bench: runs arms, parses wall/e2e/tests + the GPU-event stage split; `--bin-b` gives the ABBA order; results append to `data/p0_bench_results.txt` |
 | `scripts/phase0_hl_compare.py` | | merit-tail comparison vs HL-1t / HL-4p models (figure) |
+| `scripts/p0_walk_hl_compare.py` | | walk-scan census + first-occurrence comparison vs titanV's HL tables (figure) |
+| `scripts/p0_record_forecast.py` | | what records are still available at a fixed scan scale: deterministic winnable set, expected yield, durability |
 
 Shared device code: `tools/mr68_kernel.cuh` (CIOS Montgomery + base-2 MR +
 bitmap-fed stages), `tools/p0_mark.cuh` (wheel fill + marking kernel).
@@ -328,6 +330,80 @@ events up to m>=30; the old 27 cut dated from the 1e14 campaign where m>=27
 was empty).  Rows with single-digit measured counts are Poisson noise — the
 model test lives where the counts are >= ~10 (m <= ~25 at 2e15).
 
+`scripts/p0_walk_hl_compare.py` - the 128-bit walk scan vs titanV's HL gap
+tables, in the two framings the tables support:
+
+```
+scripts/p0_walk_hl_compare.py [--out PNG] [--dark] [--glob 'PATTERN']
+```
+Reads every walk log matched by `--glob` (default
+`data/p0_walk_wall*_g*.log`, one contiguous range), sums their coverage into a
+single `R` and takes `L` at the range midpoint, then draws four panels:
+
+* **A/B census** - `N(g >= G)` measured vs `R * SUM_g rho_g(L)` from the
+  order-4 coefficients, with Poisson error bars and the measured/model ratio.
+  The tables are calibrated on the published record curve, so the agreement is
+  an out-of-sample test of the model and a closure test of the scanner.
+* **C first-occurrence map** - `log10 x` vs gap size: every published record in
+  the band (from `data/prime_gap_merits.txt`, `x = exp(gap/merit)`), the model's
+  predicted first occurrence (root of `Y_g(L) = e^L`), and our records with the
+  move down from the previous best.
+* **D decades closed** - per length, `log10(x_prev/x_ours)` (green) against
+  `log10(x_ours/x_hl)` (grey): what one campaign closes versus what remains to
+  the predicted first occurrence.
+
+Coverage per slice is taken from the session summary line when the run
+finished, else from the `off0` of the matching `data/p0_state_*.txt`, else from
+the last monitor line (3 significant digits - a 0.1 % effect on `R`, far below
+the Poisson error).  Slice logs are appended across resume, so the event counts
+and the covered integers stay disjoint.  Prints the coefficient gate
+(`sum rho_g / (1/L)`), the per-length table and the mean decades closed.
+`--dark` also writes `*_dark.png`.
+
+`scripts/p0_record_forecast.py` - which records are still available at a fixed
+scan scale (and how many the rest of a campaign will produce):
+
+```
+scripts/p0_record_forecast.py [--r-total 2e17] [--x X | --L L] [--glob GLOB]
+                              [--gmin 1664] [--rate 2.254e11] [--top 12]
+                              [--gain-min 1000] [--emin 1e-4] [--compact]
+                              [--selftest]
+```
+`--compact` prints only the two summary lines the walk chain uses (see the chain
+section above); everything else is unchanged.  The computation lives in
+`analyze()`, which is pure (no printing, no `sys.exit`) so
+`scripts/p0_walk_chain.py` can import it directly - `open_targets()` and
+`fragility()` are shared the same way.
+On an EXHAUSTIVE scan the range fixes the merit of every gap it finds:
+`m(g) = g/L` (constant to ~1e-12 across the campaign), so "can this length still
+be recorded?" is DETERMINISTIC - `win(g) <=> table_merit(g) < g/L`.  The only
+randomness left is which winnable length shows up, at the HL rate `rho_g(L)`, so
+`E[new records] = SUM_win (1 - exp(-rho_g * R))`.  The report prints
+
+* the scan state (`R`, per-slice coverage, won lengths) and the density gate;
+* the winnable / not-winnable / reachable counts, and `E[records]` for the
+  scanned `R` **against the actual count** (a live model check);
+* `E[NEW records]` for `R_remaining = --r-total - R`, with h/record;
+* **open targets** ranked by `E[count]` (gap, our merit, table merit, margin,
+  x gain, E[count]);
+* **jackpots** above `--gain-min`, with an explicit frontier ("best gain at
+  `P(hit) >= 1e-3`") because raw gain is meaningless without its reachability;
+* **durability** of the records held: margin `< 0.05` / `< 0.13` marks a record
+  that any small improvement breaks (same convention as `record_planner.py`).
+
+Complementary to `scripts/record_planner.py`: that tool plans a COVERED hunt
+(you choose L, merit is a design variable, the cost is `exp(E(m))` primality
+tests, one target at a time).  This one reads an EXHAUSTIVE scan (L is given by
+the range, merit comes free with every gap, the currency is integers scanned,
+all reachable lengths are collected at once).  Their merit/table/margin triples
+agree exactly (verified 2026-10-10 on 40 lengths, max diff 0.0).
+
+`--selftest` re-checks nine invariants: the density gate, the winnable-set
+partition, `E[records]` reproducibility, model-vs-actual within 3 sigma, the
+monotonicity of the winnable set in the merit, and that the windowed mean of
+`rho_g` falls with `g` (`rho_g` itself is NOT monotone - `S_g` oscillates with
+`g` mod small primes).
+
 ---
 
 ## 5. Acceptance gates (run after ANY kernel/pipeline change)
@@ -427,6 +503,24 @@ non-record rows, above it MISSES the winnable band `[g, gap-min)`.  Note
 merit 35.08 vs 34.01 achievable).  Per-slice ledger:
 `data/p0_walk_<tag>_chain.log` (ts, slice, dev, start, len, gap_min, rc,
 wall, gaps, walk_batch, complete).
+
+After every COMPLETED slice the chain prints a two-line record forecast from
+`scripts/p0_record_forecast.py` (imported, not shelled out), which answers "what
+can this campaign still win, and how fast":
+
+```
+[chain] forecast: won=14  model=14.7 (-0.2 sigma)  E[new in the remaining 1.511e+17]=21.3 -> 8.7 h/record
+[chain] forecast: top open: 1906 (107.3x, E=2.26)  1930 (1.187x, E=2.08)  1956 (29.18x, E=2.00) | fragile 7/14
+```
+`won` counts distinct lengths with a `record=NEW` event in the tag's logs,
+`model` is the HL expectation for the same scanned `R` (a live check of the
+model against reality), `fragile` counts held records whose merit margin is
+below 0.13.  `--no-forecast` disables the lines; `--forecast-top N` (default 3)
+sets how many open targets are listed; `--rate` (default 2.254e11 ints/s) is the
+rate used for the h/record figures.  The forecast never takes the chain down: a
+missing table or an unparseable log degrades to a single `forecast: unavailable`
+line.  `--r-total` for the "remaining" branch is `--slices * --length`, so a
+`--slices 0` (forever) chain reports the per-1e16 yield instead.
 
 ```bash
 # one GPU / two GPUs (fleet box):  add --devices 0,1

@@ -270,10 +270,6 @@ $(BENCH_MARK): $(BUILD_DIR)/tools/bench_mark.o | $(BIN_DIR)
 # measures the full per-segment GPU cycle (memset + mark kernel + D2H of the
 # 64 KB bitmap) and verifies segment bitmaps against a naive CPU marker.
 # Build: make bin/bench_p0sieve WITH_CUDA=1
-$(MR128_BENCH): $(BUILD_DIR)/tools/mr128_bench.o tools/mr128_kernel.cuh | $(BIN_DIR)
-	$(NVCC) $(BUILD_DIR)/tools/mr128_bench.o -L$(CUDA_LIBDIR) -lcudart -lgmp -lm -o $@
-	@echo "✓ Built: $@"
-
 $(BENCH_P0SIEVE): $(BUILD_DIR)/tools/bench_p0sieve.o | $(BIN_DIR)
 	$(NVCC) $(BUILD_DIR)/tools/bench_p0sieve.o -L$(CUDA_LIBDIR) -lcudart -lm -o $@
 	@echo "✓ Built: $@"
@@ -288,9 +284,11 @@ $(CUDA_INT): $(BUILD_DIR)/tools/cuda_int_throughput.o | $(BIN_DIR)
 
 $(BUILD_DIR)/tools/%.o: tools/%.cu | $(BUILD_DIR)
 	@mkdir -p $(dir $@)
-	$(NVCC) -O3 $(CUDA_ARCH) -std=c++17 -Xcompiler -O2 -I$(SRC_DIR)/gpu -c $< -o $@
+	$(NVCC) -O3 $(CUDA_ARCH) -std=c++17 -MMD -MP -Xcompiler -O2 -I$(SRC_DIR)/gpu -c $< -o $@
 
 $(BUILD_DIR)/tools/mr68_gpu.o: tools/mr68_kernel.cuh
+$(BUILD_DIR)/tools/mr128_bench.o: tools/mr128_kernel.cuh tools/mr128_64_kernel.cuh \
+    tools/perig.cuh
 $(BUILD_DIR)/tools/phase0_scan_gpu.o: tools/mr68_kernel.cuh tools/perig.cuh \
     tools/p0_mark.cuh tools/p0_types.h tools/p0_walk_kern.cuh tools/phase0gpu_api.h
 $(BUILD_DIR)/tools/bench_p0sieve.o: tools/p0_mark.cuh tools/p0_types.h

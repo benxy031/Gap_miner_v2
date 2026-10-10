@@ -139,10 +139,10 @@ __device__ __forceinline__ static void mr128_64_one(uint64_t *one,
     }
     qn[2] = (uint64_t)cy;                      /* qh*n < 2^32 * 2^128 */
     uint64_t ovf = qn[2];
-    uint64_t b0, b1, o0, o1;
+    uint64_t b0, o0, o1;
     b0 = mr128_64_sub(0U, qn[0], 0U, &o0);
-    b1 = mr128_64_sub(0U, qn[1], b0, &o1);
-    (void)b1;
+    /* q < n here, so the borrow out of the top limb is 0 and is not needed */
+    mr128_64_sub(0U, qn[1], b0, &o1);
     one[0] = o0;
     one[1] = o1;
     if (ovf) {                                 /* overshoot: one += n */
@@ -173,10 +173,10 @@ __device__ static int mr128_64_base2(const uint64_t *nin) {
 
     mr128_64_one(one, n);
     {
-        uint64_t b0, nb1;
+        uint64_t b0;
         b0 = mr128_64_sub(n[0], one[0], 0U, &neg[0]);
-        nb1 = mr128_64_sub(n[1], one[1], b0, &neg[1]);
-        (void)nb1;
+        /* n > one, so the borrow out of the top limb is 0 and is not needed */
+        mr128_64_sub(n[1], one[1], b0, &neg[1]);
     }
     mr128_64_dbl_mod(two, one, n);
 
@@ -302,10 +302,10 @@ __device__ static int mr128_64_base2_lazy(const uint64_t *nin) {
     int b = (64 - mr128_64_clz64(n[1])) + 64;
     mr128_64_one(one, n);
     {
-        uint64_t b0, nb1;
+        uint64_t b0;
         b0 = mr128_64_sub(n[0], one[0], 0U, &neg[0]);
-        nb1 = mr128_64_sub(n[1], one[1], b0, &neg[1]);
-        (void)nb1;
+        /* n > one, so the borrow out of the top limb is 0 and is not needed */
+        mr128_64_sub(n[1], one[1], b0, &neg[1]);
     }
     mr128_64_dbl_mod(two, one, n);
 

@@ -52,6 +52,14 @@
 #define BM_WORDS ((HALF + 63) >> 6)        /* bitmap words per segment */
 #define BM_BYTES ((size_t)BM_WORDS * 8)
 
+/* Start of the probe range.  This tool passes base_hi = 0 on purpose (the
+   scanner's ranges are 128-bit, but the marking rate does not depend on where
+   inside a range one starts), so the base must fit in 64 bits.  2e20 + 1 does
+   not: it was written as 200000000000000000001ull and the compiler silently
+   truncated it to 15532559262904483841 (warning #23-D).  The largest prime
+   below 2^64 keeps the same intent (a large, odd, "deep" start) and fits. */
+static const uint64_t BENCH_BASE = 18446744073709551557ull;
+
 #define CUDA_CHECK(call)                                                     \
     do {                                                                     \
         cudaError_t _e = (call);                                             \
@@ -76,14 +84,6 @@ static void naive_mark(uint64_t *bm, uint64_t v0,
         uint64_t s = (m - v0) >> 1;
         for (; s < HALF; s += p) bm[s >> 6] |= 1ULL << (s & 63u);
     }
-}
-
-static int check_cuda(cudaError_t e, const char *what) {
-    if (e != cudaSuccess) {
-        fprintf(stderr, "[bench_p0sieve] %s: %s\n", what, cudaGetErrorString(e));
-        return 1;
-    }
-    return 0;
 }
 
 int main(int argc, char **argv) {
@@ -146,7 +146,7 @@ int main(int argc, char **argv) {
     /* ---- verify K segment bitmaps against the naive CPU marker ---- */
     if (verify > 0) {
         std::vector<uint64_t> h_gpu(BM_WORDS), h_cpu(BM_WORDS);
-        uint64_t v0 = 200000000000000000001ull;   /* 2e20+1, odd */
+        uint64_t v0 = BENCH_BASE;
         int bad = 0;
         for (int s = 0; s < verify; s++) {
             uint64_t base = v0 + (uint64_t)s * SEG;
@@ -182,7 +182,7 @@ int main(int argc, char **argv) {
     /* ---- timed loop: per segment = memset + kernel + D2H (scanner cycle) ---- */
     {
         std::vector<uint64_t> h_bm(BM_WORDS);
-        uint64_t base0 = 200000000000000000001ull;
+        uint64_t base0 = BENCH_BASE;
         const uint32_t grid = (uint32_t)((items.size() + tpb - 1) / tpb);
 
         /* warmup */

@@ -38,6 +38,7 @@ Current performance (RTX 3070, i3-10100, 8 threads):
 | `scripts/p0_walk_hl_compare.py` | | walk-scan census + first-occurrence comparison vs titanV's HL tables (figure) |
 | `scripts/p0_record_forecast.py` | | what records are still available at a fixed scan scale: deterministic winnable set, expected yield, durability |
 | `scripts/p0_pgs_bench.py` | | head-to-head vs PGS (`briankehrig/prime-gaps-cuda`): same box, same start, identical ranges; steady + startup rates and a cross-tool gap-set audit |
+| `scripts/p0_deep_sweep.py` | | walk-engine stage split vs sieve depth at a fixed band: e2e, mark/walk spans and the pacer per depth, two arms (production + mark-only), with a gap-set identity check; needs the GPU to itself, results append to `data/p0_deep_sweep_results.txt` |
 
 Shared device code: `tools/mr68_kernel.cuh` (CIOS Montgomery + base-2 MR +
 bitmap-fed stages), `tools/p0_mark.cuh` (wheel fill + marking kernel).
@@ -85,7 +86,7 @@ Defaults:
 | `--merit-min M` | `20.0` | gaps >= M are written to the log and GMP-verified; bands/top-4/records still see every gap with merit >= 6 (internal gate) |
 | `--engine sieve\|walk` | `sieve` | `walk` selects the class-30 bitmap sieve + batched jump-walk engine (~10.6x the sieve engine's throughput at the production default: measured 5.2 s vs 55.8 s for 1e12 integers, identical 5-gap output, 2026-10-02; same log/records/verify/top-4/resume path). `--check`, `--gpu-sieve`/`--cpu-sieve`, `--legacy-mr` and `--sieve-limit` apply to the sieve engine only; combining them with `--engine walk` is an error (or ignored where noted) |
 | `--gap-min G` | `ceil(--merit-min * ln(start))` | walk engine only: report every gap >= G (GMP-verified). G in [100, 1e7]; values < 300 print a warning (walk cost scales ~1/G). Passing `--gap-min` explicitly removes the merit gate; an explicit `--merit-min` stays as an additional bar |
-| `--walk-primes P` | `40000` | walk engine: sieve/item primes 17..P.  Deeper sieving cuts the number of primality tests, and at the container wall that is worth more than the extra marking: 1.48e11 -> **1.79e11 ints/s** from 15000 to 40000 (+20 %, §26.5).  At the 2e20 campaign geometry the two depths are equal within noise (3.93e11 vs 3.92e11) and 60000 is 2 % worse, so 40000 is the single default; raise it (60000..250000) for starts at or above 2^120, where tests get ~1.5x more expensive.  Gap sets are identical across depths |
+| `--walk-primes P` | `40000` | walk engine: sieve/item primes 17..P.  Deeper sieving cuts the number of primality tests (measured tests follow 1/ln P exactly) but grows the marking, so the optimum is band-dependent.  **At the 7.9e28 campaign band 100000 is the measured optimum**: 4e12 ints from 7.9e28 gave **2.059 / 2.237 / 2.397 / 2.247 / 1.926 / 1.497e11 ints/s** for P = 15000 / 40000 / 100000 / 250000 / 500000 / 1e6 (+7.2 % over 40000), while the isolated mark grows 0.76 / 0.98 / 1.21 / 1.64 / 2.59 / 4.30 ms per block (`docs/PHASE0_scan_bench.md` §28).  At the container wall 15000 -> 40000 is +20 % (1.48e11 -> **1.79e11 ints/s**, §26.5), and at the 2e20 campaign geometry the two depths are equal within noise (3.93e11 vs 3.92e11) with 60000 2 % worse - hence the default stays 40000 and deep starts at or above 2^120 want a larger one (60000..250000).  Gap sets are identical at every depth (verified 87034/87034 gaps at `--gap-min 800`, P = 40000..1e6) |
 | `--walk-batch B` | `64` | walk engine: super-batch = B x 30-blocks (**default 64 since 2026-10-03**, was 32; range **4..96**, raised from 4..32 the same day). ABBA on 1e13 at `--gap-min 702` (dev 3070, 4 arms): K32 63.68 s vs **K64 62.12 s = +2.45 %**, K96 62.26 s (+2.23 %, no better than 64 but 6.5 GB); both K64 arms beat both K32 arms and the emitted sets are identical (parity K32==K64==K96 exact, 1624/1624 on 1e12). VRAM = 2 regions x (B+1) x 33.6 MB + gap buffer: default K=64 -> 4.4 GB, K=32 -> 2.2 GB, K=96 -> 6.5 GB (an over-large K fails the bitmap alloc loudly, never silently) |
 | `--log FILE` | none | appended; one `# phase0-gpu session ...` header per run |
 | `--state FILE` / `--state-every S` | none / `30` s | checkpoint for resume; **deleted when the range completes** |
@@ -446,6 +447,26 @@ threshold is `ceil(merit_min * ln(start))`); it is printed on its own line
 because its wall includes work a threshold search never does - the enumeration
 itself.  Measured results: `docs/PHASE0_scan_bench.md` sections 16-17 and 27.
 
+`scripts/p0_deep_sweep.py` - is the sieve depth right for this band?
+
+    python3 scripts/p0_deep_sweep.py --start 79000000000050000000000000000 \
+        --length 4e12 --gap-min 1664 --depths 15000,40000,100000,250000,500000,1000000
+
+The walk engine runs two pipelined stages (GPU mark into the class-30 bitmap,
+then the batched jump-walk with the primality tests) and reports both stage
+spans.  Both stages use the whole GPU, so what has to be minimized is the sum,
+not the longer one: the tool therefore runs two arms per depth - the production
+geometry, plus `--gap-min 10000000`, which makes the walk trivial so the
+reported mark span is the mark alone (isolated), uncontaminated by pipeline
+overlap.  Same start, same `--walk-batch`, same binary for every depth; the
+reported gap set must be identical to the reference depth's (a deeper sieve
+only removes tests, never changes which numbers are reported) and the exit
+status is non-zero if it is not.  It stops the GPU from being shared: run it
+when no slice is active, and it passes `--no-records` so the campaign's records
+file is never touched.  `--length` accepts `4e12` (the engine itself does not).
+Measured depths for the 7.9e28 band, and why 100000 wins there: section 28 of
+`docs/PHASE0_scan_bench.md`.
+
 ---
 
 ## 5. Acceptance gates (run after ANY kernel/pipeline change)
@@ -455,6 +476,7 @@ itself.  Measured results: `docs/PHASE0_scan_bench.md` sections 16-17 and 27.
 | `./bin/phase0_scan_gpu --check 200000` | `CHECK PASS: 4293 primes` |
 | `./bin/phase0_scan_gpu --check 2000000` | `CHECK PASS: 42725 primes` |
 | `./bin/mr68_gpu --validate 2000000` | `0 mismatches` (85563 primes) |
+| `./bin/mr128_bench --validate 3000 0 121` | `VALIDATE PASS (0 mismatches vs GMP)` - the 2 x 64-bit walk kernel above 2^120; bits 121/125/130 must pass, 96 is outside its `2^96 < n < 2^128` domain and fails by design (§29) |
 | `./bin/bench_p0sieve --verify 3` | `3 segment(s) bit-exact vs naive CPU marker` |
 | `./bin/phase0_scan_gpu --length 500000000 --merit-min 10 --log L` | `204` rows, top-4 `724/690/684/682` (merits `15.4883/14.7610/14.6326/14.5898`), 0 unverified |
 | fast vs legacy equivalence | `--merit-min 10` on 1e10: 4439 rows, byte-identical between default and `--legacy-mr` (sorted, timestamp stripped) |
@@ -544,7 +566,9 @@ non-record rows, above it MISSES the winnable band `[g, gap-min)`.  Note
 1.33e20 the shortest is 1586 (1576 is *not* winnable - its table entry is
 merit 35.08 vs 34.01 achievable).  Per-slice ledger:
 `data/p0_walk_<tag>_chain.log` (ts, slice, dev, start, len, gap_min, rc,
-wall, gaps, walk_batch, complete).
+wall, gaps, walk_batch, walk_primes, complete; `walk_primes=0` means the
+engine default was used, so slices scanned at different depths stay
+distinguishable).
 
 After every COMPLETED slice the chain prints a two-line record forecast from
 `scripts/p0_record_forecast.py` (imported, not shelled out), which answers "what
@@ -568,6 +592,25 @@ understate the remaining work - pass the campaign total in `--r-total` and let
 `--slices` set how many slices THIS run adds (e.g. restart with `--slices 16
 --r-total 2e17` for slices 5..20 of a 2e17 campaign).  A `--slices 0` (forever)
 chain without `--r-total` reports the per-1e16 yield instead.
+
+`--walk-primes P` (default: the engine's 40000) is passed straight to every
+slice, so the whole campaign can run at one sieve depth.  The depth is a
+property of the band, not of the range: at the 7.9e28 wall the measured optimum
+is **100000** (+7.2 % end to end, +2.1e11 ints/s), while 250000 and above lose
+because the marking grows faster than the tests fall (`docs/PHASE0_scan_bench.md`
+§28, `scripts/p0_deep_sweep.py`).  It can be changed between restarts - a slice
+resumes from its checkpoint at the new depth, and the reported gaps are
+identical at every depth, so the census stays consistent across slices taken at
+different depths (record the value in the ledger if that matters for your
+analysis).  Example: a restart that also moves the remaining slices to the
+measured optimum:
+
+```bash
+nohup setsid python3 scripts/p0_walk_chain.py \
+    --start 79000000000010000000000000000 --length 10000000000000000 \
+    --gap-min 1664 --tag wall --walk-batch 64 --walk-primes 100000 \
+    --slices 11 --r-total 2e17 > /tmp/wall_chain_stdout.txt 2>&1 &
+```
 
 ```bash
 # one GPU / two GPUs (fleet box):  add --devices 0,1

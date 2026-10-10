@@ -101,6 +101,10 @@ def main(argv=None):
     ap.add_argument("--index-start", type=int, default=1)
     ap.add_argument("--slices", type=int, default=0, help="0 = run forever")
     ap.add_argument("--walk-batch", type=int, default=64)
+    ap.add_argument("--walk-primes", type=int, default=None,
+                    help="sieve depth passed to the scan (engine default 40000).  "
+                         "At the 7.9e28 band 100000 is the measured optimum "
+                         "(README_PHASE0.md section 4, docs/PHASE0_scan_bench.md 28)")
     ap.add_argument("--devices", default="0",
                     help="comma-separated CUDA device ids, one scan per device (e.g. 0,1)")
     ap.add_argument("--bin", default=os.path.join(REPO, "bin/phase0_scan_gpu"))
@@ -153,6 +157,9 @@ def main(argv=None):
         if "start0" in d and "index0" in d:
             S0, K0 = int(d["start0"]), int(d["index0"])
             print(f"[chain] chain state: start0={S0} index0={K0}", flush=True)
+    print(f"[chain] gap_min={G} walk_batch={a.walk_batch} "
+          f"walk_primes={a.walk_primes or 'engine default'} "
+          f"tag={a.tag} slices={a.slices}", flush=True)
 
     def paths(k):
         return (os.path.join(a.state_dir, f"p0_state_{a.tag}_c{k}.txt"),
@@ -166,8 +173,20 @@ def main(argv=None):
         txt = open(out, errors="replace").read()
         return ("range complete" in txt) and ("verification_failures=0" in txt)
 
-    live = subprocess.run(["pgrep", "-f", f"p0_walk_{a.tag}_c"],
-                          capture_output=True, text=True).stdout.split()
+    # Live-scanner check.  Matching the tag's paths alone (pgrep -f) also
+    # matches harmless shells - a `tail` or `grep` on the slice log names the
+    # same files - and refused safe restarts, so a candidate only counts when
+    # its argv actually runs a phase0 scanner.
+    live = []
+    for pid in subprocess.run(["pgrep", "-f", f"p0_walk_{a.tag}_c"],
+                              capture_output=True, text=True).stdout.split():
+        try:
+            with open(f"/proc/{pid}/cmdline", "rb") as fh:
+                argv = [x for x in fh.read().split(b"\0") if x]
+        except OSError:
+            continue
+        if argv and os.path.basename(argv[0]).startswith(b"phase0_scan"):
+            live.append(pid)
     if live and not a.dry_run:
         print(f"[chain] FATAL: scanners for tag={a.tag} already running (pids "
               f"{','.join(live)}); kill them first (state files make the chain "
@@ -203,6 +222,8 @@ def main(argv=None):
                "--gap-min", str(G), "--walk-batch", str(a.walk_batch),
                "--device", str(dev), "--state", state, "--state-every", "30",
                "--progress", "60", "--log", log]
+        if a.walk_primes:
+            cmd += ["--walk-primes", str(a.walk_primes)]
         print(f"[chain] {now()} slice c{k} -> device {dev}: start={S} "
               f"(winnable<=g{wg}) -> {os.path.basename(out)}", flush=True)
         if a.dry_run:
@@ -259,7 +280,8 @@ def main(argv=None):
                 with open(chain_ledger, "a") as lf:
                     lf.write(f"{now()}\tslice c{k}\tdev={dev}\tstart={S}\tlen={L}\t"
                              f"gap_min={G}\trc={rc}\twall={wall:.1f}s\tgaps={gaps}\t"
-                             f"walk_batch={bw}\tcomplete={int(ok)}\n")
+                             f"walk_batch={bw}\twalk_primes={a.walk_primes or 0}"
+                             f"\tcomplete={int(ok)}\n")
                 print(f"[chain] slice c{k} (dev {dev}) finished rc={rc} "
                       f"wall={wall:.0f}s gaps={gaps} walk_batch={bw} "
                       f"complete={int(ok)}", flush=True)

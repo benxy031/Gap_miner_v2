@@ -1,0 +1,29 @@
+GpuVerify v1 benchmark — RTX 3070 (sm_86), IDLE GPU, measured 2026-10-11
+=====================================================================
+Strong PRP base 2, one candidate per thread, 4-way unrolled CIOS.
+
+  bits   digits   PRP/s    notes
+   256    ~77     87074    20000 cases
+   512   ~154     79588    20000 cases
+  1024   ~308     17460    20000 cases
+  2048   ~616      1388     5000 cases
+  4096  ~1233        82     5000 cases
+  8192  ~2466         3     1000 cases
+ 16384  ~4932     <0.15     150 cases, stopped after 20 min (v1 scaling
+                            collapses at big sizes; needs TPI / warp-per-
+                            candidate like the miner's CIOS path)
+ 32768  ~9864        --     not measured
+
+Sweep projection (all 94,911 rows with 400..9864 digits, endpoints only):
+  400-1000  :  16286 rows ->   0.01 min
+  1000-2000 :  19008 rows ->   0.04 min
+  2000-3000 :  14176 rows ->   0.34 min
+  3000-5000 :  25904 rows ->  10.53 min
+  5000-7000 :   7402 rows ->   3.01 min
+  7000-9864 :  12134 rows -> 134.82 min
+  TOTAL ~2.5 h endpoints on an idle GPU with the v1 kernel.
+  The 7000-9864 bucket dominates; optimizing the >=8192-bit path
+  (TPI-style warp-per-candidate CIOS, like tools/mr128_kernel.cuh) is the
+  highest-leverage next step (expected 10-100x there).
+
+Rows > 9864 digits (16,110) run CPU BPSW (GMP); not included above.

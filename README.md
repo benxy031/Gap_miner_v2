@@ -554,6 +554,26 @@ alternates to cancel difficulty drift. Results land in
 `/tmp/ab_shift_results.tsv` (`OUT=`), logs in `/tmp/ab_shift_logs`
 (`LOGDIR=`). Treat runs with <5 merit candidates as noisy (Poisson).
 
+## GAP_HUNT — head-to-head vs Seth Troisi's prime-gap-gpu
+
+`scripts/hunt_gpu_bench.sh [SECS] [MERIT]` runs the primorial-hunt class on one
+GPU for the same wall time: arm A = Seth Troisi's `prime-gap-gpu`
+(`/tmp/gpugpu/gap_search_primorial`, build `make ARCH=sm_86 BITS=1024
+CC=g++-13 NVCC="nvcc -ccbin g++-13"` - building with mixed gcc 15/13 host
+compilers makes `std::format` crash in the testing thread), arm B =
+`bin/gapminer --gap-hunt` with the fleet CRT file
+(`data/crt/m23/shift450_p67_covermax_m30.txt`).  The anchor semantics differ
+(his: every `m` around `m·491#/210` - a complete sweep; ours: CRT-cover
+survivors of a 442-bit primorial interval - a biased sampler whose cover
+boosts the endpoints), so the comparison metric is the hunt-relevant one:
+**gaps with merit ≥ M found per second** on the same card.  Measured
+2026-10-10, RTX 3070, merit ≥ 10, 420 s per arm: **Seth 95.5 finds/s vs our
+67.7 finds/s (deduplicated)** - the tools are within ~30 % at this threshold,
+and ours is a covered sampler (higher merit-per-candidate, skips candidates),
+so the per-candidate comparison is even closer.  His `--minc` is one work
+unit: 200M never finishes its sieve phase in a 7-minute arm, 20M does.
+Raw record: `data/hunt_gpu_bench_results.txt`.  Needs the GPU to itself.
+
 ## GAP_HUNT — standalone record-hunting mode
 
 `--gap-hunt` decouples gap discovery from Gapcoin's PoW: no headers, no
@@ -1229,6 +1249,27 @@ That signals a real bug (composites not marked, primes falsely rejected, or
 candidate offsets corrupted) — not a performance issue. The check adds one
 relaxed atomic increment per honest gap pair and has no measurable mining
 overhead.
+
+## GpuVerify — standalone GPU gap verification
+
+`GpuVerify/` is an independent tool (own build, own sources; CUDA + GMP
+only) that re-verifies prime-gap records: BPSW-grade endpoint checks
+batched on the GPU plus a GPU interval sieve proving no prime lies between
+the endpoints. It was built for the prime-gap-list data-quality audit
+(issue primegap-list-project/prime-gap-list#38): its parser reads **100%**
+of `allgaps.sql` rows (714 more than `check.py`), and it reproduces the 4
+invalid Payne rows as endpoint-composite / prime-between with witnesses.
+
+```
+cd GpuVerify && make            # -> GpuVerify/bin/gpuverify
+./bin/gpuverify verify --expr "10^19662 - 58727" --gap 161450
+./bin/gpuverify sweep --db allgaps.sql --min-digits 400 --max-digits 9864
+```
+
+Measured on the idle RTX 3070: 87k PRP/s at 256-bit down to 3 PRP/s at
+8192-bit; the full 94,911-row endpoint sweep (400..9,864 digits) projects
+to **≈ 2.5 h**. Full docs, design notes and validation log:
+[`GpuVerify/README.md`](GpuVerify/README.md).
 
 ## Project structure
 

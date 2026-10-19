@@ -115,6 +115,8 @@ TEST_CRT_RUNTIME = $(BIN_DIR)/test_crt_runtime
 TEST_CRT_SUBMISSION = $(BIN_DIR)/test_crt_submission
 TEST_GAP_HUNT = $(BIN_DIR)/test_gap_hunt
 TEST_STRATUM = $(BIN_DIR)/test_stratum
+TEST_SMOOTH = $(BIN_DIR)/test_smooth_range
+SMOOTH_PATTERN = $(BIN_DIR)/smooth_pattern
 BENCH_FERMAT = $(BIN_DIR)/bench_fermat
 BENCH_MARK = $(BIN_DIR)/bench_mark
 BENCH_HUNT_MARK = $(BIN_DIR)/bench_hunt_mark
@@ -130,7 +132,7 @@ MR128_BENCH = $(BIN_DIR)/mr128_bench
 .PHONY: all clean test help update-merits
 
 # Default target
-all: $(BIN_DIR) $(BUILD_DIR) $(OBJECTS) $(MAIN_BINARY) $(TEST_GAP_DETECTION) $(TEST_PRIMALITY) $(TEST_WORKER_THREADS) $(TEST_GAPCOIN_RPC) $(TEST_BLOCK_SUBMISSION) $(TEST_SIEVE_CORE) $(TEST_GPU_FERMAT) $(TEST_GPU_SIEVE) $(TEST_GPU_RESOLVE) $(TEST_GAP_DIST) $(TEST_HALFCLASS) $(TEST_GAP_PRIORITY) $(TEST_CRT_SET) $(TEST_GAP_TARGET) $(TEST_POW_Q48) $(TEST_COVERING) $(TEST_CRT_RUNTIME) $(TEST_CRT_SUBMISSION) $(TEST_GAP_HUNT) $(TEST_STRATUM) $(CRT_GEN) $(GEN_CRT) $(COVER_MAX)
+all: $(BIN_DIR) $(BUILD_DIR) $(OBJECTS) $(MAIN_BINARY) $(TEST_GAP_DETECTION) $(TEST_PRIMALITY) $(TEST_WORKER_THREADS) $(TEST_GAPCOIN_RPC) $(TEST_BLOCK_SUBMISSION) $(TEST_SIEVE_CORE) $(TEST_GPU_FERMAT) $(TEST_GPU_SIEVE) $(TEST_GPU_RESOLVE) $(TEST_GAP_DIST) $(TEST_HALFCLASS) $(TEST_GAP_PRIORITY) $(TEST_CRT_SET) $(TEST_GAP_TARGET) $(TEST_POW_Q48) $(TEST_COVERING) $(TEST_CRT_RUNTIME) $(TEST_CRT_SUBMISSION) $(TEST_GAP_HUNT) $(TEST_STRATUM) $(TEST_SMOOTH) $(SMOOTH_PATTERN) $(CRT_GEN) $(GEN_CRT) $(COVER_MAX)
 
 # CUDA-only dev tool, not part of the default build: make bin/bench_mark WITH_CUDA=1
 
@@ -250,7 +252,8 @@ $(PHASE0_SCAN_GPU_SPLIT): $(BUILD_DIR)/tools/phase0_scan_gpu_hdll.o $(BUILD_DIR)
 	$(CXX) $^ -L$(CUDA_LIBDIR) -lcudart -lgmp -lm -lpthread -o $@
 	@echo "✓ Built: $@"
 
-$(BUILD_DIR)/tools/phase0_scan_gpu_hdll.o: tools/phase0_scan_gpu.cu tools/phase0gpu_api.h tools/p0_types.h
+$(BUILD_DIR)/tools/phase0_scan_gpu_hdll.o: tools/phase0_scan_gpu.cu tools/phase0gpu_api.h tools/p0_types.h \
+    tools/smooth_range.h
 	@mkdir -p $(dir $@)
 	$(CXX) -x c++ -O2 -std=gnu++17 -MMD -MP -DPHASE0_KERNEL_DLL -Itools -c $< -o $@
 
@@ -290,7 +293,8 @@ $(BUILD_DIR)/tools/mr68_gpu.o: tools/mr68_kernel.cuh
 $(BUILD_DIR)/tools/mr128_bench.o: tools/mr128_kernel.cuh tools/mr128_64_kernel.cuh \
     tools/perig.cuh
 $(BUILD_DIR)/tools/phase0_scan_gpu.o: tools/mr68_kernel.cuh tools/perig.cuh \
-    tools/p0_mark.cuh tools/p0_types.h tools/p0_walk_kern.cuh tools/phase0gpu_api.h
+    tools/p0_mark.cuh tools/p0_types.h tools/p0_walk_kern.cuh tools/phase0gpu_api.h \
+    tools/smooth_range.h
 $(BUILD_DIR)/tools/bench_p0sieve.o: tools/p0_mark.cuh tools/p0_types.h
 $(BUILD_DIR)/tools/phase0gpu_dll.o: tools/phase0gpu_api.h tools/mr68_kernel.cuh \
     tools/p0_mark.cuh tools/p0_types.h tools/p0_walk_kern.cuh tools/perig.cuh
@@ -355,6 +359,18 @@ $(TEST_STRATUM): $(BUILD_DIR)/$(SRC_DIR)/stratum.o $(BUILD_DIR)/$(TEST_DIR)/test
 	$(CC) $(CFLAGS) $^ $(LDFLAGS) -lpthread -o $@
 	@echo "✓ Built: $@"
 
+# Smooth-range census counter (header-only tools/smooth_range.h; links no
+# repo objects): naive-reference, known-leader and cost checks.
+$(TEST_SMOOTH): $(BUILD_DIR)/$(TEST_DIR)/test_smooth_range.o | $(BIN_DIR)
+	$(CC) $(CFLAGS) $^ -lm -o $@
+	@echo "✓ Built: $@"
+
+# Admissible smooth-run pattern search (CPU-only dev tool; see the header of
+# tools/smooth_pattern.c for what it computes and why).
+$(SMOOTH_PATTERN): $(BUILD_DIR)/tools/smooth_pattern.o | $(BIN_DIR)
+	$(CC) $(CFLAGS) $^ -o $@
+	@echo "✓ Built: $@"
+
 # Compile test objects
 $(BUILD_DIR)/$(TEST_DIR)/%.o: $(TEST_DIR)/%.c
 	@mkdir -p $(BUILD_DIR)/$(TEST_DIR)
@@ -377,7 +393,7 @@ endif
 	$(NVCC) -O3 $(CUDA_ARCH) $(NVCC_FLAGS) -c $< -o $@
 
 # Run tests
-test: $(TEST_GAP_DETECTION) $(TEST_PRIMALITY) $(TEST_WORKER_THREADS) $(TEST_GAPCOIN_RPC) $(TEST_BLOCK_SUBMISSION) $(TEST_SIEVE_CORE) $(TEST_GPU_FERMAT) $(TEST_GPU_SIEVE) $(TEST_GPU_RESOLVE) $(TEST_GAP_DIST) $(TEST_HALFCLASS) $(TEST_GAP_PRIORITY) $(TEST_CRT_SET) $(TEST_GAP_TARGET) $(TEST_POW_Q48) $(TEST_COVERING) $(TEST_CRT_RUNTIME) $(TEST_CRT_SUBMISSION) $(TEST_STRATUM)
+test: $(TEST_GAP_DETECTION) $(TEST_PRIMALITY) $(TEST_WORKER_THREADS) $(TEST_GAPCOIN_RPC) $(TEST_BLOCK_SUBMISSION) $(TEST_SIEVE_CORE) $(TEST_GPU_FERMAT) $(TEST_GPU_SIEVE) $(TEST_GPU_RESOLVE) $(TEST_GAP_DIST) $(TEST_HALFCLASS) $(TEST_GAP_PRIORITY) $(TEST_CRT_SET) $(TEST_GAP_TARGET) $(TEST_POW_Q48) $(TEST_COVERING) $(TEST_CRT_RUNTIME) $(TEST_CRT_SUBMISSION) $(TEST_STRATUM) $(TEST_SMOOTH)
 	@echo "\n========== Running Integration Tests =========="
 	@$(TEST_GAP_DETECTION)
 	@echo ""
@@ -414,6 +430,8 @@ test: $(TEST_GAP_DETECTION) $(TEST_PRIMALITY) $(TEST_WORKER_THREADS) $(TEST_GAPC
 	@$(TEST_CRT_SUBMISSION)
 	@echo ""
 	@$(TEST_STRATUM)
+	@echo ""
+	@$(TEST_SMOOTH)
 
 # Clean build artifacts
 clean:

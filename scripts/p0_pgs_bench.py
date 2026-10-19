@@ -71,10 +71,20 @@ def run_ours(start, length, min_gap, tmp, timeout=1800):
 
 
 def gaps_in(log):
+    """{(gap, lower prime)} from a scanner gap log.
+
+    `--log` is the space-separated session log (`ts lower gap merit upper
+    verified=.. record=..`); the same events also appear on stdout as
+    `GAP merit=.. gap=.. lower=..`, so accept both forms.
+    """
     out = set()
     if os.path.exists(log):
         with open(log) as fh:
             for line in fh:
+                m = re.match(r"^(\d+) (\d+) (\d+) ", line)
+                if m:
+                    out.add((int(m.group(3)), int(m.group(2))))
+                    continue
                 m = re.search(r"GAP .*?gap=(\d+) lower=(\d+)", line)
                 if m:
                     out.add((int(m.group(1)), int(m.group(2))))
@@ -133,7 +143,10 @@ def parse_pgs_report(path):
                 - dt.datetime.strptime(stamp.group(1), fmt)).total_seconds()
     gaps = set()
     for line in text.splitlines():
-        m = re.match(r"^(\d+)\s+[\d.]+\s+(\d+)\s*$", line)
+        # their rows are right-aligned to the width of the largest gap, so a
+        # shorter gap starts the line with spaces (minGap 900 over 1e13 lists
+        # 164 rows, of which only the 4-digit ones are flush left)
+        m = re.match(r"^\s*(\d+)\s+[\d.]+\s+(\d+)\s*$", line)
         if m:
             gaps.add((int(m.group(1)), int(m.group(2))))
     return interval, gaps
@@ -296,6 +309,11 @@ def main():
                    % (key[0], key[1], ", ".join(parts), ", ".join(same)))
             print(msg)
             lines.append(msg)
+            if any(not d[n] for n in names) and any(d[n] for n in names):
+                warn = ("   WARNING: one tool reported 0 gaps while another did not "
+                        "- suspect the parser, not the tool")
+                print(warn)
+                lines.append(warn)
 
     if a.out:
         os.makedirs(os.path.dirname(a.out), exist_ok=True)

@@ -94,6 +94,30 @@ __device__ __forceinline__ static void dbl_mod(uint32_t *r, const uint32_t *a,
     for (int j = 0; j < NW; j++) r[j] = need ? sub[j] : t[j];
 }
 
+/* ONE = 2^96 mod n for n <= 2^67.  The main path's double-precision quotient
+   is only good for n > 2^67 (there q = 2^96/n < 2^29, so the estimate is
+   within +-1 and one add/subtract corrects it); for smaller n q reaches
+   2^96/3, far above a double's 53-bit mantissa, and the residual correction
+   would need ~2^14 steps.  The exact 128/128 division nvcc emits for
+   `unsigned __int128` (__udivti3) costs one call per candidate - a few percent
+   of the ~96 Montgomery squarings - and its remainder IS 2^96 mod n, so no
+   correction step is needed at all.  Kept __noinline__ so its register
+   pressure does not bleed into the hot path (the 2e20 MR rate is unchanged).
+   This is what lets the sieve engine run at small starts (1e9-1e12), which the
+   smooth-range census needs because run lengths at a fixed gap bound are
+   dominated by ln(start). */
+__device__ __noinline__ static void one_small_n(uint32_t *one, const uint32_t *n) {
+    unsigned __int128 nn = ((unsigned __int128)n[2] << 64)
+                         | ((unsigned __int128)n[1] << 32)
+                         | (unsigned __int128)n[0];
+    unsigned __int128 N = (unsigned __int128)1 << 96;
+    unsigned __int128 q = N / nn;
+    unsigned __int128 r = N - q * nn;      /* exact: r = 2^96 mod n, r < n */
+    one[0] = (uint32_t)r;
+    one[1] = (uint32_t)(r >> 32);
+    one[2] = (uint32_t)(r >> 64);
+}
+
 /* base-2 strong probable prime: 0 = composite, 1 = probable prime.
    n-1 = 2^s * d.  y = 2^d in Montgomery form; then squarings looking for -1. */
 __device__ static int mr_base2(const uint32_t *nin) {
@@ -112,13 +136,15 @@ __device__ static int mr_base2(const uint32_t *nin) {
         if (b == 0 && n[j] != 0U) b = j * 32 + (32 - __clz(n[j]));
     }
 
-    /* ONE = 2^96 mod n.  q = floor(2^96/n) comes from a double-precision
-       estimate that is within +-1 of the true quotient (2^96/n < 2^29 for
-       n > 2^67; double rounding contributes < 2^-23 absolute); the 96-bit
-       residual (0 - q*n) mod 2^96 is then corrected with one add or subtract
-       of n.  Replaces (96-b) serial doublings (~300 instructions) with a
-       division plus ~30 integer ops. */
-    {
+    /* ONE = 2^96 mod n.  Two paths (see one_small_n above):
+       - b > 67: q = floor(2^96/n) comes from a double-precision estimate that
+         is within +-1 there (2^96/n < 2^29; double rounding contributes
+         < 2^-23 absolute); the 96-bit residual (0 - q*n) mod 2^96 is then
+         corrected with one add or subtract of n.  Replaces (96-b) serial
+         doublings (~300 instructions) with a division plus ~30 integer ops.
+       - b <= 67: the estimate is not accurate enough, so the exact
+         128-bit division gives the remainder directly. */
+    if (b > 67) {
         double dn = (double)n[2];
         dn = dn * 4294967296.0 + (double)n[1];
         dn = dn * 4294967296.0 + (double)n[0];
@@ -160,6 +186,8 @@ __device__ static int mr_base2(const uint32_t *nin) {
                 for (int j = 0; j < NW; j++) one[j] = sub[j];
             }
         }
+    } else {
+        one_small_n(one, n);
     }
     {
         uint32_t borrow = 0;

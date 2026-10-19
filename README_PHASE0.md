@@ -77,7 +77,7 @@ Defaults:
 
 | flag | default | notes |
 |---|---|---|
-| `--start DEC` | `200000000000000000000` (2e20) | any integer; the walk engine accepts up to 2^128 (auto-nudge over the 64-bit block window), the sieve engine up to 2^96 |
+| `--start DEC` | `200000000000000000000` (2e20) | any integer; the walk engine accepts up to 2^128 (auto-nudge over the 64-bit block window), the sieve engine up to 2^96 and - since the small-n MR branch (2026-10-18) - down to at least 100 (validated with `--check`, which now separates real defects from the base-2 strong pseudoprimes the MR kernel legitimately reports: 49 of them in `[100, 2e6)`, 2 in `[1000, 2e6)`, 0 at 1e7) |
 | `--length DEC` | `10000000000` (1e10) | |
 | `--sieve-limit P` | `1e7` (GPU sieve) / `3e4` (CPU sieve) | marking primes 17..P; 1e7 is the measured optimum (deeper sieving loses: item count scales with pi(P)) |
 | `--threads T` | `8` | one CUDA stream + one slice per thread |

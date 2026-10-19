@@ -28,7 +28,9 @@
  * Build: make bin/mr68_gpu WITH_CUDA=1
  * Run:
  *   ./bin/mr68_gpu --validate 200000          # GMP cross-check, must be 0 bad
+ *   ./bin/mr68_gpu --validate 200000 1000000000   # same, small-n branch
  *   ./bin/mr68_gpu 1048576 20                 # batch x iters benchmark
+ *   ./bin/mr68_gpu 1048576 20 1000000000      # benchmark at a small base
  */
 
 #ifndef _POSIX_C_SOURCE
@@ -62,9 +64,27 @@ static double now_s(void) {
     return (double)ts.tv_sec + (double)ts.tv_nsec * 1e-9;
 }
 
-/* candidates: odd n = BASE + 2*i + 1 with BASE = 2e20 (the Phase-0 start) */
-static void fill_candidates(uint32_t *cands, uint32_t count) {
-    const u128 base = (u128)20 * (u128)10000000000000000000ULL;  /* 2e20 */
+/* candidates: odd n = base + 2*i + 1.  The default base is 2e20 (the Phase-0
+   production start); a small base exercises the kernel's small-n branch
+   (n <= 2^67) that the smooth-range census needs at 1e9-1e12. */
+#define MR68_DEFAULT_BASE ((u128)20 * (u128)10000000000000000000ULL)
+
+static u128 parse_u128_arg(const char *s) {
+    u128 v = 0;
+    for (; *s >= '0' && *s <= '9'; s++) v = v * 10 + (unsigned)(*s - '0');
+    return v;
+}
+
+static void base_str(u128 v, char *out, size_t n) {
+    char t[48];
+    int i = 0, j = 0;
+    if (v == 0) { snprintf(out, n, "0"); return; }
+    while (v != 0 && i < 47) { t[i++] = (char)('0' + (int)(v % 10)); v /= 10; }
+    while (i > 0 && (size_t)(j + 1) < n) out[j++] = t[--i];
+    out[j] = 0;
+}
+
+static void fill_candidates(uint32_t *cands, uint32_t count, u128 base) {
     for (uint32_t i = 0; i < count; i++) {
         u128 n = base + (u128)2 * (u128)i + 1;
         cands[(size_t)i * NW + 0] = (uint32_t)n;
@@ -81,13 +101,45 @@ static int check_cuda(cudaError_t e, const char *what) {
     return 0;
 }
 
-static int run_validate(uint32_t count) {
-    printf("[mr68] --validate %u candidates starting at 2e20 ...\n", count);
+/* The kernel's contract is "base-2 strong probable prime", so the golden
+   reference is the same test computed with GMP - NOT full primality.  A
+   base-2 strong pseudoprime (e.g. 1002261781 = 61*157*229*457) is a CORRECT
+   kernel verdict; those are counted separately below. */
+static int gmp_sprp2(const mpz_t n) {
+    if (mpz_cmp_ui(n, 2) < 0) return 0;
+    if (mpz_cmp_ui(n, 2) == 0) return 1;
+    if (mpz_even_p(n)) return 0;
+    mpz_t n1, d, x, two;
+    unsigned long s, r;
+    int res = 0;
+    mpz_inits(n1, d, x, two, NULL);
+    mpz_sub_ui(n1, n, 1);                 /* n1 = n-1 */
+    s = mpz_scan1(n1, 0);                 /* n-1 = 2^s * d */
+    mpz_tdiv_q_2exp(d, n1, s);
+    mpz_set_ui(two, 2);
+    mpz_powm(x, two, d, n);               /* x = 2^d mod n */
+    if (mpz_cmp_ui(x, 1) == 0 || mpz_cmp(x, n1) == 0) {
+        res = 1;
+    } else {
+        for (r = 0; r + 1 < s; r++) {
+            mpz_mul(x, x, x);
+            mpz_mod(x, x, n);
+            if (mpz_cmp(x, n1) == 0) { res = 1; break; }
+        }
+    }
+    mpz_clears(n1, d, x, two, NULL);
+    return res;
+}
+
+static int run_validate(uint32_t count, u128 base) {
+    char bs[48];
+    base_str(base, bs, sizeof bs);
+    printf("[mr68] --validate %u candidates starting at %s ...\n", count, bs);
     uint32_t *d_cands = NULL;
     uint8_t *d_res = NULL, *h_res = (uint8_t *)malloc(count);
     uint32_t *h_cands = (uint32_t *)malloc((size_t)count * NW * sizeof(uint32_t));
     if (!h_res || !h_cands) { fprintf(stderr, "[mr68] alloc failed\n"); return 1; }
-    fill_candidates(h_cands, count);
+    fill_candidates(h_cands, count, base);
     if (check_cuda(cudaMalloc(&d_cands, (size_t)count * NW * sizeof(uint32_t)), "cudaMalloc cands")) return 1;
     if (check_cuda(cudaMalloc(&d_res, count), "cudaMalloc results")) return 1;
     if (check_cuda(cudaMemcpy(d_cands, h_cands, (size_t)count * NW * sizeof(uint32_t), cudaMemcpyHostToDevice), "H2D")) return 1;
@@ -105,30 +157,42 @@ static int run_validate(uint32_t count) {
 
     mpz_t n;
     mpz_init(n);
-    size_t gpu_primes = 0, gmp_primes = 0, bad = 0, bad_composite = 0;
+    size_t gpu_primes = 0, gmp_primes = 0, bad = 0, bad_composite = 0, spsp2 = 0;
     for (uint32_t i = 0; i < count; i++) {
         uint64_t w[2] = {
             (uint64_t)h_cands[(size_t)i * NW + 0] | ((uint64_t)h_cands[(size_t)i * NW + 1] << 32),
             (uint64_t)h_cands[(size_t)i * NW + 2]
         };
         mpz_import(n, 2, -1, 8, 0, 0, w);
+        int sprp2 = gmp_sprp2(n);
         int gmp = mpz_probab_prime_p(n, 30) >= 1;
         if (h_res[i]) gpu_primes++;
-        if (gmp) gmp_primes++;
-        if ((int)h_res[i] != gmp) {
+        if (sprp2) gmp_primes++;
+        if (sprp2 && !gmp) spsp2++;
+        if ((int)h_res[i] != sprp2) {
             bad++;
-            if (h_res[i] && !gmp) bad_composite++;
+            if (h_res[i] && !sprp2) bad_composite++;
+            if (bad <= 10) {
+                char vs[80];
+                mpz_get_str(vs, 10, n);
+                printf("[mr68] mismatch #%zu: n=%s kernel=%d sprp2=%d\n",
+                       bad, vs, (int)h_res[i], sprp2);
+            }
         }
     }
-    printf("[mr68] kernel primes=%zu  GMP primes=%zu  mismatches=%zu (kernel-prime-but-composite=%zu)\n",
+    printf("[mr68] kernel primes=%zu  base-2 sprp=%zu  mismatches=%zu (kernel-prime-but-not-sprp2=%zu)\n",
            gpu_primes, gmp_primes, bad, bad_composite);
+    if (spsp2)
+        printf("[mr68] info: %zu of those are base-2 strong pseudoprimes (correct "
+               "base-2 verdicts; the scanner's BPSW still rejects any gap they touch)\n",
+               spsp2);
     if (bad) {
         printf("[mr68] VALIDATE FAILED\n");
         mpz_clear(n); free(h_res); free(h_cands);
         cudaFree(d_cands); cudaFree(d_res);
         return 1;
     }
-    printf("[mr68] VALIDATE PASS (0 mismatches vs GMP over %u consecutive candidates)\n", count);
+    printf("[mr68] VALIDATE PASS (0 mismatches vs GMP base-2 strong test over %u consecutive candidates)\n", count);
     mpz_clear(n); free(h_res); free(h_cands);
     cudaFree(d_cands); cudaFree(d_res);
     return 0;
@@ -137,12 +201,14 @@ static int run_validate(uint32_t count) {
 int main(int argc, char **argv) {
     if (argc >= 2 && !strcmp(argv[1], "--validate")) {
         uint32_t count = (argc > 2) ? (uint32_t)strtoul(argv[2], NULL, 10) : 200000u;
+        u128 base = (argc > 3) ? parse_u128_arg(argv[3]) : MR68_DEFAULT_BASE;
         cudaFree(0);
-        return run_validate(count);
+        return run_validate(count, base);
     }
 
     uint32_t batch = (argc > 1) ? (uint32_t)strtoul(argv[1], NULL, 10) : 1048576u;
     int iters = (argc > 2) ? atoi(argv[2]) : 20;
+    u128 base = (argc > 3) ? parse_u128_arg(argv[3]) : MR68_DEFAULT_BASE;
     if (batch == 0 || iters < 1) return 2;
 
     cudaFree(0);
@@ -156,7 +222,7 @@ int main(int argc, char **argv) {
     uint8_t *d_res = NULL;
     uint32_t *h_cands = (uint32_t *)malloc((size_t)batch * NW * sizeof(uint32_t));
     if (!h_cands) { fprintf(stderr, "[mr68] alloc failed\n"); return 1; }
-    fill_candidates(h_cands, batch);
+    fill_candidates(h_cands, batch, base);
     if (check_cuda(cudaMalloc(&d_cands, (size_t)batch * NW * sizeof(uint32_t)), "cudaMalloc cands")) return 1;
     if (check_cuda(cudaMalloc(&d_res, batch), "cudaMalloc results")) return 1;
     if (check_cuda(cudaMemcpy(d_cands, h_cands, (size_t)batch * NW * sizeof(uint32_t), cudaMemcpyHostToDevice), "H2D")) return 1;

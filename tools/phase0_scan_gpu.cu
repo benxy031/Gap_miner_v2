@@ -94,6 +94,11 @@ static const double k_bands[N_BANDS] = {10, 15, 20, 25, 30, 35, 40};
                                   also defines w_gaprec_t via p0_types.h) */
 #endif
 
+/* --smooth: streaming smooth-run census over every prime the scan finds
+   (header-only, slot based; see smooth_range.h and docs/PHASE0_scan_bench.md
+   section 30).  Off by default: the default output is unchanged. */
+#include "smooth_range.h"
+
 #define MAX_THREADS 64
 
 /* ---------------- configuration / globals ---------------- */
@@ -164,6 +169,14 @@ static uint32_t g_walk_batch = 64;      /* blocks per super-batch (4..96);
                                            default 64 since 2026-10-03 (+2.45%
                                            ABBA vs 32; K=96 no better) */
 static int g_fast_dbg = 0;          /* P0_FAST_DBG=N: dump N fast-walk summaries */
+/* --smooth: smooth-run census (longest run of consecutive gaps <= g).  One
+   observer per worker thread; the final report merges CLOSED runs only, so
+   the run still open at the end - and any run crossing a thread slice - is
+   reported as open and never counted. */
+static int       g_smooth_on = 0;
+static int       g_smooth_k = 0;
+static uint64_t  g_smooth_g[SR_MAXG];
+static smooth_range_t g_sr[MAX_THREADS];
 
 /* wheel {3,5,7,11,13}: one bit per odd-value slot, period WHEEL_P slots.
    Bit i of the un-rotated pattern is set iff slot c is a multiple of a wheel
@@ -237,6 +250,79 @@ static void u128_str(u128 v, char *out, size_t n) {
     size_t j = 0;
     while (i > 0 && j + 1 < n) out[j++] = tmp[--i];
     out[j] = 0;
+}
+
+/* ---- --smooth: CLI list + final report ---- */
+
+static int smooth_parse(const char *s) {
+    char err[160] = "";
+    int k = sr_parse_list(s, g_smooth_g, SR_MAXG, err, sizeof err);
+    if (k < 0) { fprintf(stderr, "[phase0-gpu] --smooth: %s\n", err); return 1; }
+    g_smooth_k = k;
+    g_smooth_on = 1;
+    return 0;
+}
+
+/* Merge the per-thread observers and print the census: for every bound the
+   longest CLOSED run (counted), then the run still open at the end of the
+   session (a lower bound: printed, not counted).  Runs crossing a thread
+   slice boundary are never closed, so they can never win. */
+static void smooth_report(const u128 *anchors, int threads, FILE *log) {
+    int K = g_smooth_k;
+    int64_t mLen[SR_MAXG], mOpen[SR_MAXG];
+    u128 mSp[SR_MAXG], mEp[SR_MAXG], mOSp[SR_MAXG], mOEp[SR_MAXG];
+    int t, j;
+
+    for (j = 0; j < K; j++) {
+        mLen[j] = 0; mOpen[j] = 0;
+        mSp[j] = 0; mEp[j] = 0; mOSp[j] = 0; mOEp[j] = 0;
+    }
+    for (t = 0; t < threads; t++) {
+        int64_t lens[SR_MAXG], openv[SR_MAXG];
+        uint64_t sps[SR_MAXG], eps[SR_MAXG], osp[SR_MAXG], oep[SR_MAXG];
+        sr_results(&g_sr[t], lens, sps, eps, openv, osp, oep);
+        for (j = 0; j < K; j++) {
+            if (lens[j] > mLen[j]) {
+                mLen[j] = lens[j];
+                mSp[j] = anchors[t] + (u128)2 * (u128)sps[j];
+                mEp[j] = anchors[t] + (u128)2 * (u128)eps[j];
+            }
+            if (openv[j] > mOpen[j]) {
+                mOpen[j] = openv[j];
+                mOSp[j] = anchors[t] + (u128)2 * (u128)osp[j];
+                mOEp[j] = anchors[t] + (u128)2 * (u128)oep[j];
+            }
+        }
+    }
+    if (threads > 1) {
+        printf("[phase0-gpu] SMOOTH note: runs crossing thread-slice boundaries are "
+               "not counted (conservative)\n");
+        if (log)
+            fprintf(log, "# smooth note: runs crossing thread-slice boundaries are not counted\n");
+    }
+    for (j = 0; j < K; j++) {
+        if (mLen[j] > 0) {
+            char a[48], b[48];
+            u128_str(mSp[j], a, sizeof a);
+            u128_str(mEp[j], b, sizeof b);
+            printf("[phase0-gpu] SMOOTH g<=%llu: best=%lld start=%s end=%s\n",
+                   (unsigned long long)g_smooth_g[j], (long long)mLen[j], a, b);
+            if (log)
+                fprintf(log, "# smooth g<=%llu: best=%lld start=%s end=%s\n",
+                        (unsigned long long)g_smooth_g[j], (long long)mLen[j], a, b);
+        }
+    }
+    for (j = 0; j < K; j++) {
+        if (mOpen[j] > 0) {
+            char a[48], b[48];
+            u128_str(mOSp[j], a, sizeof a);
+            u128_str(mOEp[j], b, sizeof b);
+            printf("[phase0-gpu] SMOOTH g<=%llu: open>=%lld start=%s last=%s (not counted)\n",
+                   (unsigned long long)g_smooth_g[j], (long long)mOpen[j], a, b);
+        }
+    }
+    fflush(stdout);
+    if (log) fflush(log);
 }
 
 static void u128_to_mpz(mpz_t out, u128 x) {
@@ -540,6 +626,7 @@ static void flush_batch(job_t *j) {
            u128 value is only built on the rare reporting path. */
         uint64_t A = j->bi + j->steps[i];
         u128 x = 0;                        /* lazily built (0 = not built yet) */
+        if (g_smooth_on) sr_prime(&g_sr[j->tid], A);
 
         j->primes_found++;
         if (j->collect) {
@@ -948,6 +1035,7 @@ static void walk_result_bitmap(job_t *j, const uint64_t *rb, uint64_t seg_len,
             if (run >= run_gate) process_gap_A(j, A - run - 1, A);
             run = 0;
         }
+        if (g_smooth_on) sr_prime(&g_sr[j->tid], seg_A0 + wi * 64 + (uint64_t)b);
         j->prev_A = seg_A0 + wi * 64 + (uint64_t)b;   /* chain for the next segment */
         w &= w - 1;                     /* consume the first set bit */
         if (fset == ~0ULL) fset = wi * 64 + (uint64_t)b;
@@ -957,6 +1045,7 @@ static void walk_result_bitmap(job_t *j, const uint64_t *rb, uint64_t seg_len,
             w &= w - 1;
             uint64_t zeros = (uint64_t)(b2 - lastb - 1);
             uint64_t A = seg_A0 + wi * 64 + (uint64_t)b2;
+            if (g_smooth_on) sr_prime(&g_sr[j->tid], A);
             if (zeros >= run_gate) process_gap_A(j, A - zeros - 1, A);
             j->prev_A = A;                    /* chain for the next segment */
             lastb = b2;
@@ -1768,6 +1857,33 @@ static int run_walk_engine(void) {
 
 /* ---------------- --check: full-sequence comparison vs GMP ---------------- */
 
+/* base-2 strong probable prime test on an odd mpz - the MR kernel's contract.
+   A base-2 strong pseudoprime (2047, 3277, 4033, 4681, 8321, 15841, 29341,
+   42799, ...) satisfies it while being composite, so --check must accept such a
+   value as an EXTRA entry instead of reporting a sequence mismatch. */
+static int mpz_sprp2(const mpz_t n, mpz_t d, mpz_t x) {
+    mpz_t n1;
+    unsigned long s, r;
+    int ok;
+    if (mpz_cmp_ui(n, 2) < 0) return 0;
+    if (mpz_cmp_ui(n, 2) == 0) return 1;
+    if (mpz_even_p(n)) return 0;
+    mpz_init(n1);
+    mpz_sub_ui(n1, n, 1);
+    s = mpz_scan1(n1, 0);
+    mpz_tdiv_q_2exp(d, n1, s);
+    mpz_set_ui(x, 2);
+    mpz_powm(x, x, d, n);
+    ok = (mpz_cmp_ui(x, 1) == 0) || (mpz_cmp(x, n1) == 0);
+    for (r = 0; !ok && r + 1 < s; r++) {
+        mpz_mul(x, x, x);
+        mpz_mod(x, x, n);
+        if (mpz_cmp(x, n1) == 0) ok = 1;
+    }
+    mpz_clear(n1);
+    return ok;
+}
+
 static int run_check(u128 start, uint64_t len) {
     if (len == 0) len = 2000000;
     printf("[phase0-gpu] --check %llu candidates from start (full production path + GMP walk)\n",
@@ -1807,30 +1923,67 @@ static int run_check(u128 start, uint64_t len) {
     while (pv > 2 && !u128_is_probable(pv, t)) pv -= 2;
     u128_to_mpz(gp, pv);
 
-    size_t mismatch = 0;
-    for (size_t i = 0; i < j.collect_n && mismatch <= 5; i++) {
-        mpz_nextprime(gp, gp);
-        u128 g = mpz_to_u128(gp);
-        if (g != j.collect[i]) {
-            char a[48], b[48];
-            u128_str(g, a, sizeof a);
-            u128_str(j.collect[i], b, sizeof b);
-            fprintf(stderr, "[phase0-gpu] CHECK MISMATCH #%zu: gmp=%s gpu-path=%s\n", i, a, b);
-            mismatch++;
+    /* Sequence comparison against the GMP walk.  The GPU path reports base-2
+       STRONG PROBABLE primes, so a base-2 strong pseudoprime appears as an
+       EXTRA value that a GMP mpz_nextprime walk can never produce; an extra
+       value is tolerated iff it really passes that test.  A GMP prime missing
+       from the GPU list is always a failure (real sieve/MR defect).  This is
+       what made "--start 100" look like 6 missed primes: it was the single
+       extra value 42799 shifting the comparison by one. */
+    size_t mismatch = 0, missing = 0, tolerated = 0;
+    mpz_t gv, d2, x2, endz;
+    mpz_inits(gv, d2, x2, endz, NULL);
+    u128_to_mpz(endz, start + (u128)len);
+    mpz_nextprime(gp, gp);              /* first prime >= start */
+    for (size_t i = 0; i < j.collect_n; i++) {
+        u128_to_mpz(gv, j.collect[i]);
+        while (mpz_cmp(gp, gv) < 0) {   /* GMP has a prime the GPU missed */
+            if (missing < 5) {
+                char a[48], b[48];
+                u128_str(mpz_to_u128(gp), a, sizeof a);
+                u128_str(j.collect[i], b, sizeof b);
+                fprintf(stderr, "[phase0-gpu] CHECK MISSING #%zu: gmp=%s next-gpu=%s\n",
+                        missing + 1, a, b);
+            }
+            missing++;
+            mpz_nextprime(gp, gp);
         }
+        if (mpz_cmp(gp, gv) == 0) {                     /* exact match */
+            mpz_nextprime(gp, gp);
+            continue;
+        }
+        if (mpz_sprp2(gv, d2, x2)) { tolerated++; continue; }
+        {
+            char a[48], b[48];
+            u128_str(mpz_to_u128(gp), a, sizeof a);
+            u128_str(j.collect[i], b, sizeof b);
+            fprintf(stderr, "[phase0-gpu] CHECK MISMATCH #%zu: gmp=%s gpu-path=%s"
+                            " (value is not a base-2 strong probable prime)\n", i, a, b);
+        }
+        mismatch++;
+    }
+    while (mpz_cmp(gp, endz) < 0) {     /* GMP primes past the last GPU value */
+        if (missing < 5) {
+            char a[48];
+            u128_str(mpz_to_u128(gp), a, sizeof a);
+            fprintf(stderr, "[phase0-gpu] CHECK MISSING (tail): gmp=%s\n", a);
+        }
+        missing++;
+        mpz_nextprime(gp, gp);
     }
     char s0[48];
     u128_str(start, s0, sizeof s0);
     int rc = 0;
-    if (mismatch) {
-        fprintf(stderr, "[phase0-gpu] CHECK FAILED (%zu mismatches)\n", mismatch);
+    if (mismatch || missing) {
+        fprintf(stderr, "[phase0-gpu] CHECK FAILED (%zu non-sprp2 value(s), "
+                        "%zu GMP prime(s) missing)\n", mismatch, missing);
         rc = 1;
     } else {
-        printf("[phase0-gpu] CHECK PASS: %zu primes in [%s, %s+%llu) identical between "
-               "bucketed sieve + GPU base-2 MR + GMP verify path and a pure GMP "
-               "mpz_nextprime walk\n",
-               j.collect_n, s0, s0, (unsigned long long)len);
+        printf("[phase0-gpu] CHECK PASS: %zu base-2 probable primes in [%s, %s+%llu) "
+               "match the GMP walk (%zu extra base-2 strong pseudoprime(s) tolerated)\n",
+               j.collect_n, s0, s0, (unsigned long long)len, tolerated);
     }
+    mpz_clears(gv, d2, x2, endz, NULL);
     if (g_use_gpu_sieve) job_gs_free(&j);
     cudaFreeHost(j.steps); cudaFreeHost(j.res); free(j.collect);
     mpz_clear(j.scratch); mpz_clear(gp); mpz_clear(t);
@@ -1863,7 +2016,7 @@ static void usage(const char *p) {
         "          [--state FILE] [--state-every S] [--progress S] [--device D]\n"
         "          [--records FILE] [--no-records] [--gpu-sieve] [--check [N]]\n"
         "          [--legacy-mr] [--engine sieve|walk] [--gap-min G]\n"
-        "          [--walk-primes P] [--walk-batch B]\n"
+        "          [--walk-primes P] [--walk-batch B] [--smooth G,...]\n"
         "\n"
         "  sieve: default is CPU marking (wheel tile + bucket marking of\n"
         "         17..sieve-limit).  --gpu-sieve moves the whole mark stage\n"
@@ -1887,6 +2040,13 @@ static void usage(const char *p) {
         "         the survivor bitmap; host sees one verdict bitmap per\n"
         "         segment).  --legacy-mr selects the batched steps/res path\n"
         "         (4 M candidates per flush; reference implementation for A/B).\n"
+        "  --smooth G,..: census of smooth runs (sieve engine only): for every\n"
+        "         bound g, the longest run of consecutive gaps all <= g (length\n"
+        "         = number of gaps).  Only runs closed INSIDE a thread slice\n"
+        "         count; the run open at the end and runs crossing a thread\n"
+        "         boundary are printed as 'open' (a lower bound), not counted.\n"
+        "         Bounds: even, 2..1000000, at most 128 entries, e.g.\n"
+        "         --smooth 2,4,6,8,10,12,16,20,24,28,32,36,40,50,64,80,100,128\n"
         "  defaults: start=200000000000000000000 (2e20) length=10000000000 (1e10)\n"
         "            threads=8 merit-min=20 progress=10s state-every=30s device=0\n"
         "            --gpu-sieve (default): sieve-limit=1e7 batch=4194304 seg-bits=24\n"
@@ -1941,6 +2101,9 @@ int main(int argc, char **argv) {
         else if (!strcmp(argv[i], "--check")) {
             do_check = 1;
             if (i + 1 < argc && argv[i + 1][0] != '-') check_len = strtoull(argv[++i], NULL, 10);
+        }
+        else if (!strcmp(argv[i], "--smooth") && i + 1 < argc) {
+            if (smooth_parse(argv[++i])) return 2;
         } else { usage(argv[0]); return 2; }
     }
 
@@ -1955,6 +2118,23 @@ int main(int argc, char **argv) {
         const char *dbg = getenv("P0_FAST_DBG");
         if (dbg)
             g_fast_dbg = atoi(dbg);
+    }
+    if (g_smooth_on) {
+        char err[160] = "";
+        int t;
+        if (g_walk_engine) {
+            fprintf(stderr, "[phase0-gpu] --smooth needs the sieve engine: --engine walk "
+                            "only materialises gaps >= --gap-min\n");
+            return 2;
+        }
+        if (do_check) { fprintf(stderr, "[phase0-gpu] --smooth is not supported with --check\n"); return 2; }
+        if (!do_test) { fprintf(stderr, "[phase0-gpu] --smooth requires the test stage\n"); return 2; }
+        for (t = 0; t < threads; t++) {
+            if (!sr_init(&g_sr[t], g_smooth_g, g_smooth_k, err, sizeof err)) {
+                fprintf(stderr, "[phase0-gpu] --smooth: %s\n", err);
+                return 2;
+            }
+        }
     }
     if (g_device < 0 || g_device > 15) { fprintf(stderr, "[phase0-gpu] --device out of range\n"); return 2; }
     if (!g_walk_engine && g_use_gpu_sieve && !do_test) { fprintf(stderr, "[phase0-gpu] --gpu-sieve requires the test stage\n"); return 2; }
@@ -2060,6 +2240,12 @@ int main(int argc, char **argv) {
            s0, (unsigned long long)length, u128_ln(start));
     printf("[phase0-gpu] sieve_limit=%u  threads=%d  seg_bits=%d  batch=%u  test=%s  merit_min=%.1f\n",
            sieve_limit, threads, seg_bits, g_batch, do_test ? "on" : "off", g_merit_min);
+    if (g_smooth_on) {
+        printf("[phase0-gpu] smooth census: %d bounds (g<=", g_smooth_k);
+        for (int t = 0; t < g_smooth_k; t++)
+            printf("%s%llu", t ? "," : "", (unsigned long long)g_smooth_g[t]);
+        printf("); only runs that close inside a thread slice count\n");
+    }
     if (g_log_path) printf("[phase0-gpu] gap log: %s\n", g_log_path);
     if (g_state_path) printf("[phase0-gpu] state: %s\n", g_state_path);
     if (g_log) {
@@ -2067,6 +2253,12 @@ int main(int argc, char **argv) {
                        "sieve_limit=%u seg_bits=%d batch=%u merit_min=%.1f table=%s\n",
                 (long long)time(NULL), s0, (unsigned long long)length, threads,
                 sieve_limit, seg_bits, g_batch, g_merit_min, g_table_stamp);
+        if (g_smooth_on) {
+            fprintf(g_log, "# smooth census bounds:");
+            for (int t = 0; t < g_smooth_k; t++)
+                fprintf(g_log, " %llu", (unsigned long long)g_smooth_g[t]);
+            fprintf(g_log, "\n");
+        }
         fflush(g_log);
     }
 
@@ -2269,6 +2461,11 @@ int main(int argc, char **argv) {
         for (int b = 0; b < N_BANDS; b++) if (k_bands[b] <= g_merit_min) bb = b;
         printf("[phase0-gpu] list_estimate: ~%.1f MB per 1e14 ints at m>=%.0f (12 B/record)\n",
                (double)bands[bb] * per14 * 12.0 / 1e6, k_bands[bb]);
+    }
+    if (g_smooth_on) {
+        u128 anchors[MAX_THREADS];
+        for (int t = 0; t < threads; t++) anchors[t] = jobs[t].v_anchor;
+        smooth_report(anchors, threads, g_log);
     }
     printf("[phase0-gpu] --- end ---\n");
 

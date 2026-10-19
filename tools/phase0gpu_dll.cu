@@ -100,7 +100,8 @@ P0GPU_EXPORT int p0gpu_class30_sieve(const void *primes, const void *invp,
                                      unsigned long long alo,
                                      unsigned long long ahi,
                                      unsigned long long tile_slots,
-                                     unsigned long long ntiles, void *g_bm,
+                                     unsigned long long ntiles,
+                                     unsigned long long last_slots, void *g_bm,
                                      unsigned tile_words, const void *wpidx,
                                      int wheel_on, unsigned grid,
                                      unsigned block, size_t shared_bytes,
@@ -109,7 +110,8 @@ P0GPU_EXPORT int p0gpu_class30_sieve(const void *primes, const void *invp,
         (const uint64_t *)primes, (const uint64_t *)invp,
         (const uint64_t *)r64, (const uint32_t *)item_pidx,
         (const uint32_t *)item_k0, nitems, alo, ahi, tile_slots, ntiles,
-        (uint64_t *)g_bm, tile_words, (const uint32_t *)wpidx, wheel_on);
+        last_slots, (uint64_t *)g_bm, tile_words, (const uint32_t *)wpidx,
+        wheel_on);
     return p0gpu_rc();
 }
 

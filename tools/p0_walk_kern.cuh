@@ -76,6 +76,7 @@ __global__ static void class30_sieve_kernel(const uint64_t * __restrict__ primes
                                             uint32_t nitems,
                                             uint64_t Alo, uint64_t Ahi,
                                             uint64_t tileSlots, uint64_t ntiles,
+                                            uint64_t lastSlots,
                                             uint64_t * __restrict__ g_bm,
                                             uint32_t tileWords,
                                             const uint32_t * __restrict__ wpidx, int wheel_on) {
@@ -120,6 +121,11 @@ __global__ static void class30_sieve_kernel(const uint64_t * __restrict__ primes
     }
     __syncthreads();
     for (uint64_t tile = blockIdx.x; tile < ntiles; tile += gridDim.x) {
+        /* A tile that does not divide the block leaves a PARTIAL last tile
+           (lastSlots <= tileSlots); every guard and the global write below are
+           clamped to it, while shared-memory-only work keeps tileWords. */
+        const uint32_t slots = (uint32_t)((tile + 1 == ntiles) ? lastSlots : tileSlots);
+        const uint32_t words = (slots + 63u) >> 6;
         for (uint32_t w = threadIdx.x; w < tileWords; w += blockDim.x) sh[w] = 0;
         __syncthreads();
         /* tv = (Ahi:Alo) + ((tile*tileSlots)>>3)*30 + 1 as a 64-bit pair.
@@ -220,7 +226,7 @@ __global__ static void class30_sieve_kernel(const uint64_t * __restrict__ primes
                     step[st] = k8 * s_dm8[(j + (uint32_t)st) & 7u] + tp[st];
             }
             uint32_t p32 = pos_base + 256u * cur_p * k0;
-            if (p32 >= (uint32_t)tileSlots) continue;
+            if (p32 >= slots) continue;
             for (int r8 = 0; r8 < 32; r8++) {
                 int done = 0;
 #pragma unroll
@@ -229,7 +235,7 @@ __global__ static void class30_sieve_kernel(const uint64_t * __restrict__ primes
                        past the tile the rest of the chunk is skipped instead
                        of walking 64 guarded iterations - the dominant item
                        cost at deep sieve depths, and identical marks. */
-                    if (p32 >= (uint32_t)tileSlots) { done = 1; break; }
+                    if (p32 >= slots) { done = 1; break; }
                     atomicOr(((unsigned int *)sh) + (p32 >> 5), 1u << (p32 & 31u));
                     p32 += step[st];
                 }
@@ -265,7 +271,7 @@ __global__ static void class30_sieve_kernel(const uint64_t * __restrict__ primes
             __syncthreads();
         }
         uint64_t *out = g_bm + tile * tileWords;
-        for (uint32_t w = threadIdx.x; w < tileWords; w += blockDim.x)
+        for (uint32_t w = threadIdx.x; w < words; w += blockDim.x)
             out[w] = sh[w];
         __syncthreads();
     }

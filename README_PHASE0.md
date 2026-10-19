@@ -86,8 +86,8 @@ Defaults:
 | `--merit-min M` | `20.0` | gaps >= M are written to the log and GMP-verified; bands/top-4/records still see every gap with merit >= 6 (internal gate) |
 | `--engine sieve\|walk` | `sieve` | `walk` selects the class-30 bitmap sieve + batched jump-walk engine (~10.6x the sieve engine's throughput at the production default: measured 5.2 s vs 55.8 s for 1e12 integers, identical 5-gap output, 2026-10-02; same log/records/verify/top-4/resume path). `--check`, `--gpu-sieve`/`--cpu-sieve`, `--legacy-mr` and `--sieve-limit` apply to the sieve engine only; combining them with `--engine walk` is an error (or ignored where noted) |
 | `--gap-min G` | `ceil(--merit-min * ln(start))` | walk engine only: report every gap >= G (GMP-verified). G in [100, 1e7]; values < 300 print a warning (walk cost scales ~1/G). Passing `--gap-min` explicitly removes the merit gate; an explicit `--merit-min` stays as an additional bar |
-| `--walk-primes P` | `40000` | walk engine: sieve/item primes 17..P.  Deeper sieving cuts the number of primality tests (measured tests follow 1/ln P exactly) but grows the marking, so the optimum is band-dependent.  **At the 7.9e28 campaign band 100000 is the measured optimum**: 4e12 ints from 7.9e28 gave **2.059 / 2.237 / 2.397 / 2.247 / 1.926 / 1.497e11 ints/s** for P = 15000 / 40000 / 100000 / 250000 / 500000 / 1e6 (+7.2 % over 40000), while the isolated mark grows 0.76 / 0.98 / 1.21 / 1.64 / 2.59 / 4.30 ms per block (`docs/PHASE0_scan_bench.md` §28).  At the container wall 15000 -> 40000 is +20 % (1.48e11 -> **1.79e11 ints/s**, §26.5), and at the 2e20 campaign geometry the two depths are equal within noise (3.93e11 vs 3.92e11) with 60000 2 % worse - hence the default stays 40000 and deep starts at or above 2^120 want a larger one (60000..250000).  Gap sets are identical at every depth (verified 87034/87034 gaps at `--gap-min 800`, P = 40000..1e6) |
-| `--walk-batch B` | `64` | walk engine: super-batch = B x 30-blocks (**default 64 since 2026-10-03**, was 32; range **4..96**, raised from 4..32 the same day). ABBA on 1e13 at `--gap-min 702` (dev 3070, 4 arms): K32 63.68 s vs **K64 62.12 s = +2.45 %**, K96 62.26 s (+2.23 %, no better than 64 but 6.5 GB); both K64 arms beat both K32 arms and the emitted sets are identical (parity K32==K64==K96 exact, 1624/1624 on 1e12). VRAM = 2 regions x (B+1) x 33.6 MB + gap buffer: default K=64 -> 4.4 GB, K=32 -> 2.2 GB, K=96 -> 6.5 GB (an over-large K fails the bitmap alloc loudly, never silently) |
+| `--walk-primes P` | `150000` | walk engine: sieve/item primes 17..P.  Deeper sieving cuts the number of primality tests (measured tests follow 1/ln P exactly) but grows the marking, so the optimum is **tile-dependent and band-dependent**.  With the shipped 92 KB tile the 7.9e28 campaign band measures **2.39 / 2.45-2.48 / 2.33 / 2.30e11 ints/s** for P = 120000 / **150000** / 180000 / 210000 (4e12 ints, `--gap-min 1664`, ABBA), i.e. the optimum moved 100000 -> 150000 when the mark's per-item cost fell (§31).  With the old 64 KB tile the same band measured 2.059 / 2.237 / **2.397** / 2.247 / 1.926 / 1.497e11 for P = 15000 / 40000 / **100000** / 250000 / 500000 / 1e6 (§28).  At shallow starts a smaller depth wins: at `--start 1e20` 40000 gives 4.03e11 vs 3.87-3.95e11 at 150000, and 15000 is the optimum at the 1e13 campaign geometry, so pass `--walk-primes 40000` (or 15000) for shallow bands.  Gap sets are identical at every depth (verified 87034/87034 gaps at `--gap-min 800`, P = 40000..1e6, and 1696/1696 walk-vs-sieve at P = 150000) |
+| `--walk-batch B` | `64` | walk engine: super-batch = B x 30-blocks (**default 64 since 2026-10-03**, was 32; range **4..96**, raised from 4..32 the same day). ABBA on 1e13 at `--gap-min 702` (dev 3070, 4 arms): K32 63.68 s vs **K64 62.12 s = +2.45 %**, K96 62.26 s (+2.23 %, no better than 64 but 6.5 GB) - at the 7.9e28 wall with the 92 KB tile K96 measured 16.12/16.33 s vs 16.36/16.94 s for K64 (**+2.5 %**, both pairs), still opt-in because of the VRAM; both K64 arms beat both K32 arms and the emitted sets are identical (parity K32==K64==K96 exact, 1624/1624 on 1e12). VRAM = 2 regions x (B+1) x 33.6 MB + gap buffer: default K=64 -> 4.4 GB, K=32 -> 2.2 GB, K=96 -> 6.5 GB (an over-large K fails the bitmap alloc loudly, never silently) |
 | `--log FILE` | none | appended; one `# phase0-gpu session ...` header per run |
 | `--state FILE` / `--state-every S` | none / `30` s | checkpoint for resume; **deleted when the range completes** |
 | `--progress S` | `10` s | progress + ETA line every S seconds (`0` = off); after a `--state` resume the line's `ints/s` and the final `end_to_end` cover only the current session (the `%` and `ints=` stay whole-slice) |
@@ -105,6 +105,16 @@ isolated the cross-segment chain bug in the bitmap walk.  `P0_SG_GRID=N`
 default `92` (= the pre-pipeline full wave; range 1..4096).  Measured on the
 2e13 arm at `--gap-min 1586`: 92 -> 58.9 s, 46 -> 58.6 s, 23 -> 75.6 s (too few
 CTAs - the mark stage becomes the pacer).  Keep the default.
+`P0_TILE_SLOTS=N` (walk engine) overrides the mark tile in bitmap slots
+(64 slots = 512 B; range 131072..753664, i.e. 8..92 KB of dynamic shared).  The
+default is **the largest tile the device can opt into** (92 KB on sm_86, capped
+by `cudaDevAttrMaxSharedMemoryPerBlockOptin` minus 4 KB of static shared; 64 KB
+on devices that cannot opt in past it), because the item table holds one row per
+(prime, 256-mark chunk) per tile and that row count is the mark's dominant cost:
+92 KB vs 64 KB cut the isolated mark 5.02 -> 4.58 s and 6.58 -> 5.98 s per 4e12
+ints (P = 100000 / 250000) with an identical gap set (8753/8753 rows,
+`tests=896651987` identical).  A partial last tile is handled by the kernel's
+`lastSlots` clamp (block = 2^28 slots does not divide by 753664).
 
 ### Pipelines
 
@@ -593,10 +603,11 @@ understate the remaining work - pass the campaign total in `--r-total` and let
 --r-total 2e17` for slices 5..20 of a 2e17 campaign).  A `--slices 0` (forever)
 chain without `--r-total` reports the per-1e16 yield instead.
 
-`--walk-primes P` (default: the engine's 40000) is passed straight to every
+`--walk-primes P` (default: the engine's 150000) is passed straight to every
 slice, so the whole campaign can run at one sieve depth.  The depth is a
-property of the band, not of the range: at the 7.9e28 wall the measured optimum
-is **100000** (+7.2 % end to end, +2.1e11 ints/s), while 250000 and above lose
+property of the band AND of the mark tile: at the 7.9e28 wall with the shipped
+92 KB tile the measured optimum is **150000** (2.45-2.48e11 ints/s, vs 2.39 at
+120000 and 2.33 at 180000), while 250000 and above lose
 because the marking grows faster than the tests fall (`docs/PHASE0_scan_bench.md`
 §28, `scripts/p0_deep_sweep.py`).  It can be changed between restarts - a slice
 resumes from its checkpoint at the new depth, and the reported gaps are

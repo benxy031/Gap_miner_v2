@@ -162,12 +162,18 @@ static int g_fast_mr = 1;           /* bitmap-verdict MR pipeline (--legacy-mr d
 /* --engine walk (class-30 sieve + batched jump-walk) */
 static int      g_walk_engine = 0;
 static uint64_t g_walk_gapmin = 0;      /* 0 = derive from merit_min */
-static uint32_t g_walk_primes = 40000;  /* sieve/item primes 17..P; 40000 is the
-                                           re-measured optimum (2026-10-08):
-                                           1.48e11 -> 1.79e11 ints/s at 7.9e28 */
+static uint32_t g_walk_primes = 150000; /* sieve/item primes 17..P.  The optimum
+                                           is GEOMETRY dependent: 40000 at the
+                                           old 64 KB tile, 150000 once the
+                                           bigger tile cut the mark's per-item
+                                           cost (2026-10-08 A/B at 7.9e28:
+                                           120k 16.74 s, 150k 16.15-16.33 s,
+                                           180k 17.14, 210k 17.37) */
 static uint32_t g_walk_batch = 64;      /* blocks per super-batch (4..96);
                                            default 64 since 2026-10-03 (+2.45%
-                                           ABBA vs 32; K=96 no better) */
+                                           ABBA vs 32).  K=96 is 2-2.5% faster
+                                           at the 7.9e28 wall but needs 6.5 GB
+                                           VRAM, so it stays opt-in. */
 static int g_fast_dbg = 0;          /* P0_FAST_DBG=N: dump N fast-walk summaries */
 /* --smooth: smooth-run census (longest run of consecutive gaps <= g).  One
    observer per worker thread; the final report merges CLOSED runs only, so
@@ -1410,9 +1416,47 @@ static void *monitor_thread(void *arg) {
 static int run_walk_engine(void) {
     const uint64_t blockNum30 = 30ull * (1ull << 25);
     const uint64_t cWords = (1ull << 28) / 64;
-    const uint64_t tileSlots = 1ull << 19;
+    /* Mark tile in slots (64 bits each).  Default 2^19 slots = 64 KB shared, the
+       historical geometry.  P0_TILE_SLOTS allows a LARGER tile that does not
+       divide the 2^28-slot block: the item table has one row per
+       (prime, 256-mark chunk) PER TILE, so a bigger tile means proportionally
+       fewer item instances - the mark's dominant cost (docs section 28) - at the
+       price of a partial last tile (handled by the kernel's lastSlots clamp) and
+       less L1 for the item table.  Upper bound 753664 slots = 92 KB dynamic:
+       96 KB + the kernel's ~3.2 KB of static shared exceeds the 99 KB per-block
+       limit on sm_86 (launch fails with "invalid argument", measured). */
+    uint64_t tileSlots = 1ull << 19;
+    {   /* Default: the largest tile the device can host (92 KB cap on sm_86,
+           the 96 KB + ~3.2 KB static per-block limit minus margin), because the
+           item table holds one row per (prime, 256-mark chunk) PER TILE and
+           that row count is the mark's dominant cost.  Devices that cannot opt
+           in past 64 KB keep the historical default. */
+        int dev = 0, optin = 0;
+        if (cudaGetDevice(&dev) == cudaSuccess &&
+            cudaDeviceGetAttribute(&optin, cudaDevAttrMaxSharedMemoryPerBlockOptin, dev) == cudaSuccess &&
+            optin > 16384) {
+            uint64_t slots = (((uint64_t)(optin - 4096) / 8) * 64) & ~63ull;
+            if (slots > 753664ull) slots = 753664ull;
+            if (slots > tileSlots) tileSlots = slots;
+        }
+    }
+    {
+        const char *ev = getenv("P0_TILE_SLOTS");
+        if (ev) {
+            uint64_t v = strtoull(ev, NULL, 10);
+            if (v >= (1ull << 17) && v <= 753664ull) {
+                tileSlots = v & ~63ull;
+                if (tileSlots < (1ull << 17)) tileSlots = 1ull << 17;
+            } else {
+                fprintf(stderr, "[phase0-gpu] P0_TILE_SLOTS %llu out of range"
+                                " [131072, 753664]; using %llu\n",
+                        (unsigned long long)v, (unsigned long long)tileSlots);
+            }
+        }
+    }
     const uint32_t tileWords = (uint32_t)(tileSlots >> 6);
-    const uint64_t tilesPerBlockC = (1ull << 28) / tileSlots;
+    const uint64_t tilesPerBlockC = ((1ull << 28) + tileSlots - 1) / tileSlots;
+    const uint64_t lastTileSlots = (1ull << 28) - (tilesPerBlockC - 1) * tileSlots;
     uint32_t sg_grid = 92, sg_block = 512;
     {   /* P0_SG_GRID: mark-kernel CTA count.  92 (the pre-pipeline value) is a
            full-width wave; under P0_PIPE the marks only need to fill the walk's
@@ -1614,9 +1658,13 @@ static int run_walk_engine(void) {
     printf("[phase0-gpu] engine=walk start=%s length=%llu ln(start)=%.4f\n",
            s0, (unsigned long long)g_len, u128_ln(g_start));
     printf("[phase0-gpu] walk: primes<=%u items=%zu gap_min=%llu walk_batch=%u "
-           "block=%llu bitmap_region=%.2f GB x2\n",
+           "block=%llu bitmap_region=%.2f GB x2 tile=%llu slots (%llu KB, %llu tiles/block%s)\n",
            P, nii2, (unsigned long long)gapmin, K,
-           (unsigned long long)blockNum30, (double)region_words * 8.0 / 1e9);
+           (unsigned long long)blockNum30, (double)region_words * 8.0 / 1e9,
+           (unsigned long long)tileSlots,
+           (unsigned long long)(((uint64_t)tileWords * 8u) / 1024u),
+           (unsigned long long)tilesPerBlockC,
+           (lastTileSlots == tileSlots) ? "" : ", partial last");
     if (g_log_path) printf("[phase0-gpu] gap log: %s\n", g_log_path);
     if (g_state_path) printf("[phase0-gpu] state: %s\n", g_state_path);
     if (g_log) {
@@ -1666,8 +1714,8 @@ static int run_walk_engine(void) {
 #ifdef PHASE0_KERNEL_DLL
                 if (p0gpu_class30_sieve(d_p, d_iv, d_r, d_ip2, d_ik2, (uint32_t)nii2,
                                        (uint64_t)Aj, (uint64_t)(Aj >> 64),
-                                       tileSlots, tilesPerBlockC, bm + j * cWords,
-                                       tileWords, d_wpidx, 1,
+                                       tileSlots, tilesPerBlockC, lastTileSlots,
+                                       bm + j * cWords, tileWords, d_wpidx, 1,
                                        sg_grid, sg_block, (size_t)tileWords * 8,
                                        sA) != 0)
                     die("p0gpu_class30_sieve failed");
@@ -1675,7 +1723,7 @@ static int run_walk_engine(void) {
                 class30_sieve_kernel<<<sg_grid, sg_block, (size_t)tileWords * 8, sA>>>(
                     d_p, d_iv, d_r, d_ip2, d_ik2, (uint32_t)nii2,
                     (uint64_t)Aj, (uint64_t)(Aj >> 64), tileSlots, tilesPerBlockC,
-                    bm + j * cWords, tileWords, d_wpidx, 1);
+                    lastTileSlots, bm + j * cWords, tileWords, d_wpidx, 1);
 #endif
                 e = cudaGetLastError();
                 if (e != cudaSuccess) die_cuda(e, "walk sieve launch");

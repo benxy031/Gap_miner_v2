@@ -116,6 +116,24 @@ ints (P = 100000 / 250000) with an identical gap set (8753/8753 rows,
 `tests=896651987` identical).  A partial last tile is handled by the kernel's
 `lastSlots` clamp (block = 2^28 slots does not divide by 753664).
 
+Diagnostics for cost isolation (walk engine, docs §32) - **never production
+settings**:
+
+* `P0_WALK_OFF=1` skips the walk launches, so the run measures the mark stage
+  alone (the gap log stays empty; `tests=0`).
+* `P0_MARK_NOSTORE=0|1|2|3` picks the mark's tile-store shape at compile time:
+  `0` = production (per-tile 32 MB/block DRAM stream), `1` = no store,
+  `2` = every store on one address, `3` = every tile into the same L2-resident
+  region.  Modes 1..3 do not write the bitmap, so the binary refuses them
+  without `P0_WALK_OFF=1`.  Measured (4e12 ints, P = 150000, mark-only):
+  0 -> 4.91 s, 3 -> 4.73 s, 2 -> 4.52 s, 1 -> 4.51 s, i.e. the tile stream costs
+  8.1 % of the mark.
+* `P0_WALK_TESTMODE=0|1|2` forces the walk's primality variant (perig / exact
+  lazy 2x64 / canonical 2x64) instead of the magnitude dispatch; only valid
+  above 2^96.  Measured at `--start 1e29`: perig 16.36/17.18 s vs lazy
+  19.32/21.56 s vs canonical 24.75/25.14 s with `tests` and the gap set
+  identical, so the production test is already the fastest of the three.
+
 ### Pipelines
 
 `--gpu-sieve` (default), per segment on the thread's stream:
@@ -234,9 +252,14 @@ does not apply); `--state`/`--state-every`/`--progress` work as usual.
 Larger super-batches (fewer event syncs, more VRAM) and a deeper sieve:
 
 ```
-./bin/phase0_scan_gpu --engine walk --walk-batch 32 --walk-primes 40000 \
-    --start 200000000000000000000 --length 64426429440 --log data/p0_walk_b32.log
+./bin/phase0_scan_gpu --engine walk --walk-batch 96 --walk-primes 150000 \
+    --start 200000000000000000000 --length 64426429440 --log data/p0_walk_b96.log
 ```
+
+VRAM = 2 x (B+1) x 33.6 MB: B=96 -> 6.5 GB, B=64 -> 4.4 GB, B=32 -> 2.2 GB
+(an over-large B fails the bitmap alloc loudly).  At the 7.9e28 wall B=96 is
++2.5 % over 64; the shipped `scripts/p0_walk_chain.py` therefore defaults to 96
+and accepts `--walk-batch 64` for cards with less than ~7 GB free.
 
 ### Output
 
@@ -619,7 +642,7 @@ measured optimum:
 ```bash
 nohup setsid python3 scripts/p0_walk_chain.py \
     --start 79000000000010000000000000000 --length 10000000000000000 \
-    --gap-min 1664 --tag wall --walk-batch 64 --walk-primes 100000 \
+    --gap-min 1664 --tag wall --walk-batch 96 --walk-primes 150000 \
     --slices 11 --r-total 2e17 > /tmp/wall_chain_stdout.txt 2>&1 &
 ```
 

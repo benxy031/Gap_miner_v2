@@ -59,6 +59,7 @@ int p0gpu_class30_sieve(const void *primes, const void *invp, const void *r64,
                         unsigned long long ntiles,
                         unsigned long long last_slots, void *g_bm,
                         unsigned tile_words, const void *wpidx, int wheel_on,
+                        int store_on,
                         unsigned grid, unsigned block, size_t shared_bytes,
                         void *stream);
 

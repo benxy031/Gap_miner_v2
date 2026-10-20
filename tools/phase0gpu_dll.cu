@@ -103,15 +103,35 @@ P0GPU_EXPORT int p0gpu_class30_sieve(const void *primes, const void *invp,
                                      unsigned long long ntiles,
                                      unsigned long long last_slots, void *g_bm,
                                      unsigned tile_words, const void *wpidx,
-                                     int wheel_on, unsigned grid,
+                                     int wheel_on, int store_on, unsigned grid,
                                      unsigned block, size_t shared_bytes,
                                      void *stream) {
-    class30_sieve_kernel<<<grid, block, shared_bytes, (cudaStream_t)stream>>>(
+    switch (store_on) {
+    case 1: class30_sieve_kernel<1><<<grid, block, shared_bytes, (cudaStream_t)stream>>>(
         (const uint64_t *)primes, (const uint64_t *)invp,
         (const uint64_t *)r64, (const uint32_t *)item_pidx,
         (const uint32_t *)item_k0, nitems, alo, ahi, tile_slots, ntiles,
         last_slots, (uint64_t *)g_bm, tile_words, (const uint32_t *)wpidx,
-        wheel_on);
+        wheel_on); break;
+    case 2: class30_sieve_kernel<2><<<grid, block, shared_bytes, (cudaStream_t)stream>>>(
+        (const uint64_t *)primes, (const uint64_t *)invp,
+        (const uint64_t *)r64, (const uint32_t *)item_pidx,
+        (const uint32_t *)item_k0, nitems, alo, ahi, tile_slots, ntiles,
+        last_slots, (uint64_t *)g_bm, tile_words, (const uint32_t *)wpidx,
+        wheel_on); break;
+    case 3: class30_sieve_kernel<3><<<grid, block, shared_bytes, (cudaStream_t)stream>>>(
+        (const uint64_t *)primes, (const uint64_t *)invp,
+        (const uint64_t *)r64, (const uint32_t *)item_pidx,
+        (const uint32_t *)item_k0, nitems, alo, ahi, tile_slots, ntiles,
+        last_slots, (uint64_t *)g_bm, tile_words, (const uint32_t *)wpidx,
+        wheel_on); break;
+    default: class30_sieve_kernel<0><<<grid, block, shared_bytes, (cudaStream_t)stream>>>(
+        (const uint64_t *)primes, (const uint64_t *)invp,
+        (const uint64_t *)r64, (const uint32_t *)item_pidx,
+        (const uint32_t *)item_k0, nitems, alo, ahi, tile_slots, ntiles,
+        last_slots, (uint64_t *)g_bm, tile_words, (const uint32_t *)wpidx,
+        wheel_on); break;
+    }
     return p0gpu_rc();
 }
 
@@ -151,8 +171,19 @@ P0GPU_EXPORT int p0gpu_c30_tables(const void *clsidx, const void *perm,
 }
 
 P0GPU_EXPORT int p0gpu_set_sieve_shared(size_t bytes) {
-    cudaError_t e = cudaFuncSetAttribute(
-        class30_sieve_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
-        (int)bytes);
+    /* the kernel is templated on the store mode (0 = production, 1..3 are the
+       diagnostic variants of docs section 32), so the dynamic-shared opt-in has
+       to be applied to every instantiation the wrapper can launch */
+    static const void *const fns[4] = {
+        (const void *)&class30_sieve_kernel<0>,
+        (const void *)&class30_sieve_kernel<1>,
+        (const void *)&class30_sieve_kernel<2>,
+        (const void *)&class30_sieve_kernel<3>,
+    };
+    cudaError_t e = cudaSuccess;
+    for (int i = 0; i < 4 && e == cudaSuccess; i++)
+        e = cudaFuncSetAttribute(fns[i],
+                                 cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                 (int)bytes);
     return (e == cudaSuccess) ? 0 : -1;
 }

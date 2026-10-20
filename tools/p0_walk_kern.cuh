@@ -68,6 +68,7 @@ __device__ static inline int64_t w_prevCand(const uint64_t *bm, int64_t pos) {
     return (w << 6) + 63 - __clzll((long long)word);
 }
 
+template<int STORE>
 __global__ static void class30_sieve_kernel(const uint64_t * __restrict__ primes,
                                             const uint64_t * __restrict__ invp,
                                             const uint64_t * __restrict__ r64,
@@ -270,9 +271,32 @@ __global__ static void class30_sieve_kernel(const uint64_t * __restrict__ primes
             }
             __syncthreads();
         }
-        uint64_t *out = g_bm + tile * tileWords;
-        for (uint32_t w = threadIdx.x; w < words; w += blockDim.x)
-            out[w] = sh[w];
+        uint64_t *out = g_bm + ((STORE == 3) ? 0 : tile * tileWords);
+        if (STORE == 0 || STORE == 3) {
+            /* STORE 0 = production.  STORE 3 keeps the identical instruction
+               stream and per-thread address pattern but lands every tile in the
+               SAME 92 KB region, so it stays in L2 and the 32 MB/block DRAM
+               stream is the ONLY difference - the clean isolation of the
+               stream cost (docs section 32). */
+            for (uint32_t w = threadIdx.x; w < words; w += blockDim.x)
+                out[w] = sh[w];
+        } else if (STORE == 2) {
+            /* STORE 2: identical store count, every store on ONE address (a
+               pathological control: same-address write conflicts). */
+            for (uint32_t w = threadIdx.x; w < words; w += blockDim.x)
+                out[0] = sh[w];
+        } else {
+            /* STORE 1: no store stream at all; every shared read of the marked
+               tile folds into one accumulator whose store is data-dependent, so
+               the marking above stays live (a plain removed store would let the
+               compiler delete the item loop - the microbenchmark trap).  The
+               bitmap is NOT written, so this mode is only valid with
+               P0_WALK_OFF=1. */
+            uint64_t acc = 0;
+            for (uint32_t w = threadIdx.x; w < words; w += blockDim.x)
+                acc ^= sh[w];
+            if (acc == 0x9e3779b97f4a7c15ull) out[0] = acc;
+        }
         __syncthreads();
     }
 }

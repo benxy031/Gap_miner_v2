@@ -401,7 +401,7 @@ def main(argv=None):
                     help="total integers the campaign plans to scan; the forecast "
                          "for R_remaining = R_total - R_scanned is then printed "
                          "(the wall chain is 20 slices x 1e16 = 2e17)")
-    ap.add_argument("--rate", type=float, default=2.254e11,
+    ap.add_argument("--rate", type=float, default=2.45e11,
                     help="scan rate in ints/s (default: measured 2.254e11)")
     ap.add_argument("--gmin", type=int, default=1664,
                     help="smallest length the scanner logs (default 1664)")

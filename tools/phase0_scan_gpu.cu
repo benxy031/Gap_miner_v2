@@ -175,6 +175,18 @@ static uint32_t g_walk_batch = 64;      /* blocks per super-batch (4..96);
                                            at the 7.9e28 wall but needs 6.5 GB
                                            VRAM, so it stays opt-in. */
 static int g_fast_dbg = 0;          /* P0_FAST_DBG=N: dump N fast-walk summaries */
+/* Diagnostic-only knobs for the two cost-isolation experiments (docs section
+   32).  None of them is a production setting: P0_MARK_NOSTORE alone produces a
+   bitmap the walk must not read, so it is only valid together with
+   P0_WALK_OFF=1. */
+static int g_mark_nostore = 0;      /* P0_MARK_NOSTORE=0|1|2|3: mark store modes
+                                       (0 production; 1 no stream, 2 one address,
+                                       3 same L2 region - docs section 32) */
+static int g_walk_off = 0;          /* P0_WALK_OFF=1: skip the walk launches
+                                       (mark-only wall, honestly measured) */
+static int g_walk_testmode = -1;    /* P0_WALK_TESTMODE=0|1|2: force the walk's
+                                       primality variant (perig/lazy/canonical)
+                                       instead of the magnitude dispatch */
 /* --smooth: smooth-run census (longest run of consecutive gaps <= g).  One
    observer per worker thread; the final report merges CLOSED runs only, so
    the run still open at the end - and any run crossing a thread slice - is
@@ -1464,6 +1476,28 @@ static int run_walk_engine(void) {
         const char *ev = getenv("P0_SG_GRID");
         if (ev) { int v = atoi(ev); if (v >= 1 && v <= 4096) sg_grid = (uint32_t)v; }
     }
+    {   /* P0_MARK_NOSTORE / P0_WALK_OFF / P0_WALK_TESTMODE: diagnostics only. */
+        const char *ev = getenv("P0_MARK_NOSTORE");
+        if (ev) { int v = atoi(ev); if (v >= 0 && v <= 3) g_mark_nostore = v;
+                  else fprintf(stderr, "[phase0-gpu] P0_MARK_NOSTORE %d out of"
+                                      " range [0,3]; using 0\n", v); }
+        ev = getenv("P0_WALK_OFF");
+        if (ev) g_walk_off = (atoi(ev) != 0);
+        ev = getenv("P0_WALK_TESTMODE");
+        if (ev) {
+            int v = atoi(ev);
+            if (v >= 0 && v <= 2) g_walk_testmode = v;
+            else fprintf(stderr, "[phase0-gpu] P0_WALK_TESTMODE %d out of range"
+                                " [0,2]; using the magnitude dispatch\n", v);
+        }
+        if (g_mark_nostore || g_walk_off || g_walk_testmode >= 0)
+            fprintf(stderr, "[phase0-gpu] DIAG: mark_nostore=%d walk_off=%d"
+                            " walk_testmode=%d (not a production setting)\n",
+                    g_mark_nostore, g_walk_off, g_walk_testmode);
+        if (g_mark_nostore && !g_walk_off)
+            die("P0_MARK_NOSTORE=1 skips the bitmap write; add P0_WALK_OFF=1 "
+                "(the walk would otherwise read an unmarked bitmap)");
+    }
     const uint32_t wk_grid = 46, wk_block = 512;
 
     u128 A = ((g_start | 1) / 30u) * 30u;
@@ -1605,7 +1639,13 @@ static int run_walk_engine(void) {
     cudaMemcpyToSymbol(c30_clsidx, clsidx, sizeof(clsidx));
     cudaMemcpyToSymbol(c30_perm, perm, sizeof(perm));
     cudaMemcpyToSymbol(c30_pinv, pinv, sizeof(pinv));
-    cudaFuncSetAttribute(class30_sieve_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)(tileWords * 8));
+    /* the store mode is a template parameter (STORE 0 is production; 1..3 are
+       the diagnostic variants of docs section 32) - each instantiation needs
+       its own dynamic-shared opt-in */
+    cudaFuncSetAttribute(class30_sieve_kernel<0>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)(tileWords * 8));
+    cudaFuncSetAttribute(class30_sieve_kernel<1>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)(tileWords * 8));
+    cudaFuncSetAttribute(class30_sieve_kernel<2>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)(tileWords * 8));
+    cudaFuncSetAttribute(class30_sieve_kernel<3>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)(tileWords * 8));
 #endif
     cudaStream_t sA, sB, sC;
     cudaEvent_t evS[2], evW[2], evM[2], evX[2];
@@ -1716,14 +1756,29 @@ static int run_walk_engine(void) {
                                        (uint64_t)Aj, (uint64_t)(Aj >> 64),
                                        tileSlots, tilesPerBlockC, lastTileSlots,
                                        bm + j * cWords, tileWords, d_wpidx, 1,
+                                       g_mark_nostore,
                                        sg_grid, sg_block, (size_t)tileWords * 8,
                                        sA) != 0)
                     die("p0gpu_class30_sieve failed");
 #else
-                class30_sieve_kernel<<<sg_grid, sg_block, (size_t)tileWords * 8, sA>>>(
+                switch (g_mark_nostore) {
+                case 1: class30_sieve_kernel<1><<<sg_grid, sg_block, (size_t)tileWords * 8, sA>>>(
                     d_p, d_iv, d_r, d_ip2, d_ik2, (uint32_t)nii2,
                     (uint64_t)Aj, (uint64_t)(Aj >> 64), tileSlots, tilesPerBlockC,
-                    lastTileSlots, bm + j * cWords, tileWords, d_wpidx, 1);
+                    lastTileSlots, bm + j * cWords, tileWords, d_wpidx, 1); break;
+                case 2: class30_sieve_kernel<2><<<sg_grid, sg_block, (size_t)tileWords * 8, sA>>>(
+                    d_p, d_iv, d_r, d_ip2, d_ik2, (uint32_t)nii2,
+                    (uint64_t)Aj, (uint64_t)(Aj >> 64), tileSlots, tilesPerBlockC,
+                    lastTileSlots, bm + j * cWords, tileWords, d_wpidx, 1); break;
+                case 3: class30_sieve_kernel<3><<<sg_grid, sg_block, (size_t)tileWords * 8, sA>>>(
+                    d_p, d_iv, d_r, d_ip2, d_ik2, (uint32_t)nii2,
+                    (uint64_t)Aj, (uint64_t)(Aj >> 64), tileSlots, tilesPerBlockC,
+                    lastTileSlots, bm + j * cWords, tileWords, d_wpidx, 1); break;
+                default: class30_sieve_kernel<0><<<sg_grid, sg_block, (size_t)tileWords * 8, sA>>>(
+                    d_p, d_iv, d_r, d_ip2, d_ik2, (uint32_t)nii2,
+                    (uint64_t)Aj, (uint64_t)(Aj >> 64), tileSlots, tilesPerBlockC,
+                    lastTileSlots, bm + j * cWords, tileWords, d_wpidx, 1); break;
+                }
 #endif
                 e = cudaGetLastError();
                 if (e != cudaSuccess) die_cuda(e, "walk sieve launch");
@@ -1743,8 +1798,13 @@ static int run_walk_engine(void) {
                 die("p0gpu_walk failed");
 #else
             /* the test variant is selected per launch (the three instantiations
-               keep ptxas from pricing the widest test into the perig path) */
-            switch (w_test_mode((uint64_t)(Ab >> 64))) {
+               keep ptxas from pricing the widest test into the perig path);
+               P0_WALK_TESTMODE forces one for the cost measurement, and
+               P0_WALK_OFF skips the launch entirely (mark-only wall). */
+            int tmode = (g_walk_testmode >= 0)
+                      ? g_walk_testmode : w_test_mode((uint64_t)(Ab >> 64));
+            if (!g_walk_off) {
+            switch (tmode) {
             case 2: walk_kernel7<2><<<wk_grid, wk_block, 0, sB>>>(bm, cnb * cWords,
                         (uint64_t)Ab, (uint64_t)(Ab >> 64), d_wtab,
                         (uint32_t)gapmin, out_r, 1u << 20, st_r); break;
@@ -1754,6 +1814,7 @@ static int run_walk_engine(void) {
             default: walk_kernel7<0><<<wk_grid, wk_block, 0, sB>>>(bm, cnb * cWords,
                         (uint64_t)Ab, (uint64_t)(Ab >> 64), d_wtab,
                         (uint32_t)gapmin, out_r, 1u << 20, st_r); break;
+            }
             }
 #endif
             e = cudaGetLastError(); if (e != cudaSuccess) die_cuda(e, "walk launch");

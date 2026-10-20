@@ -32,7 +32,7 @@ Usage (one GPU / two GPUs, detached):
         > data/p0_walk_1p33e20_chain.out 2>&1 &
     # two GPUs: add  --devices 0,1
 
-Options: --slices N (0 = forever), --walk-batch B (default 64),
+Options: --slices N (0 = forever), --walk-batch B (default 96),
 --devices D[,D...] (default 0), --bin PATH, --state-dir DIR, --table FILE,
 --dry-run (print the first slice commands and exit).
 """
@@ -74,7 +74,7 @@ def shortest_winnable(L, table):
     return None, None
 
 
-def forecast_lines(tag, gmin, state_dir, table, r_total, top=3, rate=2.254e11):
+def forecast_lines(tag, gmin, state_dir, table, r_total, top=3, rate=2.45e11):
     """The p0_record_forecast summary for this chain, or a one-line apology.
 
     Never raises: the chain must keep scanning even when the forecast cannot be
@@ -100,11 +100,17 @@ def main(argv=None):
     ap.add_argument("--tag", default="1p33e20")
     ap.add_argument("--index-start", type=int, default=1)
     ap.add_argument("--slices", type=int, default=0, help="0 = run forever")
-    ap.add_argument("--walk-batch", type=int, default=64)
+    ap.add_argument("--walk-batch", type=int, default=96,
+                    help="super-batch in 30-blocks (4..96).  VRAM = 2 x (B+1) x "
+                         "33.6 MB: 96 -> 6.5 GB, 64 -> 4.4 GB.  96 measured "
+                         "+2.5%% at the 7.9e28 wall (16.12/16.33 s vs "
+                         "16.36/16.94 s for 64), so it is the default; pass 64 "
+                         "on a card with less than ~7 GB free")
     ap.add_argument("--walk-primes", type=int, default=None,
-                    help="sieve depth passed to the scan (engine default 40000).  "
-                         "At the 7.9e28 band 100000 is the measured optimum "
-                         "(README_PHASE0.md section 4, docs/PHASE0_scan_bench.md 28)")
+                    help="sieve depth passed to the scan (engine default "
+                         "150000).  At the 7.9e28 band 150000 is the measured "
+                         "optimum with the shipped 92 KB tile; shallow bands "
+                         "want 40000 (docs/PHASE0_scan_bench.md 31.3)")
     ap.add_argument("--devices", default="0",
                     help="comma-separated CUDA device ids, one scan per device (e.g. 0,1)")
     ap.add_argument("--bin", default=os.path.join(REPO, "bin/phase0_scan_gpu"))
@@ -115,8 +121,10 @@ def main(argv=None):
                          "completed slice")
     ap.add_argument("--forecast-top", type=int, default=3,
                     help="open targets shown in the forecast summary (default 3)")
-    ap.add_argument("--rate", type=float, default=2.254e11,
-                    help="scan rate in ints/s used for the forecast ETA")
+    ap.add_argument("--rate", type=float, default=2.45e11,
+                    help="scan rate in ints/s used for the forecast ETA "
+                         "(2.45e11 = measured at the 7.9e28 wall, gap-min 1664, "
+                         "P=150000, batch 96; docs 31.3)")
     ap.add_argument("--r-total", type=float, default=0.0,
                     help="total integers in the WHOLE campaign, for the forecast's "
                          "remaining-work lines (default 0 = --slices x --length, which "

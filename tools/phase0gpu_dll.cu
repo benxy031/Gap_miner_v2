@@ -143,17 +143,17 @@ P0GPU_EXPORT int p0gpu_walk(const void *bm, unsigned long long nwords,
                             unsigned block, void *stream) {
     switch (w_test_mode(ahi)) {
     case 2:
-        walk_kernel7<2><<<grid, block, 0, (cudaStream_t)stream>>>(
+        walk_kernel7<2, 0><<<grid, block, 0, (cudaStream_t)stream>>>(
             (const uint64_t *)bm, nwords, alo, ahi, (const uint32_t *)wtab,
             min_gap, (w_gaprec_t *)out, cap, (unsigned long long *)stats);
         break;
     case 1:
-        walk_kernel7<1><<<grid, block, 0, (cudaStream_t)stream>>>(
+        walk_kernel7<1, 0><<<grid, block, 0, (cudaStream_t)stream>>>(
             (const uint64_t *)bm, nwords, alo, ahi, (const uint32_t *)wtab,
             min_gap, (w_gaprec_t *)out, cap, (unsigned long long *)stats);
         break;
     default:
-        walk_kernel7<0><<<grid, block, 0, (cudaStream_t)stream>>>(
+        walk_kernel7<0, 0><<<grid, block, 0, (cudaStream_t)stream>>>(
             (const uint64_t *)bm, nwords, alo, ahi, (const uint32_t *)wtab,
             min_gap, (w_gaprec_t *)out, cap, (unsigned long long *)stats);
         break;

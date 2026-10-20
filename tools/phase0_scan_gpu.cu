@@ -187,6 +187,17 @@ static int g_walk_off = 0;          /* P0_WALK_OFF=1: skip the walk launches
 static int g_walk_testmode = -1;    /* P0_WALK_TESTMODE=0|1|2: force the walk's
                                        primality variant (perig/lazy/canonical)
                                        instead of the magnitude dispatch */
+static unsigned long long g_scan_cyc = 0, g_test_cyc = 0;   /* PROF sums */
+static int g_walk_prof = 0;         /* P0_WALK_PROF=1: instrument the walk kernel
+                                       (scan vs test cycles, stats[2..3]) */
+static uint32_t g_item_chunk = 256;  /* P0_ITEM_CHUNK: marks per mark-kernel item
+                                       row (multiple of 8, default 256).  Longer
+                                       rows amortise the per-row setup. */
+static int g_wk_grid = 0;           /* P0_WK_GRID=N: walk-kernel CTA count
+                                       (0 = 46, the historical value = 512
+                                       threads/SM = 33 % occupancy) */
+static int g_wk_block = 0;          /* P0_WK_BLOCK=N: walk-kernel threads/CTA
+                                       (0 = 512) */
 /* --smooth: smooth-run census (longest run of consecutive gaps <= g).  One
    observer per worker thread; the final report merges CLOSED runs only, so
    the run still open at the end - and any run crossing a thread slice - is
@@ -1490,6 +1501,19 @@ static int run_walk_engine(void) {
             else fprintf(stderr, "[phase0-gpu] P0_WALK_TESTMODE %d out of range"
                                 " [0,2]; using the magnitude dispatch\n", v);
         }
+        ev = getenv("P0_WK_GRID");
+        if (ev) { int v = atoi(ev); if (v >= 1 && v <= 4096) g_wk_grid = v; }
+        ev = getenv("P0_WK_BLOCK");
+        if (ev) { int v = atoi(ev); if (v >= 32 && v <= 1024) g_wk_block = v; }
+        ev = getenv("P0_WALK_PROF");
+        if (ev) g_walk_prof = (atoi(ev) != 0);
+        ev = getenv("P0_ITEM_CHUNK");
+        if (ev) {
+            int v = atoi(ev);
+            if (v >= 8 && v <= 4096) g_item_chunk = (uint32_t)(v & ~7);
+            else fprintf(stderr, "[phase0-gpu] P0_ITEM_CHUNK %d out of range"
+                                " [8,4096]; using 256\n", v);
+        }
         if (g_mark_nostore || g_walk_off || g_walk_testmode >= 0)
             fprintf(stderr, "[phase0-gpu] DIAG: mark_nostore=%d walk_off=%d"
                             " walk_testmode=%d (not a production setting)\n",
@@ -1498,8 +1522,8 @@ static int run_walk_engine(void) {
             die("P0_MARK_NOSTORE=1 skips the bitmap write; add P0_WALK_OFF=1 "
                 "(the walk would otherwise read an unmarked bitmap)");
     }
-    const uint32_t wk_grid = 46, wk_block = 512;
-
+    const uint32_t wk_grid = g_wk_grid ? (uint32_t)g_wk_grid : 46;
+    const uint32_t wk_block = g_wk_block ? (uint32_t)g_wk_block : 512;
     u128 A = ((g_start | 1) / 30u) * 30u;
     uint64_t Alo = (uint64_t)A, Ahi = (uint64_t)(A >> 64);
     u128 range_end = g_start + (u128)g_len;
@@ -1567,10 +1591,11 @@ static int run_walk_engine(void) {
         perm[pm] = m;
         for (int x = 1; x < 30; x++) if ((pm * x) % 30 == 1) pinv[pm] = (uint32_t)x;
     }
+    const uint32_t itemChunk = g_item_chunk;   /* marks per item row */
     size_t icap2 = 0;
     for (size_t i = 0; i < np; i++) {
         if (hp[i] <= 13u) continue;
-        icap2 += (size_t)((tileSlots / hp[i] + 2 + 255) / 256);
+        icap2 += (size_t)((tileSlots / hp[i] + 2 + (itemChunk - 1)) / itemChunk);
     }
     uint32_t *h_ip2 = (uint32_t *)malloc(icap2 * 4), *h_ik2 = (uint32_t *)malloc(icap2 * 4);
     if (!h_ip2 || !h_ik2) die("walk item alloc failed");
@@ -1578,7 +1603,7 @@ static int run_walk_engine(void) {
     for (size_t i = 0; i < np; i++) {
         if (hp[i] <= 13u) continue;
         uint64_t marks = tileSlots / hp[i] + 2;
-        uint32_t chunks = (uint32_t)((marks + 255) / 256);
+        uint32_t chunks = (uint32_t)((marks + (itemChunk - 1)) / itemChunk);
         for (uint32_t c = 0; c < chunks; c++) { h_ip2[nii2] = (uint32_t)i; h_ik2[nii2] = c; nii2++; }
     }
     uint32_t h_wpidx[3] = {0, 0, 0};
@@ -1620,7 +1645,7 @@ static int run_walk_engine(void) {
     /* P0_PIPE: two result/stat slots, one per alternating bitmap region, so a
        batch's walk can stay in flight while the previous batch is collected. */
     e = cudaMalloc(&d_out, 2 * (size_t)(1u << 20) * sizeof(w_gaprec_t)); if (e != cudaSuccess) die_cuda(e, "gap buffer alloc");
-    e = cudaMalloc(&d_stats, 4 * sizeof(unsigned long long)); if (e != cudaSuccess) die_cuda(e, "stats alloc");
+    e = cudaMalloc(&d_stats, 8 * sizeof(unsigned long long)); if (e != cudaSuccess) die_cuda(e, "stats alloc");
     cudaMemcpy(d_p, hp, np * 8, cudaMemcpyHostToDevice);
     cudaMemcpy(d_iv, h_iv, np * 8, cudaMemcpyHostToDevice);
     cudaMemcpy(d_r, h_r, np * 8, cudaMemcpyHostToDevice);
@@ -1756,7 +1781,7 @@ static int run_walk_engine(void) {
                                        (uint64_t)Aj, (uint64_t)(Aj >> 64),
                                        tileSlots, tilesPerBlockC, lastTileSlots,
                                        bm + j * cWords, tileWords, d_wpidx, 1,
-                                       g_mark_nostore,
+                                       g_mark_nostore, itemChunk,
                                        sg_grid, sg_block, (size_t)tileWords * 8,
                                        sA) != 0)
                     die("p0gpu_class30_sieve failed");
@@ -1765,19 +1790,23 @@ static int run_walk_engine(void) {
                 case 1: class30_sieve_kernel<1><<<sg_grid, sg_block, (size_t)tileWords * 8, sA>>>(
                     d_p, d_iv, d_r, d_ip2, d_ik2, (uint32_t)nii2,
                     (uint64_t)Aj, (uint64_t)(Aj >> 64), tileSlots, tilesPerBlockC,
-                    lastTileSlots, bm + j * cWords, tileWords, d_wpidx, 1); break;
+                    lastTileSlots, bm + j * cWords, tileWords, d_wpidx, 1,
+                    itemChunk); break;
                 case 2: class30_sieve_kernel<2><<<sg_grid, sg_block, (size_t)tileWords * 8, sA>>>(
                     d_p, d_iv, d_r, d_ip2, d_ik2, (uint32_t)nii2,
                     (uint64_t)Aj, (uint64_t)(Aj >> 64), tileSlots, tilesPerBlockC,
-                    lastTileSlots, bm + j * cWords, tileWords, d_wpidx, 1); break;
+                    lastTileSlots, bm + j * cWords, tileWords, d_wpidx, 1,
+                    itemChunk); break;
                 case 3: class30_sieve_kernel<3><<<sg_grid, sg_block, (size_t)tileWords * 8, sA>>>(
                     d_p, d_iv, d_r, d_ip2, d_ik2, (uint32_t)nii2,
                     (uint64_t)Aj, (uint64_t)(Aj >> 64), tileSlots, tilesPerBlockC,
-                    lastTileSlots, bm + j * cWords, tileWords, d_wpidx, 1); break;
+                    lastTileSlots, bm + j * cWords, tileWords, d_wpidx, 1,
+                    itemChunk); break;
                 default: class30_sieve_kernel<0><<<sg_grid, sg_block, (size_t)tileWords * 8, sA>>>(
                     d_p, d_iv, d_r, d_ip2, d_ik2, (uint32_t)nii2,
                     (uint64_t)Aj, (uint64_t)(Aj >> 64), tileSlots, tilesPerBlockC,
-                    lastTileSlots, bm + j * cWords, tileWords, d_wpidx, 1); break;
+                    lastTileSlots, bm + j * cWords, tileWords, d_wpidx, 1,
+                    itemChunk); break;
                 }
 #endif
                 e = cudaGetLastError();
@@ -1789,7 +1818,7 @@ static int run_walk_engine(void) {
             /* d_stats must be zeroed per batch as well: the kernel accumulates with
                atomicAdd and the host sums the per-batch values (without this the
                cumulative counts are summed again, over-reporting tests/jumps). */
-            e = cudaMemsetAsync(st_r, 0, 2 * sizeof(unsigned long long), sB); if (e != cudaSuccess) die_cuda(e, "stats reset");
+            e = cudaMemsetAsync(st_r, 0, 4 * sizeof(unsigned long long), sB); if (e != cudaSuccess) die_cuda(e, "stats reset");
             e = cudaEventRecord(evX[r], sB); if (e != cudaSuccess) die_cuda(e, "record evX");
 #ifdef PHASE0_KERNEL_DLL
             if (p0gpu_walk(bm, cnb * cWords, (uint64_t)Ab, (uint64_t)(Ab >> 64),
@@ -1804,14 +1833,27 @@ static int run_walk_engine(void) {
             int tmode = (g_walk_testmode >= 0)
                       ? g_walk_testmode : w_test_mode((uint64_t)(Ab >> 64));
             if (!g_walk_off) {
+            if (g_walk_prof) {
+                switch (tmode) {
+                case 2: walk_kernel7<2, 1><<<wk_grid, wk_block, 0, sB>>>(bm, cnb * cWords,
+                            (uint64_t)Ab, (uint64_t)(Ab >> 64), d_wtab,
+                            (uint32_t)gapmin, out_r, 1u << 20, st_r); break;
+                case 1: walk_kernel7<1, 1><<<wk_grid, wk_block, 0, sB>>>(bm, cnb * cWords,
+                            (uint64_t)Ab, (uint64_t)(Ab >> 64), d_wtab,
+                            (uint32_t)gapmin, out_r, 1u << 20, st_r); break;
+                default: walk_kernel7<0, 1><<<wk_grid, wk_block, 0, sB>>>(bm, cnb * cWords,
+                            (uint64_t)Ab, (uint64_t)(Ab >> 64), d_wtab,
+                            (uint32_t)gapmin, out_r, 1u << 20, st_r); break;
+                }
+            } else
             switch (tmode) {
-            case 2: walk_kernel7<2><<<wk_grid, wk_block, 0, sB>>>(bm, cnb * cWords,
+            case 2: walk_kernel7<2, 0><<<wk_grid, wk_block, 0, sB>>>(bm, cnb * cWords,
                         (uint64_t)Ab, (uint64_t)(Ab >> 64), d_wtab,
                         (uint32_t)gapmin, out_r, 1u << 20, st_r); break;
-            case 1: walk_kernel7<1><<<wk_grid, wk_block, 0, sB>>>(bm, cnb * cWords,
+            case 1: walk_kernel7<1, 0><<<wk_grid, wk_block, 0, sB>>>(bm, cnb * cWords,
                         (uint64_t)Ab, (uint64_t)(Ab >> 64), d_wtab,
                         (uint32_t)gapmin, out_r, 1u << 20, st_r); break;
-            default: walk_kernel7<0><<<wk_grid, wk_block, 0, sB>>>(bm, cnb * cWords,
+            default: walk_kernel7<0, 0><<<wk_grid, wk_block, 0, sB>>>(bm, cnb * cWords,
                         (uint64_t)Ab, (uint64_t)(Ab >> 64), d_wtab,
                         (uint32_t)gapmin, out_r, 1u << 20, st_r); break;
             }
@@ -1837,7 +1879,7 @@ static int run_walk_engine(void) {
                 if (cudaEventElapsedTime(&ms, evX[prev_r], evW[prev_r]) == cudaSuccess) t_walk_gpu += (double)ms * 1e-3;
             }
             uint32_t ng = 0;
-            unsigned long long st2[2] = {0, 0};
+            unsigned long long st2[4] = {0, 0, 0, 0};
             /* The collect copies MUST NOT use the legacy default stream: a
                synchronous cudaMemcpy there serializes against EVERY blocking
                stream (implicit sync), i.e. it waits for the next batch's marks
@@ -1847,7 +1889,7 @@ static int run_walk_engine(void) {
                sC is a private stream and the source data is already final
                (the host synchronized evW[prev_r] above). */
             e = cudaMemcpyAsync(&ng, (char *)out_p + 8, 4, cudaMemcpyDeviceToHost, sC); if (e != cudaSuccess) die_cuda(e, "gap count copy");
-            e = cudaMemcpyAsync(st2, st_p, 16, cudaMemcpyDeviceToHost, sC); if (e != cudaSuccess) die_cuda(e, "stats copy");
+            e = cudaMemcpyAsync(st2, st_p, 32, cudaMemcpyDeviceToHost, sC); if (e != cudaSuccess) die_cuda(e, "stats copy");
             e = cudaStreamSynchronize(sC); if (e != cudaSuccess) die_cuda(e, "collect sync");
             if (ng > (1u << 20) - 1) {
                 fprintf(stderr, "[phase0-gpu] FATAL: walk gap buffer overflow (ng=%u)\n", ng);
@@ -1855,6 +1897,8 @@ static int run_walk_engine(void) {
             }
             wj.tests += st2[0];
             jumps_total += st2[1];
+            g_scan_cyc += st2[2];
+            g_test_cyc += st2[3];
             wj.batches++;
             if (ng) {
                 e = cudaMemcpyAsync(hgaps, out_p + 1, (size_t)ng * sizeof(w_gaprec_t), cudaMemcpyDeviceToHost, sC);
@@ -1925,6 +1969,15 @@ static int run_walk_engine(void) {
                (unsigned long long)wj.batches, (unsigned long long)wj.tests,
                wall > 0 ? (double)wj.tests / wall : 0.0,
                jumps_total > 0 ? (double)wj.tests / (double)jumps_total : 0.0);
+        if (g_walk_prof && (g_scan_cyc + g_test_cyc) > 0) {
+            double tot = (double)(g_scan_cyc + g_test_cyc);
+            printf("[phase0-gpu] PROF walk split (thread-clock cycles, "
+                   "clock64 overhead included): scan=%.1f%% test=%.1f%%  "
+                   "scan_cyc=%.3e test_cyc=%.3e\n",
+                   100.0 * (double)g_scan_cyc / tot,
+                   100.0 * (double)g_test_cyc / tot,
+                   (double)g_scan_cyc, (double)g_test_cyc);
+        }
         if (t_mark_gpu + t_walk_gpu > 0.0) {
             double other = wall - t_mark_gpu - t_walk_gpu;
             printf("[phase0-gpu] stage split (GPU events): mark=%.1f s (%.1f%%)  "

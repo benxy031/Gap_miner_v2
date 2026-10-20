@@ -80,7 +80,8 @@ __global__ static void class30_sieve_kernel(const uint64_t * __restrict__ primes
                                             uint64_t lastSlots,
                                             uint64_t * __restrict__ g_bm,
                                             uint32_t tileWords,
-                                            const uint32_t * __restrict__ wpidx, int wheel_on) {
+                                            const uint32_t * __restrict__ wpidx, int wheel_on,
+                                            uint32_t itemChunk) {
     extern __shared__ uint64_t sh[];
     __shared__ uint64_t wpat[127];
     __shared__ uint32_t wpj[24];
@@ -226,9 +227,14 @@ __global__ static void class30_sieve_kernel(const uint64_t * __restrict__ primes
                 for (int st = 0; st < 8; st++)
                     step[st] = k8 * s_dm8[(j + (uint32_t)st) & 7u] + tp[st];
             }
-            uint32_t p32 = pos_base + 256u * cur_p * k0;
+            /* itemChunk marks per item row (P0_ITEM_CHUNK, default 256).  One
+               group is 8 marks (the class cycle advances m by 30), so a chunk
+               advances the slot by itemChunk*p and the row stride below must
+               match: a long row amortises the per-row (per-prime) setup that
+               dominates the mark at deep sieve depths. */
+            uint32_t p32 = pos_base + itemChunk * cur_p * k0;
             if (p32 >= slots) continue;
-            for (int r8 = 0; r8 < 32; r8++) {
+            for (uint32_t r8 = 0; r8 < (itemChunk >> 3); r8++) {
                 int done = 0;
 #pragma unroll
                 for (int st = 0; st < 8; st++) {
@@ -331,7 +337,41 @@ __host__ static inline int w_test_mode(uint64_t Ahi) {
     return 0;
 }
 
-template<int TESTMODE>
+/* P0_WALK_PROF instrumentation (docs section 34.2): split the walk's time into
+   bitmap SCANNING (w_nextCand/w_prevCand) and primality TESTING.  Compiled in
+   only through the PROF template parameter, so the production instantiation is
+   byte-identical to the un-instrumented one.  clock64() itself costs a few
+   cycles per bracket, so the absolute percentages carry that overhead; the
+   RATIO between scan and test is what the experiment reads. */
+template<int PROF>
+__device__ __forceinline__ static int64_t wscan_next(const uint64_t *bm, uint64_t nw,
+                                                     int64_t pos, unsigned long long &acc) {
+    if (!PROF) return w_nextCand(bm, nw, pos);
+    unsigned long long t0 = clock64();
+    int64_t r = w_nextCand(bm, nw, pos);
+    acc += clock64() - t0;
+    return r;
+}
+template<int PROF>
+__device__ __forceinline__ static int64_t wscan_prev(const uint64_t *bm,
+                                                     int64_t pos, unsigned long long &acc) {
+    if (!PROF) return w_prevCand(bm, pos);
+    unsigned long long t0 = clock64();
+    int64_t r = w_prevCand(bm, pos);
+    acc += clock64() - t0;
+    return r;
+}
+template<int PROF, int MODE>
+__device__ __forceinline__ static int wtest_prof(uint64_t v, uint64_t ahi,
+                                                 unsigned long long &acc) {
+    if (!PROF) return w_is_probable_prime<MODE>(v, ahi);
+    unsigned long long t0 = clock64();
+    int r = w_is_probable_prime<MODE>(v, ahi);
+    acc += clock64() - t0;
+    return r;
+}
+
+template<int TESTMODE, int PROF>
 __global__ static void walk_kernel7(const uint64_t *__restrict__ bm, uint64_t nwords,
                                     uint64_t Alo, uint64_t Ahi,
                                     const uint32_t *__restrict__ wtab,
@@ -349,13 +389,13 @@ __global__ static void walk_kernel7(const uint64_t *__restrict__ bm, uint64_t nw
     int64_t hi = (tid + 1 == total) ? (int64_t)nslots : lo + (int64_t)sliceLen;
     if (lo >= hi || sliceLen == 0) return;
     const int64_t end = (int64_t)nslots;
-    unsigned long long tests = 0, jumps = 0;
-    int64_t c = w_nextCand(bm, nwords, lo);
+    unsigned long long tests = 0, jumps = 0, scanCyc = 0, testCyc = 0;
+    int64_t c = wscan_next<PROF>(bm, nwords, lo, scanCyc);
     while (c >= 0) {
         tests++;
         uint64_t v = Alo + 30ull * ((uint64_t)c >> 3) + (uint64_t)scls[c & 7u];
-        if (w_is_probable_prime<TESTMODE>(v, Ahi)) break;
-        c = w_nextCand(bm, nwords, c + 1);
+        if (wtest_prof<PROF, TESTMODE>(v, Ahi, testCyc)) break;
+        c = wscan_next<PROF>(bm, nwords, c + 1, scanCyc);
     }
     if (c < 0) { atomicAdd(&stats[0], tests); return; }
     int64_t p = c;
@@ -363,16 +403,16 @@ __global__ static void walk_kernel7(const uint64_t *__restrict__ bm, uint64_t nw
     if (s >= end) { atomicAdd(&stats[0], tests); return; }
     for (;;) {
         if (p >= hi) goto done7;
-        s = w_prevCand(bm, s);
+        s = wscan_prev<PROF>(bm, s, scanCyc);
         if (s < 0) goto done7;
         if (s == p) {
             int64_t q = p + (int64_t)wtab[p & 7];
             for (;;) {
-                q = w_nextCand(bm, nwords, q);
+                q = wscan_next<PROF>(bm, nwords, q, scanCyc);
                 if (q < 0) goto done7;
                 tests++;
                 uint64_t vq = Alo + 30ull * ((uint64_t)q >> 3) + (uint64_t)scls[q & 7u];
-                if (w_is_probable_prime<TESTMODE>(vq, Ahi)) {
+                if (wtest_prof<PROF, TESTMODE>(vq, Ahi, testCyc)) {
                     uint64_t vp = Alo + 30ull * ((uint64_t)p >> 3) + (uint64_t)scls[p & 7u];
                     uint32_t gap = (uint32_t)(vq - vp);
                     if (gap >= minGapVal) {
@@ -391,7 +431,7 @@ __global__ static void walk_kernel7(const uint64_t *__restrict__ bm, uint64_t nw
         }
         tests++;
         uint64_t vs = Alo + 30ull * ((uint64_t)s >> 3) + (uint64_t)scls[s & 7u];
-        if (w_is_probable_prime<TESTMODE>(vs, Ahi)) {
+        if (wtest_prof<PROF, TESTMODE>(vs, Ahi, testCyc)) {
             p = s;
             jumps++;
             s = p + (int64_t)wtab[p & 7];
@@ -403,6 +443,7 @@ __global__ static void walk_kernel7(const uint64_t *__restrict__ bm, uint64_t nw
 done7:
     atomicAdd(&stats[0], tests);
     atomicAdd(&stats[1], jumps);
+    if (PROF) { atomicAdd(&stats[2], scanCyc); atomicAdd(&stats[3], testCyc); }
 }
 
 #endif /* P0_WALK_KERN_CUH */

@@ -276,6 +276,55 @@ scripts/record_rate_model.py --shift-scan 900,1000,1017,1050       # shift/size 
                                      # scan header prints the natural reference
                                      # (scripts/hl_natural.py) next to the
                                      # anchors so the difference is visible.
+scripts/record_rate_model.py gap_hunt_records_f1.txt --trunc-scan use
+                                     # --trunc-scan report|use, DEFAULT report.
+                                     # Scans the truncation point and prints the
+                                     # sigma profile; `use` makes the detected
+                                     # plateau the anchor of the fit instead of
+                                     # the file's smallest merit (an order
+                                     # statistic).  Measured 2026-10-25 on the
+                                     # fleet log: anchored at the observed
+                                     # minimum sigma=1.635 and E=98 records;
+                                     # plateau from m0=23.615 gives
+                                     # sigma=1.227+-0.021 and E=49, against 27
+                                     # observed.  A flat profile ("sigma flat
+                                     # from the observed minimum") means the
+                                     # sample really is cut at a fixed floor --
+                                     # the wall corpus and both hunt corpora
+                                     # report flat, so nothing needs fixing
+                                     # there.  Also WARNs when the L spread is
+                                     # < 1%: at a single geometry merit is
+                                     # g/L exactly, so "beats its length's
+                                     # record" is deterministic and E is a
+                                     # redraw expectation, not a count (the
+                                     # wall shows 2 records from the 4-dp
+                                     # reported merit vs 95 from the
+                                     # length-derived merit -- ties decided in
+                                     # the 4th decimal).  Use E to compare
+                                     # geometries, the margins for status.
+scripts/sieve_limit_records.py --gaps data/p0_walk_wall_c29_g1664.log \
+        --events-per-int 3.64e-14 --table data/prime_gap_merits.txt
+                                     # records/s as a function of the SIEVE LIMIT
+                                     # (local port of Seth Troisi's
+                                     # `prob_record_vs_plimit`).  Default cost
+                                     # points = `--reference phase0` (measured
+                                     # 2026-10-01 on the RTX 3070: 1e7/3e7/1e8 ->
+                                     # 1.075e10/9.009e9/5.495e9 ints/s); pass
+                                     # --point LIMIT:INTS_PER_S to substitute.
+                                     # --events-per-int is REQUIRED to mean
+                                     # anything: P(record|gap) is measured over
+                                     # LOGGED gaps, so it must be multiplied by
+                                     # logged events per integer (omit it and 1/L
+                                     # is assumed, i.e. "the log lists every
+                                     # pair").  In a COMPLETE scan the sweep is
+                                     # 1/cost shaped: the sieve limit cannot
+                                     # change which primes exist, so the
+                                     # throughput optimum IS the records/s
+                                     # optimum.  --check-invariance LOG_A LOG_B
+                                     # falsifies that claim on two logs taken at
+                                     # different sieve limits; --truncate
+                                     # TESTS_PER_S shows the interior optimum a
+                                     # test-budget-limited search would have.
 scripts/tail_compare.py data/gap_hunt_records_f1.txt data/gap_hunt_records_f2.txt
                                      # cover A/B tail comparison; the verdict M0
                                      # auto-clamps to the data's own report

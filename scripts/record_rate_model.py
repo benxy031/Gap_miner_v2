@@ -254,6 +254,87 @@ def fit_sigma(merits, m0):
     return sigma, sigma / math.sqrt(n), n
 
 
+def truncation_scan(merits, span=3.0, step=0.05, window=0.5, min_n=200,
+                    tol_rel=0.03):
+    """Locate the truncation point FROM THE DATA instead of assuming it.
+
+    sigma(m0) = mean(m | m >= m0) - m0 is the truncated-exponential MLE.  For a
+    sample genuinely cut at a fixed floor sigma is FLAT in m0; wherever it
+    moves, either the floor is in the wrong place or the tail is not
+    exponential.  Anchoring at the observed minimum -- the tempting choice, and
+    the one this script used to make -- reads the profile at its worst point:
+    the minimum is a single order statistic, and any edge leak (a report
+    threshold applied to a differently-computed merit, a few stragglers logged
+    below the nominal cut) leaves a deficit right at the edge that inflates
+    sigma for every depth above it.
+
+    Measured instance (fleet corpus 2026-10-25, 3591 gaps): sigma = 1.635 at the
+    observed minimum 23.1652 but 1.204 +- 0.021 from m0 = 23.7 upward, with the
+    first 0.5-merit bin holding 203 gaps where the fitted exponential expected
+    946.  E[records] went 98.1 -> 48.6 from this alone.
+
+    Returns {m0, sigma, se, n, at_floor, profile} where `profile` is the whole
+    scanned (m0, sigma, n) grid so the caller can print it, and `at_floor`
+    flags a scan that never left the first grid point (i.e. a clean
+    fixed-floor sample, like a full scan with an absolute gap floor).
+    """
+    M = sorted(merits)
+    n = len(M)
+    if n < min_n:
+        return None
+    profile = []
+    i = 0
+    for k in range(int(round(span / step)) + 1):
+        x = M[0] + k * step
+        while i < n and M[i] < x:
+            i += 1
+        m = n - i
+        if m <= 0:
+            break
+        profile.append((x, sum(M[i:]) / m - x, m))
+    if len(profile) < 3:
+        return None
+
+    def at(j):
+        """index of the first grid point at least `window` above point j"""
+        for t in range(j + 1, len(profile)):
+            if profile[t][0] - profile[j][0] >= window - 1e-9:
+                return t
+        return None
+
+    best = None
+    for j in range(len(profile)):
+        if profile[j][2] < min_n:
+            continue
+        t = at(j)
+        if t is None or profile[t][2] < min_n:
+            continue
+        rel = abs(profile[t][1] - profile[j][1]) / profile[j][1]
+        if rel <= tol_rel:
+            best = j
+            break
+    if best is None:
+        # no plateau: fall back to the least-steep point on the grid
+        cand = []
+        for j in range(len(profile)):
+            if profile[j][2] < min_n:
+                continue
+            t = at(j)
+            if t is None:
+                continue
+            cand.append((abs(profile[t][1] - profile[j][1]) / profile[j][1], j))
+        if not cand:
+            return None
+        best = min(cand)[1]
+
+    m0, sg, cnt = profile[best]
+    return {
+        "m0": m0, "sigma": sg, "se": sg / math.sqrt(cnt), "n": cnt,
+        "at_floor": best == 0, "profile": profile,
+        "sigma_floor": profile[0][1],
+    }
+
+
 # --------------------------------------------------------------------------
 # the model
 # --------------------------------------------------------------------------
@@ -418,6 +499,20 @@ def analyse(path, rows, table, m0, args):
     sigma, se, n_tail = fit_sigma(merits, m0)
     res["sigma"], res["sigma_se"], res["n_tail"] = sigma, se, n_tail
 
+    # --- truncation-point scan -------------------------------------------
+    # The fit above is anchored at `m0`, which `main` clamps to the smallest
+    # merit in the data.  That anchor is an order statistic, not a measurement
+    # of the reporting edge, so scan it and let the data place the floor.
+    scan = truncation_scan(merits, min_n=max(200, len(merits) // 20))
+    res["trunc"] = scan
+    if scan and getattr(args, "trunc_scan", "report") == "use" \
+            and not scan["at_floor"]:
+        m0 = scan["m0"]
+        sigma, se, n_tail = scan["sigma"], scan["se"], scan["n"]
+        res["sigma"], res["sigma_se"], res["n_tail"] = sigma, se, n_tail
+        res["m0_used"] = m0
+        res["trunc_used"] = True
+
     # --- tail-shape families (extrapolation above u_rec) ------------------
     # Empirical survival below u_rec, fitted family above it, so exp /
     # stretched / gpd differ ONLY in the extrapolation.  u_rec = m0 reproduces
@@ -501,6 +596,15 @@ def analyse(path, rows, table, m0, args):
     res["expected"] = p * res["n"]
     res["p_zero"] = math.exp(-res["expected"]) if res["expected"] < 700 else 0.0
     res["gaps_per_record"] = (1.0 / p) if p > 0 else float("inf")
+
+    # what the same data predicts with the floor placed by the scan instead of
+    # by the observed minimum (see truncation_scan); reported next to the
+    # headline so the two anchors are always visible together.
+    if scan and not scan["at_floor"]:
+        ent_t = reachable_entries(table, L, scan["m0"], scan["sigma"], 0.0)
+        p_t = p_record(ent_t, L, scan["sigma"], scan["m0"])
+        res["trunc_p"] = p_t
+        res["trunc_expected"] = p_t * res["n"]
 
     qs = {}
     for q in (0.05, 0.25, 0.5, 0.75, 0.95):
@@ -741,6 +845,37 @@ def report(res):
     print(f"  INFER expected records           : {res['expected']:.3f}"
           f"   -> P(observe 0) = {res['p_zero']:.3f}")
     print(f"  INFER gaps per record            : {res['gaps_per_record']:.3e}")
+    sc = res.get("trunc") or {}
+    if sc and not sc.get("at_floor"):
+        print(f"  DIAG  truncation scan            : sigma={sc['sigma_floor']:.4f} at"
+              f" the observed minimum {sc['profile'][0][0]:.4f} -> plateau"
+              f" {sc['sigma']:.4f} +- {sc['se']:.4f} from m0={sc['m0']:.4f}"
+              f" (n={sc['n']})")
+        print("        profile m0:sigma "
+              + "  ".join(f"{x:.1f}:{s:.2f}"
+                          for x, s, _ in sc["profile"][::max(1, len(sc["profile"]) // 8)]))
+        if "trunc_expected" in res:
+            tag = "(HEADLINE)" if res.get("trunc_used") else f"(headline {res['expected']:.2f})"
+            print(f"  INFER E with the scanned floor   : {res['trunc_expected']:.2f}"
+                  f"   {tag}")
+    elif sc:
+        print(f"  DIAG  truncation scan            : sigma flat from the observed"
+              f" minimum ({sc['sigma']:.4f}) -> the sample IS cut at a fixed floor")
+    # A single-geometry corpus cannot be used to MEASURE a record rate: at fixed
+    # ln(start) the merit of a gap is g/L exactly, so "beats its length's record"
+    # is a deterministic comparison, not a probability.  E above is then the
+    # expectation over a REDRAW of the same geometry, and near-ties against our
+    # own frontier (merit set at this very L) make even the observed count a
+    # rounding artefact - measured 2026-10-25 on the wall corpus: 2 records from
+    # the 4-dp reported merit vs 95 from the length-derived merit.
+    if res.get("L_spread_pct", 0.0) < 1.0:
+        warn = (".  SINGLE GEOMETRY" if res.get("L_spread_pct", 0.0) < 1.0 else "")
+        print(f"  WARN  L spread {res['L_spread_pct']:.3f}% < 1%{warn}: merit is a"
+              " deterministic function of the gap length here, so")
+        print("        E is a REDRAW expectation, not a count; ties against our"
+              " own frontier at this L decide the observed count")
+        print("        at the 4th decimal. Use E for comparing geometries and the"
+              " observed margins for status.")
     q = res.get("dbest_q", {})
     if q:
         print("  INFER predicted d_best quantiles : "
@@ -868,6 +1003,14 @@ def main():
     ap.add_argument("--shift-scan", default=None,
                     help="rank shifts by gaps/record, e.g. '258,450,507' or"
                          " '200:1050:50' (offline, model-based)")
+    ap.add_argument("--trunc-scan", choices=("report", "use"), default="report",
+                    help="scan the truncation point instead of trusting the "
+                         "observed minimum merit. 'report' (default) prints "
+                         "the sigma profile and the E it would give; 'use' "
+                         "makes the scanned plateau the headline anchor. Use "
+                         "'report' first: a flat profile means the sample "
+                         "really is cut at a fixed floor and there is nothing "
+                         "to fix.")
     ap.add_argument("--sigma-fixed", type=float, default=None,
                     help="use one sigma for every shift (removes the sigma(L)"
                          " extrapolation from the scan)")

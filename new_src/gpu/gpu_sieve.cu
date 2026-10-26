@@ -126,6 +126,19 @@ struct gpu_sieve_ctx {
     unsigned int *d_count;      /* survivor counter (written by the scan);
                                    its HIGH BIT is set when a survivor did
                                    not fit the candidate-buffer capacity */
+    unsigned int *h_count_pinned; /* PINNED mirror of d_count (see the
+                                   readback in gpu_sieve_extract_pack_impl:
+                                   a pageable 4-byte D2H cannot be a real
+                                   async DMA and costs a driver round trip
+                                   per window) */
+    /* Deferred per-window counts (gpu_sieve_defer_prepare +
+       gpu_sieve_extract_pack_device_defer).  The hunt fills K windows per
+       flight and used to take ONE stream sync per window just to learn that
+       window's survivor count; here the counts land in d_counts[i] and the
+       whole flight is read back with one D2H.  Filled by gpu_sieve_defer_prepare. */
+    unsigned int *d_counts;
+    unsigned int *h_counts_pinned;
+    size_t counts_cap;
     size_t max_candidates;
     uint32_t extract_accum;     /* K: candidate buffers sized K× per window
                                    (MR batch accumulation across windows) */
@@ -2933,9 +2946,20 @@ __global__ static void gpu_sieve_extract_pack_kernel(
    items map linearly onto ascending odd positions, so the result is bit-exact
    the same as the single-block scan however the blocks get scheduled.
    EXTRACT_MAX_BLOCKS covers 1023 words x 8 items = 8184 items = 32 blocks. */
-#define EXTRACT_ITEM_BITS 8
+/* 2026-10-25: item granularity is the extract's PARALLELISM knob, and 8 bits
+   left the GPU idle on a hunt window.  Measured at shift720/p98/m30
+   (54,122 slots = 846 words): ITEM_BITS=8 gives 6,768 items = 27 blocks of
+   256 threads, i.e. 4.7 warps/SM, and the extract stage measured 133 us per
+   window while the isolated mark pair costs 38 us -- the fill (181 us/window)
+   was extract-bound with 47 of 46+ SMs idle.  MAX_BLOCKS was 64, which also
+   capped the MINER's 4,224-word window (270,336 slots) at 64 blocks; it is now
+   2048 so neither geometry is capped (the K2 scan is one block of 256 threads
+   over par_blocks entries and stays a few us).  Any geometry whose item count
+   exceeds MAX_BLOCKS*TPB still falls back to the single-block kernel, so the
+   cap must stay well above the largest window. */
+#define EXTRACT_ITEM_BITS 2
 #define EXTRACT_TPB 256
-#define EXTRACT_MAX_BLOCKS 64
+#define EXTRACT_MAX_BLOCKS 2048
 /* Below this many items the three launches cost more than the single block
    saves; small ranges (quarter-mode tail slices) stay on the old kernel. */
 #define EXTRACT_PAR_MIN_ITEMS 512
@@ -3222,7 +3246,8 @@ static int gpu_sieve_extract_pack_impl(gpu_sieve_ctx *ctx,
                                        uint32_t base_mod60,
                                        uint64_t class_mask60,
                                        uint64_t region_start,
-                                       uint32_t slot_base)
+                                       uint32_t slot_base,
+                                       int defer_index)
 {
     if (!ctx || !bitmap || !base_limbs || !host_offsets || !host_count) {
         return 0;
@@ -3297,6 +3322,17 @@ static int gpu_sieve_extract_pack_impl(gpu_sieve_ctx *ctx,
     unsigned int cnt = 0;
     unsigned int ovf = 0;
     int attempt = 0;
+    /* Where the kernels publish this call's survivor count.  defer_index >= 0
+       means "this window's slot of the flight's count array": no host sync is
+       taken here, the caller reads the whole array once per flight. */
+    if (defer_index >= 0 &&
+        (!ctx->d_counts || (size_t)defer_index >= ctx->counts_cap))
+        return 0;
+    /* Resolved INSIDE the loop below (after the one-time realloc): the realloc
+       frees and re-creates ctx->d_count, so a pointer cached here would dangle
+       on the first extract of every context (measured: count read back as 0 ->
+       a silently truncated window). */
+    unsigned int *d_cnt = NULL;
 
     for (;;) {
         /* (Re)allocate the extract buffers if the capacity or the limb width
@@ -3379,6 +3415,12 @@ static int gpu_sieve_extract_pack_impl(gpu_sieve_ctx *ctx,
             ctx->active_limbs_capacity = active_limbs;
         }
 
+        /* Where this call's count goes: resolved HERE, after the realloc
+           above, so it can never point at a freed buffer. */
+        d_cnt = (defer_index >= 0) ? ctx->d_counts + defer_index
+                                   : ctx->d_count;
+        if (!d_cnt) return 0;
+
         /* Upload the base (independent of whether mark_from_base already did). */
         err = cudaMemcpyAsync(ctx->d_base_limbs, base_limbs,
                               (size_t)active_limbs * sizeof(*base_limbs),
@@ -3432,7 +3474,7 @@ static int gpu_sieve_extract_pack_impl(gpu_sieve_ctx *ctx,
                 bitmap, (uint32_t)n_items_sel, (uint32_t)w_lo, lo_odd, hi_odd,
                 half_filter, base_mod60, class_mask60, region_start,
                 first_odd_offset, ctx->d_ext_states, ctx->ext_epoch,
-                ctx->d_cands_aos[cand_buf & 1], ctx->d_offsets, ctx->d_count,
+                ctx->d_cands_aos[cand_buf & 1], ctx->d_offsets, d_cnt,
                 (uint32_t)ctx->max_candidates, slot_base, active_limbs,
                 ctx->d_base_limbs);
         } else if (par_blocks > 0) {
@@ -3444,19 +3486,19 @@ static int gpu_sieve_extract_pack_impl(gpu_sieve_ctx *ctx,
                 half_filter, base_mod60, class_mask60, region_start,
                 first_odd_offset, d_tot);
             gpu_sieve_extract_scan_kernel<<<1, EXTRACT_TPB, 0, ctx->stream>>>(
-                d_tot, par_blocks, d_base, ctx->d_count);
+                d_tot, par_blocks, d_base, d_cnt);
             gpu_sieve_extract_write_kernel<<<par_blocks, EXTRACT_TPB, 0,
                                              ctx->stream>>>(
                 bitmap, (uint32_t)n_items_sel, (uint32_t)w_lo, lo_odd, hi_odd,
                 half_filter, base_mod60, class_mask60, region_start,
                 first_odd_offset, d_base, ctx->d_cands_aos[cand_buf & 1],
-                ctx->d_offsets, ctx->d_count, (uint32_t)ctx->max_candidates,
+                ctx->d_offsets, d_cnt, (uint32_t)ctx->max_candidates,
                 slot_base, active_limbs, ctx->d_base_limbs);
         } else
         gpu_sieve_extract_pack_kernel<<<1, 1024, 0, ctx->stream>>>(
             bitmap, (uint64_t)words, odd_interval_size,
             first_odd_offset, ctx->d_base_limbs, active_limbs,
-            ctx->d_cands_aos[cand_buf & 1], ctx->d_offsets, ctx->d_count,
+            ctx->d_cands_aos[cand_buf & 1], ctx->d_offsets, d_cnt,
             (uint32_t)ctx->max_candidates, lo_odd, hi_odd, half_filter,
             base_mod60, class_mask60, region_start, slot_base);
         sieve_timing_end(ctx);
@@ -3469,6 +3511,33 @@ static int gpu_sieve_extract_pack_impl(gpu_sieve_ctx *ctx,
             return 0;
         }
 
+        if (defer_index >= 0) {
+            /* DEFERRED: the count stays in d_counts[defer_index] and the
+               offsets copy is issued over the window's WHOLE stride slice (the
+               count is not known yet), so it rides in stream order behind the
+               kernels.  Slots past the true count hold stale offsets but are
+               never read: the scan is bounded by b->count[i].
+
+               A single bulk copy of the flight's offset block at the flight
+               boundary was tried and is SLOWER (ABBA 2026-10-25: 5,277.9 vs
+               5,595.7 win/s = -5.7%): the 76 MB D2H then sits in the critical
+               path before the scan, while per-window copies interleave with
+               the GPU work and are free (the host side is hidden either way). */
+            size_t stride = (accum && ctx->cand_cap_limit)
+                                ? (size_t)(ctx->cand_cap_limit / accum) : 0;
+            if (stride == 0 ||
+                (uint64_t)slot_base + (uint64_t)stride >
+                    (uint64_t)ctx->max_candidates)
+                return 0;
+            err = cudaMemcpyAsync(host_offsets,
+                                  ctx->d_offsets + (size_t)slot_base,
+                                  stride * sizeof(uint64_t),
+                                  cudaMemcpyDeviceToHost, ctx->stream);
+            if (err != cudaSuccess) return 0;
+            if (host_count) *host_count = 0;
+            return 1;
+        }
+
         /* Read the survivor count first (async + stream sync), then copy only
            the valid entries.  Using a full-buffer copy would transfer ~1 MB of
            dead slots per window; using synchronous cudaMemcpy would insert
@@ -3478,7 +3547,24 @@ static int gpu_sieve_extract_pack_impl(gpu_sieve_ctx *ctx,
            fill-pipeline mode (the offset copy below rides in stream order). */
         cnt = 0;
         ovf = 0;
-        err = cudaMemcpyAsync(&cnt, ctx->d_count, sizeof(cnt),
+        /* PINNED destination: `&cnt` is a stack (pageable) address, so
+           cudaMemcpyAsync from it cannot be a real async DMA -- the driver
+           stages it and the round trip costs ~100 us.  The fill path pays this
+           readback once per WINDOW, and it was the dominant term of the fill
+           (measured 2026-10-25 at shift720/p98/m30, K=2048: the fill is
+           181 us/window while the extract kernel itself is ~10 us and the
+           mark pair ~24 us; the fill is insensitive to the mark chunk size,
+           the prime-table depth 2e5..1e7 and the extract kernel count).
+           Copy into ctx-owned pinned memory instead. */
+        if (!ctx->h_count_pinned) {
+            if (cudaHostAlloc((void **)&ctx->h_count_pinned,
+                              sizeof(unsigned int),
+                              cudaHostAllocDefault) != cudaSuccess)
+                ctx->h_count_pinned = NULL;
+        }
+        void *h_cnt = ctx->h_count_pinned ? (void *)ctx->h_count_pinned
+                                          : (void *)&cnt;
+        err = cudaMemcpyAsync(h_cnt, ctx->d_count, sizeof(cnt),
                               cudaMemcpyDeviceToHost, ctx->stream);
         if (err != cudaSuccess) return 0;
         err = cudaStreamSynchronize(ctx->stream);
@@ -3489,6 +3575,8 @@ static int gpu_sieve_extract_pack_impl(gpu_sieve_ctx *ctx,
                     cudaGetErrorString(err));
             return 0;
         }
+        if (ctx->h_count_pinned)
+            cnt = *ctx->h_count_pinned;
         if (cnt & 0x80000000U) {
             ovf = 1;
             cnt &= 0x7FFFFFFFU;
@@ -3636,7 +3724,7 @@ int gpu_sieve_extract_pack(gpu_sieve_ctx *ctx,
                                        active_limbs, host_cands_aos,
                                        host_offsets, host_count,
                                        base_mod60, class_mask60,
-                                       region_start, 0);
+                                       region_start, 0, -1);
 }
 
 /* Fused Stage 3: extract + pack keeping candidates on-device (no D→H cand
@@ -3662,7 +3750,7 @@ int gpu_sieve_extract_pack_device(gpu_sieve_ctx *ctx,
                                      ctx->d_bitmap[0], 0, base_limbs,
                                      active_limbs, NULL, host_offsets,
                                      host_count, base_mod60, class_mask60,
-                                     region_start, 0)) {
+                                     region_start, 0, -1)) {
         return 0;
     }
     *d_cands_out = ctx->d_cands_aos[0];
@@ -3695,7 +3783,7 @@ int gpu_sieve_extract_pack_device_range(gpu_sieve_ctx *ctx,
                                      base_limbs,
                                      active_limbs, NULL, host_offsets,
                                      host_count, base_mod60, class_mask60,
-                                     region_start, slot_base)) {
+                                     region_start, slot_base, -1)) {
         return 0;
     }
     *d_cands_out = ctx->d_cands_aos[cand_buf & 1];
@@ -3730,7 +3818,7 @@ int gpu_sieve_extract_pack_device_range_ex(gpu_sieve_ctx *ctx,
                                      base_limbs,
                                      active_limbs, NULL, host_offsets,
                                      host_count, base_mod60, class_mask60,
-                                     region_start, slot_base)) {
+                                     region_start, slot_base, -1)) {
         return 0;
     }
     *d_cands_out = ctx->d_cands_aos[cand_buf & 1] +
@@ -3766,12 +3854,103 @@ int gpu_sieve_extract_pack_device_range_bitmap(
                                      base_limbs,
                                      active_limbs, NULL, host_offsets,
                                      host_count, base_mod60, class_mask60,
-                                     region_start, slot_base)) {
+                                     region_start, slot_base, -1)) {
         return 0;
     }
     *d_cands_out = ctx->d_cands_aos[cand_buf & 1] +
                    (size_t)slot_base * (size_t)active_limbs;
     return 1;
+}
+
+/* ── Deferred per-window survivor counts ────────────────────────────────
+   The gap-hunt fill used to pay ONE cudaStreamSynchronize per window just to
+   learn that window's survivor count (it needs the count to place the next
+   window's survivors in the packed candidate buffer).  Measured 2026-10-25 at
+   shift720/p98/m40, K=2048: the fill is 179 us/window of which the isolated
+   kernels are ~53 us, and the per-window cost splits as ~147 us fixed +
+   0.59 ns/slot -- i.e. 82% of the wall is that fixed, per-window round trip.
+
+   With a FIXED per-window stride the placement is known WITHOUT the count, so:
+     gpu_sieve_defer_prepare(ctx, K)     -- count array + pinned mirror, once
+     ... gpu_sieve_extract_pack_device_defer(..., defer_index=i) per window
+     gpu_sieve_counts_request(ctx, K)    -- one D2H of all K counts
+     <caller syncs its stream>            -- e.g. gpu_sieve_sync_stream
+     gpu_sieve_counts_host(ctx)          -- K counts, host-visible
+   The caller must fail closed if any count exceeds its stride (a window would
+   have spilled into the next window's slice). */
+int gpu_sieve_defer_prepare(gpu_sieve_ctx *ctx, size_t windows) {
+    if (!ctx || windows == 0) return 0;
+    if (ctx->counts_cap >= windows && ctx->d_counts && ctx->h_counts_pinned)
+        return 1;
+    if (ctx->d_counts) { cudaFree(ctx->d_counts); ctx->d_counts = NULL; }
+    if (ctx->h_counts_pinned) {
+        cudaFreeHost(ctx->h_counts_pinned);
+        ctx->h_counts_pinned = NULL;
+    }
+    ctx->counts_cap = 0;
+    if (cudaMalloc(&ctx->d_counts, windows * sizeof(unsigned int)) !=
+        cudaSuccess) {
+        ctx->d_counts = NULL;
+        return 0;
+    }
+    if (cudaHostAlloc((void **)&ctx->h_counts_pinned,
+                      windows * sizeof(unsigned int),
+                      cudaHostAllocDefault) != cudaSuccess ||
+        cudaMemset(ctx->d_counts, 0, windows * sizeof(unsigned int)) !=
+            cudaSuccess) {
+        if (ctx->h_counts_pinned) {
+            cudaFreeHost(ctx->h_counts_pinned);
+            ctx->h_counts_pinned = NULL;
+        }
+        cudaFree(ctx->d_counts);
+        ctx->d_counts = NULL;
+        return 0;
+    }
+    ctx->counts_cap = windows;
+    return 1;
+}
+
+int gpu_sieve_counts_request(gpu_sieve_ctx *ctx, size_t windows) {
+    if (!ctx || !ctx->d_counts || !ctx->h_counts_pinned) return 0;
+    if (windows == 0 || windows > ctx->counts_cap) return 0;
+    return cudaMemcpyAsync(ctx->h_counts_pinned, ctx->d_counts,
+                           windows * sizeof(unsigned int),
+                           cudaMemcpyDeviceToHost, ctx->stream) == cudaSuccess
+               ? 1 : 0;
+}
+
+const unsigned int *gpu_sieve_counts_host(gpu_sieve_ctx *ctx) {
+    return ctx ? ctx->h_counts_pinned : NULL;
+}
+
+/* Extract one window whose survivor count goes to d_counts[defer_index]
+   instead of being read back here.  slot_base must be the window's FIXED
+   stride base; the offsets are copied over the whole stride slice and are
+   valid up to (not including) the count the caller reads back later. */
+int gpu_sieve_extract_pack_device_defer(gpu_sieve_ctx *ctx,
+                                        uint64_t odd_interval_size,
+                                        uint64_t first_odd_offset,
+                                        uint64_t lo_odd,
+                                        uint64_t hi_odd,
+                                        int bitmap_buf,
+                                        int cand_buf,
+                                        const uint64_t *base_limbs,
+                                        int active_limbs,
+                                        uint64_t *host_offsets,
+                                        uint32_t slot_base,
+                                        int defer_index,
+                                        uint32_t base_mod60,
+                                        uint64_t class_mask60,
+                                        uint64_t region_start) {
+    unsigned int dummy_count = 0;
+    if (defer_index < 0) return 0;
+    return gpu_sieve_extract_pack_impl(ctx, odd_interval_size, first_odd_offset,
+                                       lo_odd, hi_odd,
+                                       ctx->d_bitmap[bitmap_buf & 1], cand_buf,
+                                       base_limbs, active_limbs, NULL,
+                                       host_offsets, &dummy_count,
+                                       base_mod60, class_mask60, region_start,
+                                       slot_base, defer_index);
 }
 
 /* Device pointer of row r in the row bitmap arena (NULL when unavailable). */
@@ -3787,6 +3966,31 @@ uint64_t *gpu_sieve_row_bitmap(gpu_sieve_ctx *ctx, uint32_t row) {
 void gpu_sieve_set_extract_accum(gpu_sieve_ctx *ctx, uint32_t k) {
     if (!ctx) return;
     ctx->extract_accum = k ? k : 1;
+}
+
+/* Fix the per-window candidate capacity (= the stride of the deferred-count
+   layout).  Callers that use gpu_sieve_extract_pack_device_defer MUST pin it
+   so the host and the device agree on the per-window slice; right-sizing is
+   skipped in that mode. */
+void gpu_sieve_set_cand_cap(gpu_sieve_ctx *ctx, uint64_t per_window) {
+    if (!ctx || per_window == 0) return;
+    if (ctx->cand_cap_per_window != per_window) {
+        ctx->cand_cap_per_window = per_window;
+        ctx->cand_cap_pending = 0;
+        ctx->max_candidates = 0;      /* forces the one-time realloc */
+    }
+}
+
+uint64_t gpu_sieve_cand_cap_per_window(const gpu_sieve_ctx *ctx) {
+    return ctx ? ctx->cand_cap_per_window : 0;
+}
+
+/* Pin a caller-owned host buffer for real async DMA (see the note at the
+   hunt's call site).  Returns 1 when pinned. */
+int gpu_sieve_pin_host(void *ptr, size_t bytes) {
+    if (!ptr || bytes == 0) return 0;
+    return cudaHostRegister(ptr, bytes, cudaHostRegisterDefault) == cudaSuccess
+               ? 1 : 0;
 }
 
 void gpu_sieve_set_cand_cap_limit(gpu_sieve_ctx *ctx, uint64_t slots) {
@@ -3852,6 +4056,15 @@ void gpu_sieve_destroy(gpu_sieve_ctx *ctx) {
     if (ctx->d_cands_aos[1]) cudaFree(ctx->d_cands_aos[1]);
     if (ctx->d_offsets) cudaFree(ctx->d_offsets);
     if (ctx->d_count) cudaFree(ctx->d_count);
+    if (ctx->h_count_pinned) {
+        cudaFreeHost(ctx->h_count_pinned);
+        ctx->h_count_pinned = NULL;
+    }
+    if (ctx->d_counts) cudaFree(ctx->d_counts);
+    if (ctx->h_counts_pinned) cudaFreeHost(ctx->h_counts_pinned);
+    ctx->d_counts = NULL;
+    ctx->h_counts_pinned = NULL;
+    ctx->counts_cap = 0;
     if (ctx->d_row_bitmaps) cudaFree(ctx->d_row_bitmaps);
     if (ctx->d_step_mod_p) cudaFree(ctx->d_step_mod_p);
     if (ctx->d_residues_scratch) cudaFree(ctx->d_residues_scratch);

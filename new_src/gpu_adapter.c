@@ -23,6 +23,14 @@
 #endif
 
 struct gpu_adapter *gpu_adapter_init(int device_id) {
+    return gpu_adapter_init_limbs(device_id, GPU_ADAPTER_MAX_BATCH, 0);
+}
+
+/* Same, with the Fermat staging sized for `limbs` limbs (0 = compiled max) and
+   for `max_batch` candidates.  Each worker thread owns one adapter, so these
+   two numbers multiply the fleet's memory: see the note in gpu_fermat_init_limbs. */
+struct gpu_adapter *gpu_adapter_init_limbs(int device_id, size_t max_batch,
+                                           int limbs) {
     struct gpu_adapter *adapter = 
         (struct gpu_adapter *)malloc(sizeof(struct gpu_adapter));
     
@@ -32,17 +40,27 @@ struct gpu_adapter *gpu_adapter_init(int device_id) {
     adapter->gpu_context = NULL;
 
 #ifdef WITH_CUDA
-    gpu_fermat_ctx *ctx = gpu_fermat_init(device_id, GPU_ADAPTER_MAX_BATCH);
+    if (max_batch == 0 || max_batch > GPU_ADAPTER_MAX_BATCH)
+        max_batch = GPU_ADAPTER_MAX_BATCH;
+    gpu_fermat_ctx *ctx = gpu_fermat_init_limbs(device_id, max_batch, limbs);
     if (ctx) {
         adapter->gpu_context = ctx;
-        printf("[GPUAdapter] Initialized CUDA device %d (%s)\n",
-               device_id, gpu_fermat_device_name(ctx));
+        printf("[GPUAdapter] Initialized CUDA device %d (%s) staging: "
+               "max_batch=%zu limbs=%d (~%zu MB device + ~%zu MB pinned)\n",
+               device_id, gpu_fermat_device_name(ctx), max_batch,
+               gpu_fermat_get_limbs(ctx),
+               (size_t)(4 * 2 * max_batch *
+                        (size_t)gpu_fermat_get_limbs(ctx) * 8 / (1024 * 1024)),
+               (size_t)(4 * 2 * max_batch *
+                        (size_t)gpu_fermat_get_limbs(ctx) * 8 / (1024 * 1024)));
     } else {
         fprintf(stderr,
                 "[GPUAdapter] CUDA init failed for device %d, "
                 "falling back to CPU Fermat\n", device_id);
     }
 #else
+    (void)max_batch;
+    (void)limbs;
     printf("[GPUAdapter] Initialized for device %d (CPU fallback mode)\n", 
            device_id);
 #endif

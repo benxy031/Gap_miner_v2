@@ -141,7 +141,19 @@ P0GPU_EXPORT int p0gpu_walk(const void *bm, unsigned long long nwords,
                             const void *wtab, unsigned min_gap, void *out,
                             unsigned cap, void *stats, unsigned grid,
                             unsigned block, void *stream) {
+    /* w_test_mode() is the single source of truth for the band -> test map, so
+       the DLL MUST carry an instantiation for every mode it can return.  It
+       returned 3 (our lazy-Barrett test, n < 2^75) with no case here, so the
+       Windows / split build silently ran perig below 2^75 while the monolithic
+       build ran the new test - the parity gate could not see it, because the
+       two tests produce an identical gap set.  Note this DLL has no mode
+       override: the host's P0_WALK_TESTMODE only affects the monolithic build. */
     switch (w_test_mode(ahi)) {
+    case 3:
+        walk_kernel7<3, 0><<<grid, block, 0, (cudaStream_t)stream>>>(
+            (const uint64_t *)bm, nwords, alo, ahi, (const uint32_t *)wtab,
+            min_gap, (w_gaprec_t *)out, cap, (unsigned long long *)stats);
+        break;
     case 2:
         walk_kernel7<2, 0><<<grid, block, 0, (cudaStream_t)stream>>>(
             (const uint64_t *)bm, nwords, alo, ahi, (const uint32_t *)wtab,

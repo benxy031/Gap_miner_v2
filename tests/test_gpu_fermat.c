@@ -283,6 +283,59 @@ static int run_gpu_fermat_device_path_test(void) {
         for (uint32_t i = 0; i < TEST_CANDIDATE_COUNT; i++)
             if (host_results[i] != dev_results[i]) mismatches++;
 
+        /* Bounded diagnostics (GAPDBG_FERMAT_MISMATCH=1): which candidates
+           disagree, and their top-limb shape.  The mismatch count alone cannot
+           tell a layout bug from a verdict bug. */
+        if (mismatches != 0 && getenv("GAPDBG_FERMAT_MISMATCH")) {
+            uint32_t shown = 0;
+            for (uint32_t i = 0; i < TEST_CANDIDATE_COUNT && shown < 12; i++) {
+                if (host_results[i] == dev_results[i]) continue;
+                unsigned long bits = (unsigned long)AL * 64UL;
+                if ((i & 3U) == 2U)
+                    bits = (unsigned long)AL * 64UL - 1UL -
+                           (unsigned long)(i % 56U);
+                else if ((i & 3U) == 3U)
+                    bits = (unsigned long)AL * 32UL;
+                unsigned top = (unsigned)(bits & 63UL);
+                fprintf(stderr,
+                        "  [mismatch] AL=%d i=%u shape=%u bits=%lu topbits=%u "
+                        "host=%d dev=%d\n",
+                        AL, i, i & 3U, bits, top ? top : 64,
+                        (int)host_results[i], (int)dev_results[i]);
+                shown++;
+            }
+        }
+
+        /* Isolated retest of the first few mismatches: one candidate per call
+           through BOTH paths.  If a candidate that disagreed inside the batch
+           agrees on its own, the bug is in the batch/grid path, not in the
+           arithmetic or in the AoS/SoA conversion. */
+        if (mismatches != 0 && getenv("GAPDBG_FERMAT_MISMATCH")) {
+            uint32_t shown = 0;
+            for (uint32_t i = 0; i < TEST_CANDIDATE_COUNT && shown < 4; i++) {
+                if (host_results[i] == dev_results[i]) continue;
+                uint8_t r1 = 0xFF, r2 = 0xFF;
+                uint64_t *d_one = NULL;
+                int p1 = gpu_fermat_test_batch(ctx, h_cands + (size_t)i * (size_t)AL,
+                                               &r1, 1);
+                int p2 = -1;
+                if (cudaMalloc((void **)&d_one, (size_t)AL * sizeof(uint64_t)) ==
+                    cudaSuccess) {
+                    if (cudaMemcpy(d_one, h_cands + (size_t)i * (size_t)AL,
+                                   (size_t)AL * sizeof(uint64_t),
+                                   cudaMemcpyHostToDevice) == cudaSuccess)
+                        p2 = gpu_fermat_test_device(ctx, d_one, &r2, 1);
+                    cudaFree(d_one);
+                }
+                fprintf(stderr,
+                        "  [isolated] AL=%d i=%u single: batch=%d(r=%d) "
+                        "device=%d(r=%d) in_batch: host=%d dev=%d\n",
+                        AL, i, p1, (int)r1, p2, (int)r2,
+                        (int)host_results[i], (int)dev_results[i]);
+                shown++;
+            }
+        }
+
         if (mismatches != 0 || host_primes != dev_primes) {
             fprintf(stderr,
                     "  FAIL AL=%d: host_primes=%d dev_primes=%d mismatches=%u\n",
@@ -557,10 +610,13 @@ int main(void) {
     printf("========== GPU Fermat Kernel Tests ==========\n\n");
 
     int ok = run_gpu_fermat_correctness_test();
-    if (ok)
-        ok = run_gpu_fermat_device_path_test();
+    /* Reference FIRST, then the internal H2D-vs-device consistency check: the
+       device-path test aborts the chain on failure, and a failing consistency
+       check used to hide whether the KERNEL or one of the two PATHS is wrong. */
     if (ok)
         ok = run_gpu_fermat_pattern_test();
+    if (ok)
+        ok = run_gpu_fermat_device_path_test();
 
     printf("\n==============================================\n");
     if (!ok) {

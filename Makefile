@@ -294,10 +294,11 @@ $(BUILD_DIR)/tools/mr128_bench.o: tools/mr128_kernel.cuh tools/mr128_64_kernel.c
     tools/perig.cuh
 $(BUILD_DIR)/tools/phase0_scan_gpu.o: tools/mr68_kernel.cuh tools/perig.cuh \
     tools/p0_mark.cuh tools/p0_types.h tools/p0_walk_kern.cuh tools/phase0gpu_api.h \
-    tools/smooth_range.h
+    tools/smooth_range.h tools/p0_test_lazy.cuh
 $(BUILD_DIR)/tools/bench_p0sieve.o: tools/p0_mark.cuh tools/p0_types.h
 $(BUILD_DIR)/tools/phase0gpu_dll.o: tools/phase0gpu_api.h tools/mr68_kernel.cuh \
-    tools/p0_mark.cuh tools/p0_types.h tools/p0_walk_kern.cuh tools/perig.cuh
+    tools/p0_mark.cuh tools/p0_types.h tools/p0_walk_kern.cuh tools/perig.cuh \
+    tools/p0_test_lazy.cuh
 
 # Link test_gap_priority
 $(TEST_GAP_PRIORITY): $(OBJECTS) $(BUILD_DIR)/$(TEST_DIR)/test_gap_priority.o | $(BIN_DIR)

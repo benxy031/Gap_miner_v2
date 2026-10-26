@@ -116,6 +116,24 @@ static double   g_merit_min = 20.0;
 static int      g_merit_explicit = 0;   /* --merit-min given on the command line */
 static double   g_progress = 10.0;       /* seconds between progress lines (0 = off) */
 static double   g_state_every = 30.0;    /* seconds between checkpoint writes */
+/* ---- report shape (PGN-style target line + best/recent lists) ----
+   --best N : how many of the STRONGEST gaps this run found are listed (merit
+               order).  --recent N : how many of the LAST REPORTED gaps are
+               listed.  Both are pure reporting knobs: no test, no gap, no
+               band and no record decision depends on them. */
+#define MAX_BEST   32
+#define MAX_RECENT 64
+static int g_best_n   = 10;
+static int g_recent_n = 10;
+static struct {
+    u128     lower, upper;
+    uint64_t gap;
+    double   merit;
+} g_recent[MAX_RECENT];
+static int      g_recent_head = 0;   /* next write slot in the ring */
+static uint64_t g_recent_total = 0;  /* entries ever stored (wraps) */
+static pthread_mutex_t g_recent_mu = PTHREAD_MUTEX_INITIALIZER;
+
 static const char *g_log_path = NULL;
 static const char *g_state_path = NULL;
 static const char *g_records_path = NULL;   /* NULL = default path if present */
@@ -279,6 +297,43 @@ static void u128_str(u128 v, char *out, size_t n) {
     size_t j = 0;
     while (i > 0 && j + 1 < n) out[j++] = tmp[--i];
     out[j] = 0;
+}
+
+/* PGN-style target line: the merit gate expressed as a GAP size at this start.
+   Gaps between odd primes are even, so the bound is rounded up to an even
+   number; ln(start) is constant over any realistic range (1e14 at 2e20 moves
+   it by 5e-7 relative), i.e. this is ONE scalar per run, not a per-gap cost. */
+static uint64_t target_gap_for_merit(double merit, double ln_start) {
+    if (ln_start <= 0.0) return 0;
+    double gt = merit * ln_start;
+    if (gt < 0.0) gt = 0.0;
+    uint64_t g = (uint64_t)(gt + 0.999999999);   /* ceil */
+    if (g & 1ull) g++;
+    return g;
+}
+
+static void print_target_line(double merit, uint64_t gap, double ln_start) {
+    printf("[phase0-gpu] target: merit >= %.2f  (gap >= %llu at ln(start)=%.4f)\n",
+           merit, (unsigned long long)gap, ln_start);
+}
+
+/* last N REPORTED gaps (oldest first).  Guarded by one mutex: only gaps that
+   pass the report gate land here (tens per second at merit-min 15), so the
+   lock is invisible next to the log write it accompanies. */
+static void print_recent_finds(void) {
+    if (g_recent_n <= 0 || g_recent_total == 0) return;
+    int cnt = (int)(g_recent_total < (uint64_t)MAX_RECENT ? g_recent_total : MAX_RECENT);
+    if (cnt > g_recent_n) cnt = g_recent_n;
+    printf("[phase0-gpu] recent finds (last %d reported gap%s, oldest first):\n",
+           cnt, cnt == 1 ? "" : "s");
+    for (int r = cnt; r >= 1; r--) {
+        int idx = (g_recent_head - r + MAX_RECENT) % MAX_RECENT;
+        char sl[48], su[48];
+        u128_str(g_recent[idx].lower, sl, sizeof sl);
+        u128_str(g_recent[idx].upper, su, sizeof su);
+        printf("[phase0-gpu]   gap=%llu merit=%.4f lower=%s upper=%s\n",
+               (unsigned long long)g_recent[idx].gap, g_recent[idx].merit, sl, su);
+    }
 }
 
 /* ---- --smooth: CLI list + final report ---- */
@@ -446,21 +501,22 @@ struct job_s {
     uint64_t batches, gaps_reported, gaps_bad, records_new;
     uint64_t band_cnt[N_BANDS];
     double t_mark, t_walk, t_wait, t_gpu, t_proc, t_boot;
-    /* top-4 gaps */
+    /* top gaps (--best N, capped at MAX_BEST); both engines use this */
     int      ntop;
-    u128     top_lower[4], top_upper[4];
-    uint64_t top_gap[4];
-    double   top_merit[4];
+    u128     top_lower[MAX_BEST], top_upper[MAX_BEST];
+    uint64_t top_gap[MAX_BEST];
+    double   top_merit[MAX_BEST];
 };
 
 static void top_insert(job_t *j, u128 lower, u128 upper, uint64_t gap, double merit) {
+    int n = g_best_n;
     int pos = -1;
-    for (int t = 0; t < 4; t++) {
+    for (int t = 0; t < n; t++) {
         if (merit > j->top_merit[t]) { pos = t; break; }
     }
-    if (pos < 0 && j->ntop < 4) pos = j->ntop;
+    if (pos < 0 && j->ntop < n) pos = j->ntop;
     if (pos < 0) return;
-    for (int t = 3; t > pos; t--) {
+    for (int t = n - 1; t > pos; t--) {
         j->top_merit[t] = j->top_merit[t - 1];
         j->top_lower[t] = j->top_lower[t - 1];
         j->top_upper[t] = j->top_upper[t - 1];
@@ -595,11 +651,22 @@ static void process_prime_gap(job_t *j, u128 xp, u128 x, uint64_t gap) {
         if (nb > N_BANDS) nb = N_BANDS;
         for (int b = 0; b < nb; b++) j->band_cnt[b]++;
     }
-    if (j->ntop < 4 || merit > j->top_merit[3])
+    if (j->ntop < g_best_n || merit > j->top_merit[g_best_n - 1])
         top_insert(j, xp, x, gap, merit);
     double best = 0.0;
     int rec = record_check(gap, merit, &best);
     if (merit >= g_merit_min || rec == 2) {
+        if (g_recent_n > 0) {
+            pthread_mutex_lock(&g_recent_mu);
+            int h = g_recent_head;
+            g_recent[h].lower = xp;
+            g_recent[h].upper = x;
+            g_recent[h].gap   = gap;
+            g_recent[h].merit = merit;
+            g_recent_head = (h + 1) % MAX_RECENT;
+            g_recent_total++;
+            pthread_mutex_unlock(&g_recent_mu);
+        }
         int ok = verify_gap(xp, x);
         int isrec = report_gap(xp, x, gap, merit, ok, rec, best);
         j->gaps_reported++;
@@ -1497,9 +1564,9 @@ static int run_walk_engine(void) {
         ev = getenv("P0_WALK_TESTMODE");
         if (ev) {
             int v = atoi(ev);
-            if (v >= 0 && v <= 2) g_walk_testmode = v;
+            if (v >= 0 && v <= 3) g_walk_testmode = v;
             else fprintf(stderr, "[phase0-gpu] P0_WALK_TESTMODE %d out of range"
-                                " [0,2]; using the magnitude dispatch\n", v);
+                                " [0,3]; using the magnitude dispatch\n", v);
         }
         ev = getenv("P0_WK_GRID");
         if (ev) { int v = atoi(ev); if (v >= 1 && v <= 4096) g_wk_grid = v; }
@@ -1722,6 +1789,7 @@ static int run_walk_engine(void) {
     u128_str(g_start, s0, sizeof s0);
     printf("[phase0-gpu] engine=walk start=%s length=%llu ln(start)=%.4f\n",
            s0, (unsigned long long)g_len, u128_ln(g_start));
+    print_target_line((double)gapmin / u128_ln(g_start), gapmin, u128_ln(g_start));
     printf("[phase0-gpu] walk: primes<=%u items=%zu gap_min=%llu walk_batch=%u "
            "block=%llu bitmap_region=%.2f GB x2 tile=%llu slots (%llu KB, %llu tiles/block%s)\n",
            P, nii2, (unsigned long long)gapmin, K,
@@ -1826,8 +1894,8 @@ static int run_walk_engine(void) {
                            wk_grid, wk_block, sB) != 0)
                 die("p0gpu_walk failed");
 #else
-            /* the test variant is selected per launch (the three instantiations
-               keep ptxas from pricing the widest test into the perig path);
+            /* the test variant is selected per launch (the instantiations keep
+               ptxas from pricing the widest test into the perig path);
                P0_WALK_TESTMODE forces one for the cost measurement, and
                P0_WALK_OFF skips the launch entirely (mark-only wall). */
             int tmode = (g_walk_testmode >= 0)
@@ -1835,6 +1903,9 @@ static int run_walk_engine(void) {
             if (!g_walk_off) {
             if (g_walk_prof) {
                 switch (tmode) {
+                case 3: walk_kernel7<3, 1><<<wk_grid, wk_block, 0, sB>>>(bm, cnb * cWords,
+                            (uint64_t)Ab, (uint64_t)(Ab >> 64), d_wtab,
+                            (uint32_t)gapmin, out_r, 1u << 20, st_r); break;
                 case 2: walk_kernel7<2, 1><<<wk_grid, wk_block, 0, sB>>>(bm, cnb * cWords,
                             (uint64_t)Ab, (uint64_t)(Ab >> 64), d_wtab,
                             (uint32_t)gapmin, out_r, 1u << 20, st_r); break;
@@ -1847,6 +1918,9 @@ static int run_walk_engine(void) {
                 }
             } else
             switch (tmode) {
+            case 3: walk_kernel7<3, 0><<<wk_grid, wk_block, 0, sB>>>(bm, cnb * cWords,
+                        (uint64_t)Ab, (uint64_t)(Ab >> 64), d_wtab,
+                        (uint32_t)gapmin, out_r, 1u << 20, st_r); break;
             case 2: walk_kernel7<2, 0><<<wk_grid, wk_block, 0, sB>>>(bm, cnb * cWords,
                         (uint64_t)Ab, (uint64_t)(Ab >> 64), d_wtab,
                         (uint32_t)gapmin, out_r, 1u << 20, st_r); break;
@@ -2000,6 +2074,7 @@ static int run_walk_engine(void) {
             printf("[phase0-gpu]   top#%d gap=%llu merit=%.4f lower=%s upper=%s verified=%d\n",
                    r2 + 1, (unsigned long long)wj.top_gap[r2], wj.top_merit[r2], sl, su, ok);
         }
+        print_recent_finds();
         printf("[phase0-gpu] gaps reported=%llu  verification_failures=%llu  records_new=%llu%s\n",
                (unsigned long long)wj.gaps_reported, (unsigned long long)wj.gaps_bad,
                (unsigned long long)wj.records_new, g_log_path ? "" : "  (no --log file)");
@@ -2217,6 +2292,14 @@ static void usage(const char *p) {
         "           --no-records disables the check.  Criterion identical to the\n"
         "           gap-hunt watcher and new_src/record_log.c: gap in the table AND\n"
         "           merit > best known; a beat is logged even below --merit-min.\n"
+        "  --best N (default 10, range 1..32): how many of the STRONGEST gaps the\n"
+        "           run found are listed as 'top#k' rows (merit order).\n"
+        "  --recent N (default 10, range 0..64): how many of the LAST REPORTED\n"
+        "           gaps are listed as 'recent finds' (oldest first); 0 disables.\n"
+        "  target line: every run prints, once at startup and once in the results,\n"
+        "           'target: merit >= 20.00  (gap >= 936 at ln(start)=46.7448)'\n"
+        "           i.e. the merit gate restated as the smallest even gap that can\n"
+        "           meet it at this start (one scalar per run; gaps are even).\n"
         "  gap log format (append): <unix_ts> <lower_prime> <gap> <merit> <upper_prime>\n"
         "           verified=<0|1> record=<NEW|no|absent|off> table=<best|unknown>,\n"
         "           plus one '# phase0-gpu session ...' header line per run.\n"
@@ -2240,6 +2323,16 @@ int main(int argc, char **argv) {
         else if (!strcmp(argv[i], "--seg-bits") && i + 1 < argc) { seg_bits = atoi(argv[++i]); seg_set = 1; }
         else if (!strcmp(argv[i], "--batch") && i + 1 < argc) { g_batch = (uint32_t)strtoul(argv[++i], NULL, 10); batch_set = 1; }
         else if (!strcmp(argv[i], "--merit-min") && i + 1 < argc) { g_merit_min = atof(argv[++i]); g_merit_explicit = 1; }
+        else if (!strcmp(argv[i], "--best") && i + 1 < argc) {
+            g_best_n = atoi(argv[++i]);
+            if (g_best_n < 1) g_best_n = 1;
+            if (g_best_n > MAX_BEST) g_best_n = MAX_BEST;
+        }
+        else if (!strcmp(argv[i], "--recent") && i + 1 < argc) {
+            g_recent_n = atoi(argv[++i]);
+            if (g_recent_n < 0) g_recent_n = 0;
+            if (g_recent_n > MAX_RECENT) g_recent_n = MAX_RECENT;
+        }
         else if (!strcmp(argv[i], "--log") && i + 1 < argc) g_log_path = argv[++i];
         else if (!strcmp(argv[i], "--records") && i + 1 < argc) g_records_path = argv[++i];
         else if (!strcmp(argv[i], "--no-records")) g_no_records = 1;
@@ -2400,6 +2493,8 @@ int main(int argc, char **argv) {
     u128_str(start, s0, sizeof s0);
     printf("[phase0-gpu] start=%s  length=%llu  ln(start)=%.4f\n",
            s0, (unsigned long long)length, u128_ln(start));
+    print_target_line(g_merit_min, target_gap_for_merit(g_merit_min, u128_ln(start)),
+                      u128_ln(start));
     printf("[phase0-gpu] sieve_limit=%u  threads=%d  seg_bits=%d  batch=%u  test=%s  merit_min=%.1f\n",
            sieve_limit, threads, seg_bits, g_batch, do_test ? "on" : "off", g_merit_min);
     if (g_smooth_on) {
@@ -2522,9 +2617,9 @@ int main(int argc, char **argv) {
     uint64_t tot_batches = 0, tot_gaps = 0, tot_bad = 0, tot_rec = 0;
     uint64_t bands[N_BANDS] = {0};
     double t_mark = 0, t_walk = 0, t_wait = 0, t_gpu = 0, t_proc = 0, t_boot = 0;
-    u128 top_lower[4] = {0, 0, 0, 0}, top_upper[4] = {0, 0, 0, 0};
-    uint64_t top_gap[4] = {0};
-    double top_merit[4] = {0};
+    u128 top_lower[MAX_BEST] = {0}, top_upper[MAX_BEST] = {0};
+    uint64_t top_gap[MAX_BEST] = {0};
+    double top_merit[MAX_BEST] = {0};
     int ntop = 0;
     for (int t = 0; t < threads; t++) {
         ints += jobs[t].ints;
@@ -2544,10 +2639,10 @@ int main(int argc, char **argv) {
         for (int b = 0; b < N_BANDS; b++) bands[b] += jobs[t].band_cnt[b];
         for (int r = 0; r < jobs[t].ntop; r++) {
             int pos = -1;
-            for (int q = 0; q < 4; q++) if (jobs[t].top_merit[r] > top_merit[q]) { pos = q; break; }
-            if (pos < 0 && ntop < 4) pos = ntop;
+            for (int q = 0; q < g_best_n; q++) if (jobs[t].top_merit[r] > top_merit[q]) { pos = q; break; }
+            if (pos < 0 && ntop < g_best_n) pos = ntop;
             if (pos < 0) continue;
-            for (int q = 3; q > pos; q--) {
+            for (int q = g_best_n - 1; q > pos; q--) {
                 top_merit[q] = top_merit[q - 1];
                 top_lower[q] = top_lower[q - 1];
                 top_upper[q] = top_upper[q - 1];
@@ -2557,12 +2652,14 @@ int main(int argc, char **argv) {
             top_lower[pos] = jobs[t].top_lower[r];
             top_upper[pos] = jobs[t].top_upper[r];
             top_gap[pos]   = jobs[t].top_gap[r];
-            if (ntop < 4) ntop++;
+            if (ntop < g_best_n) ntop++;
         }
     }
 
     double per14 = (ints > 0) ? (1e14 / (double)ints) : 0.0;
     printf("[phase0-gpu] --- results ---\n");
+    print_target_line(g_merit_min, target_gap_for_merit(g_merit_min, u128_ln(start)),
+                      u128_ln(start));
     printf("[phase0-gpu] wall=%.2f s  ints=%llu  end_to_end=%.3e ints/s%s\n",
            wall, (unsigned long long)ints, (double)ints / wall,
            all_done ? "" : "  (STOPPED early)");
@@ -2614,6 +2711,7 @@ int main(int argc, char **argv) {
             printf("[phase0-gpu]   top#%d gap=%llu merit=%.4f lower=%s upper=%s verified=%d\n",
                    r + 1, (unsigned long long)top_gap[r], top_merit[r], sl, su, ok);
         }
+        print_recent_finds();
         printf("[phase0-gpu] gaps reported=%llu  verification_failures=%llu  records_new=%llu%s\n",
                (unsigned long long)tot_gaps, (unsigned long long)tot_bad,
                (unsigned long long)tot_rec,

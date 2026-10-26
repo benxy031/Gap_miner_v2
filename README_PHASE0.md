@@ -70,7 +70,7 @@ bin/phase0_scan_gpu [--start DEC] [--length DEC] [--sieve-limit P] [--threads T]
                     [--records FILE] [--no-records] [--gpu-sieve|--cpu-sieve]
                     [--check [N]] [--legacy-mr] [--no-test]
                     [--engine sieve|walk] [--gap-min G] [--walk-primes P]
-                    [--walk-batch B]
+                    [--walk-batch B] [--best N] [--recent N]
 ```
 
 Defaults:
@@ -93,6 +93,8 @@ Defaults:
 | `--progress S` | `10` s | progress + ETA line every S seconds (`0` = off); after a `--state` resume the line's `ints/s` and the final `end_to_end` cover only the current session (the `%` and `ints=` stay whole-slice) |
 | `--device D` | `0` | CUDA device |
 | `--records FILE` / `--no-records` | `data/prime_gap_merits.txt` if present | record check: gap length in table AND merit > best known; a beat is logged even below `--merit-min` |
+| `--best N` | `10` | how many of the STRONGEST gaps the run found are listed as `top#k` rows in the results (merit order; range 1..32). Report-only: no band, log line, test or record decision depends on it. `--best 12` lists 12 |
+| `--recent N` | `10` | how many of the LAST REPORTED gaps (the ones that passed `--merit-min`) are listed as `recent finds`, oldest first; range 0..64, `0` disables the section. Costs one mutex per reported gap (~30 locks/s at `--merit-min 15`, i.e. invisible). `--recent 20` lists 20 |
 | sieve mode | `--gpu-sieve` | `--cpu-sieve` selects the (slow) CPU marking path |
 | MR pipeline | bitmap-fed (fast) | `--legacy-mr` selects the batched steps/res path (A/B reference; `--check` always uses it) |
 | `--check [N]` | off | sieve+MR `[start, start+N)` then re-walk the range with `mpz_nextprime`; N default 2e6. Forces the legacy MR path (needs the collect list) |
@@ -128,11 +130,36 @@ settings**:
   without `P0_WALK_OFF=1`.  Measured (4e12 ints, P = 150000, mark-only):
   0 -> 4.91 s, 3 -> 4.73 s, 2 -> 4.52 s, 1 -> 4.51 s, i.e. the tile stream costs
   8.1 % of the mark.
-* `P0_WALK_TESTMODE=0|1|2` forces the walk's primality variant (perig / exact
-  lazy 2x64 / canonical 2x64) instead of the magnitude dispatch; only valid
-  above 2^96.  Measured at `--start 1e29`: perig 16.36/17.18 s vs lazy
+* `P0_WALK_TESTMODE=0|1|2|3` forces the walk's primality variant instead of the
+  magnitude dispatch: `0` = perig (2x64 CIOS Montgomery), `1` = exact lazy 2x64,
+  `2` = canonical 2x64, `3` = our three-limb lazy-Barrett test.  Modes 0..2 are
+  only valid above 2^96; mode 3 is the opposite end (2^64 <= n < 2^75).
+  Measured at `--start 1e29` for 0/1/2: perig 16.36/17.18 s vs lazy
   19.32/21.56 s vs canonical 24.75/25.14 s with `tests` and the gap set
-  identical, so the production test is already the fastest of the three.
+  identical, so perig is the fastest of those three.  Mode 3 at
+  `--start 1e22` (hi = 542): see the dispatch default below.
+* Walk test dispatch (default, no environment variable): `n < 2^75` -> mode 3,
+  `2^75 .. 2^120` -> perig, `2^120 .. 2^126` -> mode 1, above -> mode 2.  The
+  band boundaries are the exactness limits, not tuning: mode 3's five-word
+  square needs a < 2^80, perig is exact to 2^120, mode 1 to 2^126.  Example:
+  `./bin/phase0_scan_gpu --engine walk --start 1e22 --length 2e12 --merit-min 20`
+  runs mode 3 without any variable set.
+  **Measured 2026-10-26** (dev 3070, `--start 1e22 --length 2e12 --merit-min 20`,
+  2 interleaved reps): perig 9.07/9.00 s vs mode 3 8.44/8.40 s = **+7 % end to
+  end**, with a **bit-identical gap set** (22,939 gaps at `--merit-min 12` and
+  1,826,878 at `--merit-min 8` both diff to zero on (lower, gap, upper)).  The
+  +7 % is smaller than the test's own 1.23x because the test is only part of the
+  walk: at this band mark = 64.7 % and walk = 61.7 % of the wall (they overlap).
+  Above 2^75 nothing changes, so the campaign band (1e32) is unaffected.
+* Kernel-DLL builds (`phase0_scan_gpu_split`, and on Windows `phase0gpu.dll` +
+  the MinGW host tools) pick the test from the MAGNITUDE only:
+  `P0_WALK_TESTMODE` is a monolithic-build variable.  `p0gpu_walk` must carry a
+  `case` for every mode `w_test_mode()` can return - mode 3 was missing there
+  while the monolithic path had it, so the split build silently ran perig below
+  2^75 (4.19 s vs 3.66 s at `--start 1e22 --length 5e11`, and the gap set is
+  identical either way, so only the timing exposed it).  Both dispatch sites are
+  now in sync; `bin/phase0_scan_gpu` and `bin/phase0_scan_gpu_split` agree to
+  the bit (22,939 gaps, 3.66 / 3.64 s).
 
 ### Pipelines
 
@@ -270,6 +297,22 @@ one status line and, for each gap above `--merit-min`, a `GAP ...` line:
 [phase0-gpu]  42.15%  ints=1.234e+12  1.75e+10 ints/s  u=3.51%  tests=...  primes=...  gaps=...  batches=...  eta=0:52:34
 [phase0-gpu] GAP merit=16.0445 gap=750 lower=... upper=... verified=1 record=no table=22.9982
 ```
+
+and, once in the `--- results ---` block, a fixed-shape report (also printed by
+`--engine walk`):
+
+```
+[phase0-gpu] target: merit >= 20.00  (gap >= 936 at ln(start)=46.7448)
+[phase0-gpu]   top#1 gap=724 merit=15.4883 lower=... upper=... verified=1   (x --best)
+[phase0-gpu] recent finds (last 10 reported gaps, oldest first):              (x --recent)
+[phase0-gpu]   gap=630 merit=13.4774 lower=... upper=...
+```
+
+The `target:` line restates the merit gate as the smallest **even** gap that can
+meet it at this start (gaps between odd primes are even).  `ln(start)` is
+constant over any realistic range (1e14 at 2e20 moves it 5e-7 relative), so this
+is one scalar per run, not a per-gap cost.  Under `--engine walk` it is printed
+from `--gap-min` instead (e.g. `--gap-min 700` -> `merit >= 14.97`).
 
 The monitor thread prints exactly this status line; end of run:
 

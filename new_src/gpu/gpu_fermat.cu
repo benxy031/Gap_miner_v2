@@ -1313,15 +1313,23 @@ static __host__ __forceinline__ int cgbn_supports_al(int al)
     #if NL >= 20
     case 20:
     #endif
-    #if NL >= 24
-    case 24:
-    #endif
-    #if NL >= 28
-    case 28:
-    #endif
-    #if NL >= 32
-    case 32:
-    #endif
+    /* AL=24 (1536-bit) and AL=28 (1792-bit) are DELIBERATELY absent: the CGBN
+       kernel is wrong at exactly those two widths.  Measured 2026-10-25 with
+       tests/test_gpu_fermat: the H2D path (which uses cgbn_fermat_kernel_soa_t)
+       matches the CPU reference at AL=24/28 (150 boundary patterns each, 0
+       mismatches, 0 false negatives), while the device-pointer path (which
+       forces the AoS cgbn_fermat_kernel_t) disagrees with it on 9 and 12 of
+       4096 random candidates IN BOTH DIRECTIONS -- i.e. the AoS CGBN kernel
+       returns wrong verdicts there, not just a truncated batch.  AL=20 and
+       AL=32 are correct on both paths, and the failure is identical with
+       GPU_FERMAT_TPI=4 and =8, so it is not the TPI choice.  Both widths now
+       fall through to the SCALAR Montgomery path, which the same reference
+       test validates at EVERY width; that keeps verdicts correct at shift
+       >= 1280 (AL=24) and >= 1536 (AL=28) instead of silently emitting false
+       gaps.  No production geometry uses them (the fleet runs AL=16, the hunt
+       AL=16/20/32); re-enabling needs the AoS CGBN kernel fixed first, and
+       this capability list must be changed together with the dispatch in
+       launch_fermat or the layout choice and the banner would lie. */
         return 1;
     default:
         return 0;
@@ -1511,15 +1519,10 @@ static cudaError_t launch_fermat(int al, cudaStream_t stream,
             #if NL >= 20
             CGBN_DISP_WIDE(20, 4)                    /* 1280-bit (default TPI=4) */
             #endif
-            /* AL=24/28/32 (1536/1792/2048-bit) also accept TPI=4 now (the
-               multi blocker is gone); they run TPI=8 by default (AL=32 hunt is
-               a wash, AL=24/28 not yet A/B'd). */
-            #if NL >= 24
-            CGBN_DISP_WIDE(24, 8)                    /* 1536-bit */
-            #endif
-            #if NL >= 28
-            CGBN_DISP_WIDE(28, 8)                    /* 1792-bit */
-            #endif
+            /* AL=24/28 (1536/1792-bit): NO CGBN case -- see the long note in
+               cgbn_supports_al(): the AoS CGBN kernel is wrong at exactly these
+               two widths, so they take the scalar path below.  This switch and
+               that capability list must stay consistent. */
             #if NL >= 32
             CGBN_DISP_WIDE(32, 8)                    /* 2048-bit */
             #endif
@@ -1610,7 +1613,48 @@ static cudaError_t launch_fermat(int al, cudaStream_t stream,
 #if NL >= 20
     if (al <= 20) { FERMAT_DISPATCH(20); }
 #endif
-    /* Fallback: compile-time maximum */
+#if NL >= 21
+    if (al <= 21) { FERMAT_DISPATCH(21); }
+#endif
+#if NL >= 22
+    if (al <= 22) { FERMAT_DISPATCH(22); }
+#endif
+#if NL >= 23
+    if (al <= 23) { FERMAT_DISPATCH(23); }
+#endif
+#if NL >= 24
+    if (al <= 24) { FERMAT_DISPATCH(24); }
+#endif
+#if NL >= 25
+    if (al <= 25) { FERMAT_DISPATCH(25); }
+#endif
+#if NL >= 26
+    if (al <= 26) { FERMAT_DISPATCH(26); }
+#endif
+#if NL >= 27
+    if (al <= 27) { FERMAT_DISPATCH(27); }
+#endif
+#if NL >= 28
+    if (al <= 28) { FERMAT_DISPATCH(28); }
+#endif
+#if NL >= 29
+    if (al <= 29) { FERMAT_DISPATCH(29); }
+#endif
+#if NL >= 30
+    if (al <= 30) { FERMAT_DISPATCH(30); }
+#endif
+#if NL >= 31
+    if (al <= 31) { FERMAT_DISPATCH(31); }
+#endif
+#if NL >= 32
+    if (al <= 32) { FERMAT_DISPATCH(32); }
+#endif
+    /* Fallback: compile-time maximum.  Reached only when NL exceeds the last
+       entry above; the chain MUST cover every AL the scalar path can see,
+       because the kernel reads exactly W limbs per candidate (stride ==
+       active_limbs) and a mismatch silently corrupts the modulus.  Entries
+       21..31 were missing until 2026-10-25, so any AL in 21..31 dispatched to
+       W = NL and produced wrong verdicts on the scalar path. */
     FERMAT_DISPATCH(NL);
 
 #undef FERMAT_DISPATCH
@@ -1624,6 +1668,7 @@ struct gpu_fermat_ctx {
     int       device_id;
     size_t    max_batch;
     int       active_limbs;    /* arithmetic width (≤ NL); 0 = use NL  */
+    int       limb_cap;        /* width the buffers were ALLOCATED for   */
     /* Double-buffered async pipeline: 2 slots for overlap */
     cudaStream_t stream[2];
     uint64_t *d_cands[2];      /* device candidate buffers  */
@@ -1699,8 +1744,24 @@ int gpu_fermat_device_count(void)
 
 gpu_fermat_ctx *gpu_fermat_init(int device_id, size_t max_batch)
 {
+    return gpu_fermat_init_limbs(device_id, max_batch, NL);
+}
+
+gpu_fermat_ctx *gpu_fermat_init_limbs(int device_id, size_t max_batch,
+                                      int limbs_in)
+{
     gpu_fermat_ctx *ctx = (gpu_fermat_ctx *)calloc(1, sizeof(*ctx));
     if (!ctx) return NULL;
+    /* Allocate for the width THIS geometry needs, not for the compiled
+       maximum.  The miner's CRT path runs shift 738 (994-bit candidates -> 16
+       limbs) while GPU_NLIMBS is 32, so every staging buffer was twice the
+       size it needed to be: 4 buffers x 2 slots x max_batch x limbs x 8 B
+       = 655 MB per worker thread at max_batch=320,000, NL=32 versus 328 MB at
+       16 limbs.  That is the whole reason a --threads 8 miner sits at ~5 GB
+       (and ~10 GB as two dual-GPU processes) while the hunt, which uses ONE
+       context in total, looks small.  The cap is recorded so set_limbs() can
+       never widen past what was allocated. */
+    int limbs = (limbs_in > 0 && limbs_in <= NL) ? limbs_in : NL;
 
     for (int s = 0; s < 2; s++) {
         if (pthread_mutex_init(&ctx->slot_mu[s], NULL) != 0) {
@@ -1734,7 +1795,8 @@ gpu_fermat_ctx *gpu_fermat_init(int device_id, size_t max_batch)
 
     ctx->device_id = device_id;
     ctx->max_batch = max_batch;
-    ctx->active_limbs = NL;   /* default: full width; call set_limbs() to narrow */
+    ctx->active_limbs = limbs;   /* default: full width; call set_limbs() to narrow */
+    ctx->limb_cap = limbs;
 
     /* Allocate double-buffered device + pinned host memory */
     for (int s = 0; s < 2; s++) {
@@ -1745,10 +1807,10 @@ gpu_fermat_ctx *gpu_fermat_init(int device_id, size_t max_batch)
             goto fail;
         }
 
-        err = cudaMalloc(&ctx->d_cands[s], max_batch * NL * sizeof(uint64_t));
+        err = cudaMalloc(&ctx->d_cands[s], max_batch * (size_t)limbs * sizeof(uint64_t));
         if (err != cudaSuccess) {
             fprintf(stderr, "gpu_fermat: cudaMalloc cands[%d] (%zu B): %s\n",
-                    s, max_batch * NL * 8, cudaGetErrorString(err));
+                    s, max_batch * (size_t)limbs * 8, cudaGetErrorString(err));
             goto fail;
         }
 
@@ -1759,7 +1821,7 @@ gpu_fermat_ctx *gpu_fermat_init(int device_id, size_t max_batch)
             goto fail;
         }
 
-        err = cudaMallocHost(&ctx->h_cands[s], max_batch * NL * sizeof(uint64_t));
+        err = cudaMallocHost(&ctx->h_cands[s], max_batch * (size_t)limbs * sizeof(uint64_t));
         if (err != cudaSuccess) {
             fprintf(stderr, "gpu_fermat: cudaMallocHost cands[%d]: %s\n",
                     s, cudaGetErrorString(err));
@@ -1773,14 +1835,14 @@ gpu_fermat_ctx *gpu_fermat_init(int device_id, size_t max_batch)
             goto fail;
         }
 
-        err = cudaMalloc(&ctx->d_cands_soa[s], max_batch * NL * sizeof(uint64_t));
+        err = cudaMalloc(&ctx->d_cands_soa[s], max_batch * (size_t)limbs * sizeof(uint64_t));
         if (err != cudaSuccess) {
             fprintf(stderr, "gpu_fermat: cudaMalloc cands_soa[%d] (%zu B): %s\n",
-                s, max_batch * (size_t)NL * sizeof(uint64_t), cudaGetErrorString(err));
+                s, max_batch * (size_t)limbs * sizeof(uint64_t), cudaGetErrorString(err));
             goto fail;
         }
 
-        err = cudaMallocHost(&ctx->h_cands_soa[s], max_batch * NL * sizeof(uint64_t));
+        err = cudaMallocHost(&ctx->h_cands_soa[s], max_batch * (size_t)limbs * sizeof(uint64_t));
         if (err != cudaSuccess) {
             fprintf(stderr, "gpu_fermat: cudaMallocHost cands_soa[%d]: %s\n",
                 s, cudaGetErrorString(err));
@@ -2132,8 +2194,9 @@ const char *gpu_fermat_device_name(gpu_fermat_ctx *ctx)
 void gpu_fermat_set_limbs(gpu_fermat_ctx *ctx, int limbs)
 {
     if (!ctx) return;
-    if (limbs < 1)  limbs = NL;
-    if (limbs > NL) limbs = NL;
+    int cap = ctx->limb_cap > 0 ? ctx->limb_cap : NL;
+    if (limbs < 1)  limbs = cap;
+    if (limbs > cap) limbs = cap;   /* never past what was allocated */
     __atomic_store_n(&ctx->active_limbs, limbs, __ATOMIC_RELAXED);
 }
 

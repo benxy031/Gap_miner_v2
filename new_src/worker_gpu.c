@@ -3188,7 +3188,17 @@ void *worker_thread_run_crt(void *arg) {
     int gpu_sieve_failure_reported = 0;
     uint64_t *gpu_host_bitmap = NULL;
     if (atomic_load_explicit(&g_gpu_fermat_enabled, memory_order_acquire)) {
-        gpu = gpu_adapter_init((int)config->gpu_device);
+        /* Size the staging for THIS geometry (shift known up front):
+           gpu_fermat_limbs_for_bits(256+shift) limbs instead of the compiled
+           GPU_NLIMBS.  At shift 738 that is 16 vs 32 -> the per-worker staging
+           halves from ~655 MB to ~328 MB, which is what a --threads 8 miner
+           turns into ~5 GB (and ~10 GB as two dual-GPU processes).  Batch stays
+           at GPU_ADAPTER_MAX_BATCH: the CRT path submits a whole flight and
+           gpu_fermat_clamp() TRUNCATES anything past max_batch, so lowering it
+           below the flight's candidate count would silently drop verdicts. */
+        gpu = gpu_adapter_init_limbs((int)config->gpu_device,
+                                     GPU_ADAPTER_MAX_BATCH,
+                                     gpu_fermat_limbs_for_bits(256U + rt->shift));
         if (gpu) {
             gpu_adapter_set_candidate_bits(gpu, 256U + rt->shift);
             gpu_limbs = gpu_adapter_get_limbs(gpu);

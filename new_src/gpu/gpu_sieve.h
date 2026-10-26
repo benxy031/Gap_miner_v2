@@ -292,6 +292,39 @@ uint64_t *gpu_sieve_pingpong_bitmap(gpu_sieve_ctx *ctx, int buf);
 /* Size the extract candidate buffers for K-window MR batch accumulation. */
 void gpu_sieve_set_extract_accum(gpu_sieve_ctx *ctx, uint32_t k);
 
+/* Fixed per-window candidate capacity = stride of the deferred-count layout. */
+void gpu_sieve_set_cand_cap(gpu_sieve_ctx *ctx, uint64_t per_window);
+uint64_t gpu_sieve_cand_cap_per_window(const gpu_sieve_ctx *ctx);
+
+/* Deferred per-window survivor counts: see the block comment above
+   gpu_sieve_defer_prepare in gpu_sieve.cu.  One D2H + one stream sync per
+   FLIGHT instead of per window. */
+int gpu_sieve_defer_prepare(gpu_sieve_ctx *ctx, size_t windows);
+int gpu_sieve_counts_request(gpu_sieve_ctx *ctx, size_t windows);
+const unsigned int *gpu_sieve_counts_host(gpu_sieve_ctx *ctx);
+int gpu_sieve_extract_pack_device_defer(gpu_sieve_ctx *ctx,
+                                        uint64_t odd_interval_size,
+                                        uint64_t first_odd_offset,
+                                        uint64_t lo_odd,
+                                        uint64_t hi_odd,
+                                        int bitmap_buf,
+                                        int cand_buf,
+                                        const uint64_t *base_limbs,
+                                        int active_limbs,
+                                        uint64_t *host_offsets,
+                                        uint32_t slot_base,
+                                        int defer_index,
+                                        uint32_t base_mod60,
+                                        uint64_t class_mask60,
+                                        uint64_t region_start);
+
+/* Pin a caller-owned host buffer for real async DMA (1 = pinned).  The gap-hunt
+   fill copies survivor OFFSETS to host memory once per window and, in
+   fill-pipeline mode, leaves those copies in flight; a pageable destination
+   serialises them through the driver's staging path.  Costs `bytes` of
+   non-pageable RAM, so it is a knob (GAP_HUNT_PIN_OFFSETS). */
+int gpu_sieve_pin_host(void *ptr, size_t bytes);
+
 /* Pin the candidate capacity to the caller's host-side allocation (total
    slots, i.e. per-window capacity x K; 0 = no limit).  The host candidate
    arrays are written by the same dense layout the device buffers use, so

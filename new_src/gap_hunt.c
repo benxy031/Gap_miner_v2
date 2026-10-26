@@ -349,6 +349,14 @@ struct gh_ctx {
     uint64_t res_windows;
     uint64_t *p_limbs;          /* P limbs: the per-window CRT step */
     uint64_t res_m_limit;       /* max folded m_steps (device limit) */
+    /* Deferred per-window survivor counts (GAP_HUNT_DEFER_COUNT): the fill
+       places window i's survivors at i*stride WITHOUT waiting for the count,
+       so all K windows' extracts run back-to-back on the sieve stream and the
+       counts are read back once per flight.  Measured 2026-10-25: the fill is
+       179 us/window of which ~53 us is isolated kernel work -- the rest is the
+       one-sync-per-window round trip this mode removes. */
+    int defer_counts;
+    uint32_t stride;
 };
 
 static void gh_batch_init(struct gh_batch *b) {
@@ -589,6 +597,36 @@ static int gh_fill_extract(struct gh_batch *b, int slot, struct gh_ctx *g,
                            struct gh_fill_win *w, uint32_t *cum_io) {
     uint64_t *d_cands = NULL;
     unsigned int nc = 0;
+    if (g->defer_counts) {
+        /* Fixed-stride placement: the next window's base is known without
+           this window's count, so no host sync here (see the note in
+           gpu_sieve.cu / gpu_sieve_extract_pack_device_defer). */
+        uint64_t base = (uint64_t)w->i * (uint64_t)g->stride;
+        if ((uint64_t)g->stride * (uint64_t)g_batch > g->cap) {
+            fprintf(stderr, "[GAP_HUNT] defer stride %u x K=%d exceeds cap "
+                    "%llu\n", g->stride, g_batch,
+                    (unsigned long long)g->cap);
+            return 0;
+        }
+        if (!gpu_sieve_extract_pack_device_defer(
+                g->sieve, w->odd_size, w->first_odd_offset, 0,
+                w->lo_tail_odd, w->buf, slot, w->limbs, g->fermat_limbs,
+                b->win_off[w->i], (uint32_t)base, (int)w->i, w->base_mod60,
+                w->class_mask, g->region_start)) {
+            fprintf(stderr, "[GAP_HUNT] fill fail: deferred extract "
+                    "(k=%llu i=%u)\n", (unsigned long long)w->k, w->i);
+            return 0;
+        }
+        b->count[w->i] = 0;      /* filled by the flight-boundary readback */
+        b->cum[w->i] = (uint32_t)base;
+        *cum_io = (uint32_t)(base + (uint64_t)g->stride);
+        if (g_host_timing) {
+            uint64_t ht1 = gh_now_us();
+            g_ht_extract += ht1 - w->ht0;
+            w->ht0 = ht1;
+        }
+        return 1;
+    }
     if (!gpu_sieve_extract_pack_device_range_ex(
             g->sieve, w->odd_size, w->first_odd_offset, 0, w->lo_tail_odd,
             w->buf, slot, w->limbs, g->fermat_limbs, &d_cands,
@@ -762,6 +800,46 @@ static void gh_fill_finalize(struct gh_batch *b, int slot, uint32_t cum) {
     b->slot = slot;
 }
 
+/* Flight boundary: finalize, make the deferred survivor counts host-visible
+   (ONE D2H for the whole flight), sync the sieve stream, and install the
+   counts.  In deferred mode a window whose count exceeds its fixed stride
+   would have spilled into the NEXT window's offsets, so that is a hard
+   fail-closed (never a silent truncation: a dropped survivor is a false gap). */
+static int gh_fill_commit(struct gh_batch *b, int slot, uint32_t cum,
+                          struct gh_ctx *g) {
+    gh_fill_finalize(b, slot, cum);
+    if (g->defer_counts &&
+        !gpu_sieve_counts_request(g->sieve, (size_t)g_batch))
+        return 0;
+    /* Deferred mark/extract work of this fill must be drained before the scan
+       of this flight starts (the MR gather reads the device candidate buffer
+       from the fermat stream, so it must not race the sieve stream's last
+       extract).  Once per flight, not per window. */
+    if (!gpu_sieve_sync_stream(g->sieve))
+        return 0;
+    if (g->defer_counts) {
+        const unsigned int *hc = gpu_sieve_counts_host(g->sieve);
+        if (!hc)
+            return 0;
+        for (uint32_t i = 0; i < (uint32_t)g_batch; i++) {
+            unsigned int c = hc[i];
+            if (c & 0x80000000U) {
+                fprintf(stderr, "[GAP_HUNT] deferred extract: capacity flag "
+                        "on window %u - failing closed\n", i);
+                return 0;
+            }
+            if (c > g->stride) {
+                fprintf(stderr, "[GAP_HUNT] deferred extract: window %u has "
+                        "%u survivors > stride %u - failing closed\n",
+                        i, c, g->stride);
+                return 0;
+            }
+            b->count[i] = c;
+        }
+    }
+    return 1;
+}
+
 /* Serial fill of a whole flight (mark + extract, NO scan).  Split out of the
    old gh_batch_fill so the jump2 prefetch can fill the NEXT flight in quanta
    while the current one scans. */
@@ -774,12 +852,7 @@ static int gh_fill_only(struct gh_batch *b, int slot, uint64_t k0,
             return 0;
         i += q;
     }
-    gh_fill_finalize(b, slot, cum);
-    /* Flight boundary: with the fill pipeline the mark/extract syncs are
-       deferred (see gpu_sieve_set_fill_pipeline), so this is where the flight's
-       last window is made host-visible before anything else reads the host
-       offsets or the device candidate buffer. */
-    return gpu_sieve_sync_stream(g->sieve);
+    return gh_fill_commit(b, slot, cum, g);
 }
 
 /* ── P1: next-flight fill prefetch (2026-10-02) ─────────────────────────
@@ -881,16 +954,13 @@ static int gh_prefetch_step(struct gh_prefetch *pf, struct gh_ctx *g) {
         g_j2_pref_windows += q;
     }
     if (pf->next_i >= (uint32_t)g_batch) {
-        gh_fill_finalize(pf->b, pf->slot, pf->cum);
-        /* Flight boundary: drain the deferred mark/extract work of this fill
-           before the scan of this flight can start (the MR gather reads the
-           device candidate buffer from the fermat stream, so it must not race
-           the sieve stream's last extract).  Once per flight, not per window. */
-        if (!gpu_sieve_sync_stream(g->sieve))
+        /* Flight boundary: commit = finalize + deferred counts + the ONE
+           stream sync of this whole flight (mark/extract drain before the
+           scan can read the candidate buffer). */
+        if (!gh_fill_commit(pf->b, pf->slot, pf->cum, g))
             pf->failed = 1;
         pf->done = 1;
-    }
-    return !pf->failed;
+    }    return !pf->failed;
 }
 
 /* ── Jump2: chunk-parallel backward search (Kehrig-exact, latency-free) ───
@@ -1830,6 +1900,23 @@ int gap_hunt_run(const struct gap_hunt_config *cfg) {
     }
     uint64_t *offsets = (uint64_t *)malloc(
         2U * (size_t)g_batch * win_cap * sizeof(uint64_t));
+    /* Pin the offset slices (GAP_HUNT_PIN_OFFSETS=0 disables): the fill copies
+       survivor offsets to host memory once per window and, in fill-pipeline
+       mode, deliberately leaves those copies in flight, so a pageable
+       destination serialises them through the driver's staging path.
+       Measured 2026-10-25 (shift720/p98/m40, K=2048, ABBA below): see
+       docs/ or the repo note; the cost is ~2 x K x win_cap x 8 B of
+       non-pageable RAM, which is why this stays switchable. */
+    {
+        const char *pin_env = getenv("GAP_HUNT_PIN_OFFSETS");
+        int want_pin = !(pin_env && pin_env[0] == '0');
+        if (want_pin && offsets &&
+            !gpu_sieve_pin_host(offsets,
+                                2U * (size_t)g_batch * win_cap *
+                                    sizeof(uint64_t)))
+            fprintf(stderr, "[GAP_HUNT] note: offsets buffer stays pageable "
+                            "(pin failed)\n");
+    }
     uint8_t *flags = (uint8_t *)malloc(
         (size_t)g_batch * win_cap);
     if (!base_limbs || !offsets || !flags) {
@@ -2049,6 +2136,59 @@ int gap_hunt_run(const struct gap_hunt_config *cfg) {
         A.win_off[i] = offsets + (size_t)i * win_cap;
         B.win_off[i] =
             offsets + ((size_t)g_batch + (size_t)i) * win_cap;
+    }
+
+    /* Deferred per-window survivor counts (GAP_HUNT_DEFER_COUNT=1 enables).
+       The fill needs each window's survivor count only to place the NEXT
+       window's survivors, so with a FIXED stride the placement is known up
+       front and the per-window sync disappears: all K extracts run back to
+       back and the counts are read back once per flight.
+
+       DEFAULT OFF: measured 2026-10-25 over three interleaved ABBA blocks at
+       shift720/p98/m40, K=2048 -- +1.6%, -5.7% (bulk-copy variant) and -0.3%
+       respectively, while arms of the SAME configuration varied by up to 5.7%.
+       The mechanism is hidden host work, not wasted time: with the syncs gone
+       the host side drops from 140 to 49.5 us/window and the WALL does not
+       move, because that work was already overlapped with GPU work.  Batching
+       the offset copy into one 76 MB D2H per flight made it clearly worse (the
+       copy lands in the scan's critical path).  Keep the mode for a geometry
+       where the HOST is the bottleneck (slower CPU, or a GPU fast enough that
+       the 4.8 MB prime-table streaming per window stops dominating).
+
+       Requirements when enabled: the host stride must equal the device's
+       per-window capacity (both come from gpu_sieve_cand_cap_estimate, and
+       right-sizing is skipped in this mode), and the window must be extracted
+       in ONE range (quarter mode issues a second extract per window). */
+    {
+        const char *dv = getenv("GAP_HUNT_DEFER_COUNT");
+        int want = (dv && dv[0] && dv[0] != '0');
+        if (want && g_quarter) {
+            fprintf(stderr, "[GAP_HUNT] note: deferred counts are off in "
+                            "quarter mode\n");
+        } else if (want) {
+            gpu_sieve_set_cand_cap(gpu_sieve, (uint64_t)win_cap);
+            if (!gpu_sieve_defer_prepare(gpu_sieve, (size_t)g_batch)) {
+                fprintf(stderr, "[GAP_HUNT] note: deferred counts unavailable "
+                                "(device count array alloc failed)\n");
+            } else if (gpu_sieve_cand_cap_per_window(gpu_sieve) !=
+                       (uint64_t)win_cap) {
+                fprintf(stderr, "[GAP_HUNT] note: deferred counts off "
+                                "(device capacity %llu != host stride %zu)\n",
+                        (unsigned long long)
+                            gpu_sieve_cand_cap_per_window(gpu_sieve),
+                        win_cap);
+            } else if ((uint64_t)win_cap * (uint64_t)g_batch > g.cap) {
+                fprintf(stderr, "[GAP_HUNT] note: deferred counts off "
+                                "(stride x K exceeds the candidate cap)\n");
+            } else {
+                g.defer_counts = 1;
+                g.stride = (uint32_t)win_cap;
+                fprintf(stderr, "[GAP_HUNT] deferred survivor counts ON "
+                                "(stride=%u slots/window, one count readback "
+                                "per %d-window flight)\n",
+                        g.stride, g_batch);
+            }
+        }
     }
 
     uint64_t next_k = k;

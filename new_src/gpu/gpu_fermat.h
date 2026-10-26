@@ -48,6 +48,14 @@ int gpu_fermat_device_count(void);
    Returns NULL on failure (no GPU, driver error, out of memory). */
 gpu_fermat_ctx *gpu_fermat_init(int device_id, size_t max_batch);
 
+/* Same, but the staging buffers are allocated for `limbs` limbs (≤ GPU_NLIMBS)
+   instead of the compiled maximum.  Use it when the geometry's width is known
+   up front (e.g. 256+shift bits -> 16 limbs at shift 738): the buffers are
+   4 x 2 slots x max_batch x limbs x 8 B, so this is a direct 2x saving at
+   16 vs 32 limbs.  set_limbs() can never widen past this allocation. */
+gpu_fermat_ctx *gpu_fermat_init_limbs(int device_id, size_t max_batch,
+                                      int limbs);
+
 /* Real per-call candidate cap of this context (the value passed to
    gpu_fermat_init; every submit clamps to it).  Callers that size their own
    staging or guards MUST use THIS value, not a compile-time macro: if the
@@ -100,8 +108,7 @@ int gpu_fermat_submit_device(gpu_fermat_ctx *ctx, int slot,
 */
 
 /* Submit candidates for async Fermat testing on the given slot (0 or 1).
-   Copies candidates into pinned staging, launches async H→D + kernel + D→H.
-   Returns 0 on success, -1 on error.  The candidates buffer may be reused
+   Copies candidates into pinned staging, launches async H→D + kernel + D→H.   Returns 0 on success, -1 on error.  The candidates buffer may be reused
    immediately after this call returns. */
 int gpu_fermat_submit(gpu_fermat_ctx *ctx, int slot,
                       const uint64_t *candidates, size_t count);

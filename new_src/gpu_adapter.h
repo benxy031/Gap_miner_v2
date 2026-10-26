@@ -55,6 +55,12 @@ struct gpu_adapter {
 /* Initialize GPU adapter for given device */
 struct gpu_adapter *gpu_adapter_init(int device_id);
 
+/* Initialize with explicit staging sizes: `max_batch` candidates x `limbs`
+   limbs per context (0 limbs = compiled maximum).  Each worker thread owns one
+   adapter, so memory = threads x 8 x max_batch x limbs x 8 B. */
+struct gpu_adapter *gpu_adapter_init_limbs(int device_id, size_t max_batch,
+                                           int limbs);
+
 /* Return the number of usable CUDA devices, or 1 for CPU-only builds. */
 int gpu_adapter_device_count(void);
 

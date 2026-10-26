@@ -26,6 +26,7 @@
 #include "perig.cuh"           /* ciosFermatTest128_hi - exact to 120 bits */
 #include "mr128_64_kernel.cuh"  /* >= 2^120: exact 2x64-bit CIOS, 1.1x faster
                                    than the 4x32 kernel (tools/mr128_bench.cu) */
+#include "p0_test_lazy.cuh"     /* < 2^75: our lazy-Barrett test, 1.23x faster */
 
 __device__ __constant__ uint32_t c30_cls[8] = {1, 7, 11, 13, 17, 19, 23, 29};
 __device__ __constant__ int8_t c30_clsidx[30];
@@ -312,20 +313,23 @@ __global__ static void class30_sieve_kernel(const uint64_t * __restrict__ primes
    scan range's high word passed at runtime (ciosFermatTest128_hi). */
 /* Primality test dispatch.  perig's ciosFermatTest128_hi is exact up to 120
    bits but rejects real primes from 121 bits on (a false negative silently
-   splits a gap - see tools/mr128_64_kernel.cuh).  Bands: perig below 2^120,
-   the lazy ladder (mr128_64_base2_lazy, exact < 2^126, +37%) in
-   2^120..2^126, and the canonical kernel above 2^126.  Values below 2^120
-   keep the perig verdict, so the <= 96-bit production path is bit-for-bit
-   unchanged. */
+   splits a gap - see tools/mr128_64_kernel.cuh).  Bands: OUR lazy-Barrett
+   three-limb test below 2^75 (measured 1.35x perig in that band: 0.94 vs
+   1.27 ns/test, gates in tools/bench_lazy.cu), perig in 2^75..2^120, the lazy
+   Montgomery ladder (mr128_64_base2_lazy, exact < 2^126, +37%) in
+   2^120..2^126, and the canonical kernel above 2^126.  Above 2^75 the
+   verdicts are bit-for-bit what they were. */
+#define W_SMALL_MAX_HI  (1ULL << 11)     /* value < 2^75: mode 3 */
 #define W_PERIG_MAX_HI  (1ULL << 56)     /* value < 2^120 */
 #define W_LAZY_MAX_HI   (1ULL << 62)     /* value < 2^126 */
 
 /* The test is selected at kernel-compile time, not per call: instantiating
-   three variants in one kernel lets ptxas allocate registers for the worst
+   several variants in one kernel lets ptxas allocate registers for the worst
    branch, which cost the production (perig) path 18%.  The host launches the
    variant matching the super-batch's high word. */
 template<int MODE>
 __device__ static inline int w_is_probable_prime(uint64_t v, uint64_t Ahi) {
+    if (MODE == 3) return p0lazy::test_hi(v, (uint32_t)Ahi) ? 1 : 0;
     if (MODE == 2) return mr128_64_base2_u128(v, Ahi);
     if (MODE == 1) return mr128_64_base2_lazy_u128(v, Ahi);
     return ciosFermatTest128_hi(v, Ahi) ? 1 : 0;
@@ -334,6 +338,7 @@ __device__ static inline int w_is_probable_prime(uint64_t v, uint64_t Ahi) {
 __host__ static inline int w_test_mode(uint64_t Ahi) {
     if (Ahi >= W_LAZY_MAX_HI)  return 2;
     if (Ahi >= W_PERIG_MAX_HI) return 1;
+    if (Ahi && Ahi < W_SMALL_MAX_HI) return 3;
     return 0;
 }
 

@@ -138,10 +138,13 @@ settings**:
   19.32/21.56 s vs canonical 24.75/25.14 s with `tests` and the gap set
   identical, so perig is the fastest of those three.  Mode 3 at
   `--start 1e22` (hi = 542): see the dispatch default below.
-* Walk test dispatch (default, no environment variable): `n < 2^75` -> mode 3,
-  `2^75 .. 2^120` -> perig, `2^120 .. 2^126` -> mode 1, above -> mode 2.  The
-  band boundaries are the exactness limits, not tuning: mode 3's five-word
-  square needs a < 2^80, perig is exact to 2^120, mode 1 to 2^126.  Example:
+* Walk test dispatch (default, no environment variable): `n` under 2^70 ->
+  perig, `2^70 .. 2^75` -> mode 3, `2^75 .. 2^120` -> perig, `2^120 .. 2^126` ->
+  mode 1, above -> mode 2.  The band boundaries are exactness limits (mode 3's
+  five-word square needs a < 2^80, perig is exact to 2^120, mode 1 to 2^126),
+  EXCEPT the 2^70 lower bound for mode 3, which is a measured crossover: our
+  test's reciprocal costs more up front than perig's constants, so it only pays
+  once the exponent is long enough.  Example:
   `./bin/phase0_scan_gpu --engine walk --start 1e22 --length 2e12 --merit-min 20`
   runs mode 3 without any variable set.
   **Measured 2026-10-26** (dev 3070, `--start 1e22 --length 2e12 --merit-min 20`,

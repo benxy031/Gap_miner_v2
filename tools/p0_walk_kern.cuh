@@ -319,6 +319,7 @@ __global__ static void class30_sieve_kernel(const uint64_t * __restrict__ primes
    Montgomery ladder (mr128_64_base2_lazy, exact < 2^126, +37%) in
    2^120..2^126, and the canonical kernel above 2^126.  Above 2^75 the
    verdicts are bit-for-bit what they were. */
+#define W_MODE3_MIN_HI  (64ULL)          /* value >= 2^70: mode 3 is faster */
 #define W_SMALL_MAX_HI  (1ULL << 11)     /* value < 2^75: mode 3 */
 #define W_PERIG_MAX_HI  (1ULL << 56)     /* value < 2^120 */
 #define W_LAZY_MAX_HI   (1ULL << 62)     /* value < 2^126 */
@@ -338,7 +339,11 @@ __device__ static inline int w_is_probable_prime(uint64_t v, uint64_t Ahi) {
 __host__ static inline int w_test_mode(uint64_t Ahi) {
     if (Ahi >= W_LAZY_MAX_HI)  return 2;
     if (Ahi >= W_PERIG_MAX_HI) return 1;
-    if (Ahi && Ahi < W_SMALL_MAX_HI) return 3;
+    /* mode 3 wins only once there are enough squarings to amortise its
+       reciprocal: measured ours/perig = 0.998 at Ahi=17, 0.960 at 54, 0.960 at
+       171, 0.921 at 542, but 1.02 BELOW Ahi~10.  The crossover is in the
+       exponent length, so the lower bound is Ahi=64 (n >= 2^70). */
+    if (Ahi >= W_MODE3_MIN_HI && Ahi < W_SMALL_MAX_HI) return 3;
     return 0;
 }
 

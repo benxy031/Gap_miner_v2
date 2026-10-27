@@ -70,7 +70,7 @@ bin/phase0_scan_gpu [--start DEC] [--length DEC] [--sieve-limit P] [--threads T]
                     [--records FILE] [--no-records] [--gpu-sieve|--cpu-sieve]
                     [--check [N]] [--legacy-mr] [--no-test]
                     [--engine sieve|walk] [--gap-min G] [--walk-primes P]
-                    [--walk-batch B] [--best N] [--recent N]
+                    [--walk-batch B] [--best N] [--recent N] [--smooth G,..]
 ```
 
 Defaults:
@@ -95,6 +95,7 @@ Defaults:
 | `--records FILE` / `--no-records` | `data/prime_gap_merits.txt` if present | record check: gap length in table AND merit > best known; a beat is logged even below `--merit-min` |
 | `--best N` | `10` | how many of the STRONGEST gaps the run found are listed as `top#k` rows in the results (merit order; range 1..32). Report-only: no band, log line, test or record decision depends on it. `--best 12` lists 12 |
 | `--recent N` | `10` | how many of the LAST REPORTED gaps (the ones that passed `--merit-min`) are listed as `recent finds`, oldest first; range 0..64, `0` disables the section. Costs one mutex per reported gap (~30 locks/s at `--merit-min 15`, i.e. invisible). `--recent 20` lists 20 |
+| `--smooth G,..` | off | sieve engine only: smooth-run census (longest run of consecutive gaps `<= g`) for each bound; bounds even, 2..1e6, at most 128 entries. Rejected with `--engine walk` (it only reports gaps `>= --gap-min`, so it cannot see the small gaps a census needs), with `--no-test`, and with `--check`. With the flag off the output is byte-identical to a build without it (verified: same 21,232-row gap log; docs §30) |
 | sieve mode | `--gpu-sieve` | `--cpu-sieve` selects the (slow) CPU marking path |
 | MR pipeline | bitmap-fed (fast) | `--legacy-mr` selects the batched steps/res path (A/B reference; `--check` always uses it) |
 | `--check [N]` | off | sieve+MR `[start, start+N)` then re-walk the range with `mpz_nextprime`; N default 2e6. Forces the legacy MR path (needs the collect list) |
@@ -117,6 +118,31 @@ on devices that cannot opt in past it), because the item table holds one row per
 ints (P = 100000 / 250000) with an identical gap set (8753/8753 rows,
 `tests=896651987` identical).  A partial last tile is handled by the kernel's
 `lastSlots` clamp (block = 2^28 slots does not divide by 753664).
+`P0_ITEM_CHUNK=N` (walk engine) sets how many marks one item-table row covers,
+default `256` (rounded down to a multiple of 8; range 8..4096).  Together with
+`P0_TILE_SLOTS` it fixes the row count, which is the mark's dominant cost.
+Re-swept 2026-10-27 at the campaign band (`--start 1e32 --length 2e12`,
+`--gap-min 2002`, dev 3070, wall per arm): chunk 64/128/**256**/512/1024/2048 ->
+8.80 / 8.63 / **8.66** / 8.80 / 9.04 / 8.82 s, and tile
+131072/262144/524288/**753664** -> 10.81 / 9.60 / 9.20 / **8.61** s, so both
+defaults still sit at the optimum.
+`P0_WK_GRID=N` / `P0_WK_BLOCK=N` (walk engine) are the walk kernel's CTA count and
+threads per CTA, defaults `46` / `512` (ranges 1..4096 and 32..1024).  They are a
+measured optimum: same arm, 46x512 -> 8.67 s against 92x512 9.40 s, 138x512
+9.60 s, 46x256 9.61 s and 46x1024 9.80 s.  The mark CTA count `P0_SG_GRID` is
+flat there (46/92/138/184/276 -> 8.64..8.84 s), so under `P0_PIPE` the mark is no
+longer the knob it was pre-pipeline - keep its default too.
+`P0_WALK_PROF=1` (walk engine) adds per-thread `clock64` counters and prints the
+walk's scan/test split.  At the campaign band it reads **scan 1.8 % / test
+98.2 %**: the walk is arithmetic, not bitmap scanning.
+
+**Ceiling of the arithmetic avenue, measured 2026-10-27** (`--start 1e32`,
+`--length 2e12`): the walk is 91.8 % of the wall and 98 % of the walk is the test,
+yet the MARK is 98.5 % of the wall and the two streams overlap 1.8x, so
+`wall/mark` = **1.5 %** is the whole prize for making the walk free.  That is why
+a device-resident CUDA-graph rewrite of the scan loop was specified, measured up
+to the ceiling and then **rejected**, and why PGN68's 2.18x is not a scheduler
+win: see `docs/PHASE0_pgn_lever_verdict_2026-10-26.md` (§42).
 
 Diagnostics for cost isolation (walk engine, docs §32) - **never production
 settings**:
@@ -132,11 +158,16 @@ settings**:
   8.1 % of the mark.
 * `P0_WALK_TESTMODE=0|1|2|3` forces the walk's primality variant instead of the
   magnitude dispatch: `0` = perig (2x64 CIOS Montgomery), `1` = exact lazy 2x64,
-  `2` = canonical 2x64, `3` = our three-limb lazy-Barrett test.  Modes 0..2 are
-  only valid above 2^96; mode 3 is the opposite end (2^64 <= n < 2^75).
-  Measured at `--start 1e29` for 0/1/2: perig 16.36/17.18 s vs lazy
+  `2` = canonical 2x64, `3` = our three-limb lazy-Barrett test.  Modes 0..2 live
+  in the same 128-bit container (perig is exact to 2^120, the lazy and canonical
+  variants past it), so their band boundaries are COST choices, not correctness
+  ones - the three agree on the emitted gap set at 1e32 (`--gap-min 1300`:
+  185/185 gaps in every arm).  Measured at `--start 1e29` for 0/1/2: perig
+  16.36/17.18 s vs lazy
   19.32/21.56 s vs canonical 24.75/25.14 s with `tests` and the gap set
-  identical, so perig is the fastest of those three.  Mode 3 at
+  identical, so perig is the fastest of those three; re-measured at the campaign
+  band (`--start 1e32 --length 2e12 --gap-min 1300`): perig **12.86 s** < lazy
+  16.00 s < canonical 18.40 s.  Mode 3 at
   `--start 1e22` (hi = 542): see the dispatch default below.
 * Walk test dispatch (default, no environment variable): `n` under 2^70 ->
   perig, `2^70 .. 2^75` -> mode 3, `2^75 .. 2^120` -> perig, `2^120 .. 2^126` ->

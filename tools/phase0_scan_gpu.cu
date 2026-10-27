@@ -2263,7 +2263,7 @@ static void usage(const char *p) {
         "         engine (approx. 10x faster than the exhaustive sieve path):\n"
         "         it reports every gap >= --gap-min (default ceil(merit-min *\n"
         "         ln(start))) through the same log/records/verify path, with\n"
-        "         --walk-primes (sieve depth, default 40000, the measured\n         optimum; raise it further at >= 2^120) and --walk-batch\n"
+        "         --walk-primes (sieve depth, default 150000 = the measured\n         optimum on the 92 KB tile; 40000 wins at shallow starts, and a deeper sieve pays at >= 2^120) and --walk-batch\n"
         "         (blocks per super-batch, default 64, range 4..96; VRAM =\n"
         "         2 x (K+1) x 33.6 MB: K=32 2.2 GB, K=64 4.4 GB, K=96 6.5 GB).  The range\n"
         "         must fit one 64-bit window of the block base (true for all\n"

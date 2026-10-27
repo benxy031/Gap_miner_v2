@@ -147,6 +147,11 @@ DEFAULT_POOL_LOG = "gapminer_pool_records.log"
 DEFAULT_TABLE = "data/prime_gap_merits.txt"
 
 Z95 = 1.959963985
+# The record table stores 4 decimals, so a merit delta below its own
+# granularity is a rounding TIE, not a beat.  Set from the table's precision,
+# never from how close a row happens to look (a 6-decimal value compared with a
+# 4-decimal table manufactures records like 28.082649 > 28.0826).
+TABLE_TOL = 1.0e-4
 
 
 @dataclass
@@ -417,20 +422,35 @@ def _int(v):
 
 # ── statistics ───────────────────────────────────────────────────────────────
 
-def poisson_rate(n: int, hours: float):
-    """(rate, lo, hi) candidates per hour, 95% normal-approximation interval.
+def _chi2_q(k: float, p: float) -> float:
+    """Chi-square quantile by Wilson-Hilferty (no scipy on a miner box).
 
-    For small n the normal approximation is optimistic, so the caller prints
-    the interval only as a scale and falls back to the exact zero-count bound
-    when n == 0 (95% upper bound = 3.0 events, the standard Poisson rule).
+    Accurate to ~1% for k >= 10 and monotone in k, which is all the Garwood
+    Poisson interval below needs; it replaces a normal approximation that was
+    optimistic exactly where these logs are thin (n of a few events).
+    """
+    z = -Z95 if p < 0.5 else Z95
+    a = 2.0 / (9.0 * k)
+    return k * (1.0 - a + z * math.sqrt(a)) ** 3
+
+
+def poisson_rate(n: int, hours: float):
+    """(rate, lo, hi) candidates per hour, 95% interval.
+
+    Uses the EXACT Garwood (chi-square) interval for n > 0: the normal
+    approximation is optimistic for the small counts these logs often have, and
+    a rate bound that is too tight reads as a detection that is not there.
+    n == 0 keeps the standard 3.0/spans Poisson rule, which is what a report
+    about "nothing found" must say.
     """
     if hours <= 0:
         return (float("nan"), float("nan"), float("nan"))
     rate = n / hours
     if n == 0:
         return (0.0, 0.0, 3.0 / hours)
-    half = Z95 * math.sqrt(n) / hours
-    return (rate, max(0.0, rate - half), rate + half)
+    lo = 0.5 * _chi2_q(2.0 * n, 0.025) / hours
+    hi = 0.5 * _chi2_q(2.0 * n + 2.0, 0.975) / hours
+    return (rate, max(0.0, lo), hi)
 
 
 def quantile(sorted_vals, q):
@@ -496,6 +516,36 @@ def sigma_from_quantiles(merits):
     if q75 <= q25 or c75 == 0:
         return None
     return (q75 - q25) / math.log(c25 / c75)
+
+
+def sigma_profile(merits, levels=(0.0, 0.1, 0.25, 0.5), min_n=8):
+    """Mean-excess scale re-estimated at increasing thresholds (the drift).
+
+    A single fitted sigma is the AVERAGE slope over the whole tail.  When the
+    tail steepens with depth - the normal case here - that average
+    OVER-predicts counts past the deepest threshold anybody counted, so an
+    estimate built on it is optimistic by a factor that grows with depth.  This
+    returns [(m0, n_at_or_above, sigma), ...] so the caller can report the
+    drift and extrapolate with the LOCAL (deepest) value instead.
+    """
+    s = sorted(merits)
+    out = []
+    for q in levels:
+        if len(s) < min_n:
+            break
+        m0 = quantile(s, q)
+        tail = [m for m in s if m >= m0]
+        if len(tail) < min_n:
+            continue
+        out.append((m0, len(tail),
+                    sum(m - m0 for m in tail) / len(tail)))
+    return out
+
+
+def deep_scale(merits, levels=(0.0, 0.1, 0.25, 0.5), min_n=8):
+    """(m0, n, sigma) of the deepest threshold that still carries counts."""
+    prof = sigma_profile(merits, levels, min_n)
+    return prof[-1] if prof else None
 
 
 def ks_exponential(merits, m0, sigma):
@@ -614,7 +664,7 @@ def report_group(title, cands, table, args, out=sys.stdout, comparable=True):
     print(f"   candidates     {n}", file=out)
     if span_ok:
         print(f"   rate           {rate:.2f}/h  "
-              f"(95% CI {lo:.2f}..{hi:.2f}, normal approximation)", file=out)
+              f"(95% CI {lo:.2f}..{hi:.2f}, exact Poisson)", file=out)
     else:
         print("   rate           n/a (all candidates carry the same timestamp)",
               file=out)
@@ -669,8 +719,26 @@ def report_group(title, cands, table, args, out=sys.stdout, comparable=True):
         if s_eff:
             print(f"                  sigma_eff={s_eff:.3f} -> cover gain "
                   f"x{nat.gain(28.0, s_eff, L_nat):.1f} at merit 28, "
-                  f"x{nat.gain(40.0, s_eff, L_nat):.0f} at merit 40",
-                  file=out)
+                  f"x{nat.gain(40.0, s_eff, L_nat):.0f} at merit 40"
+                  "   [MODEL: from the fitted sigma]", file=out)
+            # The countable version of the same statement.  The fitted sigma
+            # absorbs most of the cover effect, so the model number can sit an
+            # order of magnitude above what the observed counts support; when
+            # the two disagree, the counted one is the honest one to quote.
+            m0c = merits[0]
+            e0c = nat.E(L_nat, m0c)
+            parts = []
+            for mm in (28.0, 40.0):
+                obs = sum(1 for m in merits if m >= mm)
+                en = len(merits) * math.exp(-(nat.E(L_nat, mm) - e0c))
+                if obs < 5 or en < 5:
+                    parts.append(f"m>={mm:.0f}: too thin (obs {obs}, "
+                                 f"nat_exp {en:.1f})")
+                else:
+                    parts.append(f"m>={mm:.0f}: x{obs / en:.2f} "
+                                 f"(obs {obs} vs nat {en:.1f})")
+            print("                  cover gain COUNTED (external, QUOTE THIS): "
+                  + "; ".join(parts), file=out)
         print("                  a tail that MATCHES this line means the cover "
               "adds nothing at this size", file=out)
 
@@ -750,6 +818,50 @@ def report_group(title, cands, table, args, out=sys.stdout, comparable=True):
                             "   [steeper than nature = cover adds little]")
                 print(f"                    {thr:10.4f} {obs:8d} {en:9.1f} {shown}"
                       f"{note}", file=out)
+        # ── deep-end scale: the estimate that survives extrapolation ─────
+        # The rows above price the tail against ONE fitted sigma.  Where the
+        # tail steepens with depth that global value over-predicts, and the
+        # bias GROWS with depth, so the report states the drift and which scale
+        # to extrapolate with instead of leaving the reader to assume.
+        s_loc = None
+        counted = [(thr, obs) for thr, obs, e_c, _r_c, _sd_c in rows
+                   if obs >= 5 and e_c >= 5]
+        if len(counted) >= 2:
+            (t_a, o_a), (t_b, o_b) = counted[-2], counted[-1]
+            if o_a > o_b > 0 and t_b > t_a:
+                s_loc = (t_b - t_a) / math.log(o_a / o_b)
+                dt = max(rows[-1][0] - t_b, t_b - t_a)
+                if sigma > 0 and s_loc > 0:
+                    over = math.exp(dt * (1.0 / s_loc - 1.0 / sigma))
+                    # The local scale rests on the two counts it was computed
+                    # from, so log(over) carries sd = dt*sqrt(1/o_a + 1/o_b).
+                    # Below 2 sigma the honest output is "not resolvable", not
+                    # a recommendation built from the noisier of two numbers.
+                    sd_log = dt * math.sqrt(1.0 / o_a + 1.0 / o_b)
+                    print(f"   deep scale     sigma_local={s_loc:.3f} between "
+                          f"m>={t_a:.4f} (n={o_a}) and m>={t_b:.4f} "
+                          f"(n={o_b})  vs global {sigma:.3f}", file=out)
+                    if abs(math.log(over)) <= 2.0 * sd_log:
+                        print(f"                  the drift is NOT resolvable "
+                              f"with these counts (x{over:.2f} is "
+                              f"{abs(math.log(over)) / sd_log:.1f} sigma, "
+                              f"2 sigma = x{math.exp(2.0 * sd_log):.2f}): "
+                              f"keep the global sigma and collect more "
+                              f"candidates before extrapolating", file=out)
+                    elif over > 1.0:
+                        print(f"                  the global sigma OVER-predicts "
+                              f"beyond m>={t_b:.4f} by x{over:.1f} "
+                              f"({abs(math.log(over)) / sd_log:.1f} sigma) "
+                              f"and the error grows with depth -> "
+                              f"extrapolate with the LOCAL scale, never "
+                              f"{sigma:.3f}", file=out)
+                    else:
+                        print(f"                  the global sigma UNDER-predicts "
+                              f"beyond m>={t_b:.4f} by x{1.0 / over:.1f} "
+                              f"({abs(math.log(over)) / sd_log:.1f} sigma; "
+                              f"tail thicker than the fit) -> extrapolate "
+                              f"with the LOCAL scale", file=out)
+
         # A ratio only means something if it is larger than the Poisson error of
         # the count behind it: at 6 expected events a ratio of 0.70 is pure
         # noise (2 sigma = 0.84), and letting that drive the verdict would
@@ -843,19 +955,49 @@ def report_group(title, cands, table, args, out=sys.stdout, comparable=True):
                 continue
             scored.append((table[c.gap] - c.merit, c))
         scored.sort(key=lambda x: x[0])
-        above = [x for x in scored if x[0] < 0]
+        # Two things a raw row count gets wrong:
+        #  * the site accepts ONE record per gap length, so counting ROWS
+        #    overstates what is claimable - dedupe on the strongest per length;
+        #  * the table carries 4 decimals, so a delta within its own rounding
+        #    granularity is a TIE, never a record.
+        ties = [c for need, c in scored if abs(need) <= TABLE_TOL]
+        above_best = {}
+        for need, c in scored:
+            if need < -TABLE_TOL:
+                cur = above_best.get(c.gap)
+                if cur is None or c.merit > cur.merit:
+                    above_best[c.gap] = c
+        above = sorted(above_best.values(),
+                       key=lambda c: table[c.gap] - c.merit)
+        n_rows_above = sum(1 for need, _c in scored if need < -TABLE_TOL)
+        if above or ties:
+            print(f"   records        {len(above)} distinct gap length(s) above "
+                  f"the table, from {n_rows_above} candidate row(s); "
+                  f"{len(ties)} row(s) inside the table's 4-decimal "
+                  f"granularity = TIE, not a record", file=out)
+            if span_ok and n_rows_above:
+                rr, rlo, rhi = poisson_rate(n_rows_above, hours)
+                print(f"                  measured yield {n_rows_above}/{n} = "
+                      f"{100.0 * n_rows_above / n:.2f}% of candidates, one "
+                      f"every {1.0 / rr:.2f} h (95% CI {1.0 / rhi:.2f}.."
+                      f"{1.0 / rlo:.2f} h)", file=out)
         if above:
-            print(f"   *** {len(above)} candidate(s) ABOVE the known best for "
-                  f"their gap length: verify before claiming anything ***",
-                  file=out)
-            for delta, c in above[:10]:
+            print(f"   *** verify every row before claiming a record: "
+                  f"{len(above)} distinct gap length(s) ***", file=out)
+            for c in above[:10]:
+                delta = c.merit - table[c.gap]
+                tag = ("marginal: may already be superseded" if delta < 0.05
+                       else "strong")
                 print(f"      gap={c.gap} merit={c.merit:.4f} "
-                      f"table={table[c.gap]:.4f} delta={-delta:+.4f} "
-                      f"{c.iso}", file=out)
+                      f"table={table[c.gap]:.4f} delta={delta:+.4f} "
+                      f"[{tag}] {c.iso}", file=out)
                 print(f"        scripts/verify_gap_candidate.py {c.gap} "
                       f"{c.merit:.4f} {c.start if c.start else '<start=missing>'}"
                       f"   # {os.path.basename(c.path)}", file=out)
-        near = [x for x in scored if x[0] >= 0][:args.top]
+            if len(above) > 10:
+                print(f"                  ... and {len(above) - 10} more",
+                      file=out)
+        near = [x for x in scored if x[0] >= -TABLE_TOL][:args.top]
         if near:
             print("   closest to a record (needed merit - found merit):",
                   file=out)
@@ -1417,6 +1559,38 @@ def selftest() -> int:
          ks_exponential(merits, m0, sigma)[2]),
         ("empty log gives a rate bound", "3.0/1h = 3.0/h",
          abs(poisson_rate(0, 1.0)[2] - 3.0) < 1e-9 and lo < rate < hi),
+    ]
+    # Estimator checks (2026-10-27): every extrapolation in the report rests on
+    # the rate interval and on which scale is read off the tail, so both are
+    # pinned here.  Two DETERMINISTIC constructions fix the drift direction: a
+    # capped tail (thinner than exponential, the case the report warns about)
+    # must come back with a smaller deep scale, and a true exponential must NOT
+    # be reported as drifting (no invented trend).
+    ex_lo, ex_hi = poisson_rate(5, 1.0)[1:]
+    capped = ([float(min(i, 100)) for i in range(1, 201)] + [100.5] * 50)
+    prof_cap = sigma_profile(capped)
+    prof_exp = sigma_profile(merits)
+    checks += [
+        ("Poisson CI is Garwood-exact, not normal",
+         f"n=5 -> [{ex_lo:.2f}, {ex_hi:.2f}] (textbook 1.62..11.67)",
+         abs(ex_lo - 1.62) < 0.05 and abs(ex_hi - 11.67) < 0.15),
+        ("sigma profile reads the DEEPEST threshold",
+         f"{len(prof_cap)} levels, m0 {prof_cap[0][0]:.0f} -> "
+         f"{prof_cap[-1][0]:.0f}",
+         len(prof_cap) >= 3
+         and all(prof_cap[i][0] < prof_cap[i + 1][0]
+                 for i in range(len(prof_cap) - 1))
+         and deep_scale(capped) == prof_cap[-1]),
+        ("a capped tail reports a SMALLER deep scale",
+         f"sigma {prof_cap[0][2]:.1f} -> {prof_cap[-1][2]:.2f}",
+         prof_cap[-1][2] < 0.5 * prof_cap[0][2]),
+        ("a true exponential is NOT reported as drifting",
+         f"sigma {prof_exp[0][2]:.3f} -> {prof_exp[-1][2]:.3f}",
+         all(abs(p[2] - prof_exp[0][2]) < 0.3 * prof_exp[0][2]
+             for p in prof_exp)),
+        ("TABLE_TOL spans the table's 4-decimal granularity",
+         f"{TABLE_TOL:g} (want 5e-05..1e-03)",
+         5e-05 <= TABLE_TOL <= 1e-03),
     ]
     failed = 0
     for name, detail, ok in checks:

@@ -436,6 +436,34 @@ scripts/records_report.py --source pool --plot
                                      # observed tail should sit ABOVE the
                                      # natural line, and matching it means the
                                      # cover adds nothing at that size.
+                                     #
+                                     # Since 2026-10-27 the estimates are
+                                     # labelled by what they rest on:
+                                     #   rate       -> exact Poisson (Garwood)
+                                     #                 interval, not normal
+                                     #   cover gain -> printed twice: MODEL
+                                     #                 (from the fitted sigma)
+                                     #                 and COUNTED (obs vs the
+                                     #                 HL natural law). Quote
+                                     #                 COUNTED: the fit
+                                     #                 absorbs most of the
+                                     #                 cover effect.
+                                     #   deep scale -> sigma re-read at the
+                                     #                 DEEPEST threshold that
+                                     #                 still carries counts, with
+                                     #                 the drift's sigma. If it
+                                     #                 is below 2 sigma the
+                                     #                 report says "not
+                                     #                 resolvable" and keeps the
+                                     #                 global value.
+                                     #   records    -> counted per DISTINCT
+                                     #                 gap length (the site takes
+                                     #                 one per length), with rows
+                                     #                 inside the table's
+                                     #                 4-decimal granularity
+                                     #                 reported as TIE, never as a
+                                     #                 record, and a measured
+                                     #                 records-per-hour yield.
 scripts/records_report.py --since 2026-09-19T12:00 --until 2026-09-19T18:00
                                      # a window; ALSO turns "nothing found"
                                      # into a 95% rate upper bound (3.0/span)

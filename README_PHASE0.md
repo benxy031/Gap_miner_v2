@@ -363,9 +363,30 @@ The monitor thread prints exactly this status line; end of run:
 ```
 
 Walk runs print one extra summary line before the band table:
-`stage split (GPU events): mark=... (..%)  walk=... (..%)  other=... (..%)`
-(mark/walk are pure kernel times from CUDA events; `other` goes NEGATIVE when
-P0_PIPE overlaps the stages - that is the overlap, not an error).
+```
+[phase0-gpu] gpu batches=...  tests=...  tests_per_wall=... tests/s  tests/jump=...
+[phase0-gpu] stage SPANS (GPU events): mark=... (..%)  walk=... (..%)  other=...
+```
+
+Two readings that are easy to get wrong, and how to get them right:
+
+- **`tests_per_wall` is `tests / TOTAL wall`**, so the mark time is inside it. It
+  is *not* the walk kernel's own test rate. For the walk's own rate, measure the
+  mark-only wall (`P0_WALK_OFF=1`) and use
+  `tests / (wall - mark_only_wall)`. At 1e32 / `--walk-primes 150000` the two
+  differ by ~1.3x (docs/PHASE0_scan_bench.md section 43).
+- **`stage SPANS` are spans, not cost shares.** Under `P0_PIPE` both stages run
+  concurrently, so each span also covers the other stage's time: both can read
+  ~100 % of the wall and `other` goes negative by exactly the overlap. Never
+  read those percentages as where the time goes. The honest split comes from
+  two independent measurements that agree to 3 %: the mark-only wall
+  (`P0_WALK_OFF=1`) and the intercept of a `wall = a + b/gapmin` fit over
+  several `--gap-min` values, where `a` is the mark and `b/gapmin` the walk
+  (docs/PHASE0_scan_bench.md section 42).
+
+Both lines were relabelled on 2026-10-27 after the span numbers had been read as
+shares and produced a wrong conclusion ("the mark is 94-98 % of the wall") that
+stood for a month; the true split at 1e32 is mark ~24 %, walk ~76 %.
 
 Note: the `fast split` sums are per-kernel wall times on 8 shared streams and
 inflate with stream overlap; run `--threads 1` (or use the 1-thread numbers in

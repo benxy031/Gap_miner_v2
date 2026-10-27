@@ -2038,8 +2038,11 @@ static int run_walk_engine(void) {
                    (unsigned long long)g_pre_ints,
                    g_len ? 100.0 * (double)g_pre_ints / (double)g_len : 0.0,
                    (unsigned long long)wj.ints);
-        printf("[phase0-gpu] gpu batches=%llu  tests=%llu  test_rate=%.3e tests/s  "
-               "tests/jump=%.2f\n",
+        /* This rate divides by the TOTAL wall, so the mark is inside it - it is
+           NOT the walk kernel's own test rate (measured 1.3x apart on
+           2026-10-27, docs section 43).  Labelled so it cannot be misread. */
+        printf("[phase0-gpu] gpu batches=%llu  tests=%llu  tests_per_wall=%.3e tests/s  "
+               "tests/jump=%.2f  [tests_per_wall = tests / TOTAL wall, mark included]\n",
                (unsigned long long)wj.batches, (unsigned long long)wj.tests,
                wall > 0 ? (double)wj.tests / wall : 0.0,
                jumps_total > 0 ? (double)wj.tests / (double)jumps_total : 0.0);
@@ -2054,9 +2057,12 @@ static int run_walk_engine(void) {
         }
         if (t_mark_gpu + t_walk_gpu > 0.0) {
             double other = wall - t_mark_gpu - t_walk_gpu;
-            printf("[phase0-gpu] stage split (GPU events): mark=%.1f s (%.1f%%)  "
-                   "walk=%.1f s (%.1f%%)  other=%.1f s (%.1f%%) "
-                   "[other = host/sync/launch+boot; negative = mark/walk overlap]\n",
+            printf("[phase0-gpu] stage SPANS (GPU events): mark=%.1f s (%.1f%%)  "
+                   "walk=%.1f s (%.1f%%)  other=%.1f s (%.1f%%)\n"
+                   "[phase0-gpu]   SPANS, NOT cost shares: each span also covers the other "
+                   "stage's overlap, so both can read ~100%% and `other` goes negative.\n"
+                   "[phase0-gpu]   real split: P0_WALK_OFF=1 gives the mark-only wall, and "
+                   "wall = a + b/gapmin fits a = mark, b/gapmin = walk (docs section 42)\n",
                    t_mark_gpu, 100.0 * t_mark_gpu / wall,
                    t_walk_gpu, 100.0 * t_walk_gpu / wall,
                    other, 100.0 * other / wall);

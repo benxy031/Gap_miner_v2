@@ -43,7 +43,13 @@ __device__ __constant__ uint32_t c30_pinv[30];
 __device__ static inline uint64_t t_fastmod64(uint64_t x, uint64_t p, uint64_t invp) {
     uint64_t q = __umul64hi(x, invp);
     uint64_t r = x - q * p;
-    while (r >= p) r -= p;
+    /* The host supplies invp = floor(2^64/p) (phase0_scan_gpu.cu), so the
+       quotient estimate is at most one low and r < 2p: two unconditional
+       conditional-subtracts are exact and branch-free.  The data-dependent
+       `while` this replaces diverges across a warp of 32 different primes - it
+       measured 8% of the mark loop (tools/bench_mark_item.cu, P1 vs P3). */
+    r -= (r >= p) ? p : 0;
+    r -= (r >= p) ? p : 0;
     return r;
 }
 
@@ -102,6 +108,20 @@ __global__ static void class30_sieve_kernel(const uint64_t * __restrict__ primes
     __shared__ uint32_t s_step[8 * 8 * 8];   /* [jstart][unit p%30][st] */
     __shared__ uint32_t s_dm8[8];
     __shared__ uint8_t  s_unit[30];
+    /* s_kadj[r0*30 + p%30] = the number of extra p-steps needed to lift a first
+       mark whose residue is r0 onto a slot that the class-30 layout actually
+       contains.  It depends only on (r0, p%30) so the per-row `while` loop that
+       searched for it - 32 lanes searching different distances - becomes one
+       shared lookup (900 B; measured 8% of the mark, bench_mark_item.cu P3). */
+    __shared__ uint8_t  s_kadj[900];
+    for (uint32_t i = threadIdx.x; i < 900u; i += blockDim.x) {
+        uint32_t r0 = i / 30u, pm = i % 30u, k = 0;
+        if (c30_clsidx[pm] >= 0) {
+            uint32_t msk = c30_perm[pm];
+            while (!((msk >> ((r0 + k * pm) % 30u)) & 1u)) k++;
+        }
+        s_kadj[i] = (uint8_t)k;
+    }
     if (threadIdx.x < 30u) {
         uint32_t r = threadIdx.x, j = 0xFFu;
         for (uint32_t t = 0; t < 8u; t++) if (c30_cls[t] == r) j = t;
@@ -148,9 +168,7 @@ __global__ static void class30_sieve_kernel(const uint64_t * __restrict__ primes
             uint64_t phi1 = 1u + d;
             uint64_t r0 = phi1 % 30u;
             uint64_t pm30 = p % 30u;
-            uint32_t mask = c30_perm[pm30];
-            uint64_t kadj = 0;
-            while (!((mask >> ((r0 + kadj * pm30) % 30u)) & 1u)) kadj++;
+            uint64_t kadj = (uint64_t)s_kadj[r0 * 30u + pm30];
             uint64_t phi = phi1 + kadj * p;
             uint64_t r = phi % 30u;
             uint64_t pos = (phi / 30u) * 8u + (uint64_t)c30_clsidx[r];
@@ -211,9 +229,7 @@ __global__ static void class30_sieve_kernel(const uint64_t * __restrict__ primes
                 uint32_t phi1 = (uint32_t)(1u + d);
                 uint32_t r0 = phi1 % 30u;
                 uint32_t pm30 = (uint32_t)(p % 30u);
-                uint32_t mask = c30_perm[pm30];
-                uint32_t kadj = 0;
-                while (!((mask >> ((r0 + kadj * pm30) % 30u)) & 1u)) kadj++;
+                uint32_t kadj = (uint32_t)s_kadj[r0 * 30u + pm30];
                 uint32_t phi = phi1 + kadj * cur_p;
                 uint32_t r = phi % 30u;
                 pos_base = (phi / 30u) * 8u + (uint32_t)c30_clsidx[r];

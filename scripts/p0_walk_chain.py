@@ -35,6 +35,13 @@ Usage (one GPU / two GPUs, detached):
 Options: --slices N (0 = forever), --walk-batch B (default 96),
 --devices D[,D...] (default 0), --bin PATH, --state-dir DIR, --table FILE,
 --dry-run (print the first slice commands and exit).
+
+Watcher: unless --no-watch is given, the chain starts
+scripts/p0_records_to_submit.py detached (its own session, so it survives the
+chain) and appends the watcher output to data/p0_records_watch.out.  If a
+watcher is already running it is reused rather than duplicated.  The watcher
+keeps regenerating records_to_submit_phase0.txt from every data/p0_*.log, so
+the submit list is current without a second terminal.
 """
 import argparse
 import collections
@@ -119,6 +126,17 @@ def main(argv=None):
     ap.add_argument("--no-forecast", action="store_true",
                     help="do not print the p0_record_forecast summary after each "
                          "completed slice")
+    ap.add_argument("--watch", dest="watch", action="store_true", default=True,
+                    help="start scripts/p0_records_to_submit.py detached (default)")
+    ap.add_argument("--no-watch", dest="watch", action="store_false",
+                    help="do not start the records watcher")
+    ap.add_argument("--watch-interval", type=int, default=30,
+                    help="watcher poll interval in seconds (default 30)")
+    ap.add_argument("--watch-script",
+                    default=os.path.join(REPO, "scripts/p0_records_to_submit.py"))
+    ap.add_argument("--watch-out",
+                    default=os.path.join(REPO, "data/p0_records_watch.out"),
+                    help="watcher output file (appended)")
     ap.add_argument("--forecast-top", type=int, default=3,
                     help="open targets shown in the forecast summary (default 3)")
     ap.add_argument("--rate", type=float, default=2.45e11,
@@ -246,10 +264,52 @@ def main(argv=None):
             launch(k, dev)
         return 0
 
+    def start_watcher():
+        """Start the records watcher detached unless one is already running.
+
+        Detached on purpose (own session): the watcher must outlive a chain
+        restart, and a second chain start must not spawn a duplicate.
+        """
+        if not a.watch:
+            print("[chain] watcher: disabled (--no-watch)", flush=True)
+            return None
+        if not os.path.exists(a.watch_script):
+            print(f"[chain] WARNING: watcher script not found: {a.watch_script}",
+                  flush=True)
+            return None
+        pids = []
+        for pid in subprocess.run(["pgrep", "-f", "p0_records_to_submit.py"],
+                                  capture_output=True, text=True).stdout.split():
+            try:
+                with open(f"/proc/{pid}/cmdline", "rb") as fh:
+                    argv = [x for x in fh.read().split(b"\0") if x]
+            except OSError:
+                continue
+            if any(x.endswith(b"p0_records_to_submit.py") for x in argv):
+                pids.append(pid)
+        if pids:
+            print(f"[chain] watcher already running (pid {','.join(pids)}) -> "
+                  f"reusing it", flush=True)
+            return None
+        d = os.path.dirname(a.watch_out)
+        if d:
+            os.makedirs(d, exist_ok=True)
+        fh = open(a.watch_out, "a")
+        p = subprocess.Popen([sys.executable, a.watch_script,
+                              "--interval", str(a.watch_interval)],
+                             stdout=fh, stderr=subprocess.STDOUT,
+                             start_new_session=True)
+        fh.close()
+        print(f"[chain] watcher started (pid {p.pid}, interval "
+              f"{a.watch_interval}s) -> {os.path.basename(a.watch_out)}", flush=True)
+        return p
+
     with open(chain_state, "w") as fh:
         fh.write(f"start0 {S0}\nindex0 {K0}\n")
     with open(lock_path, "w") as fh:
         fh.write(f"{os.getpid()}\n")
+
+    watcher = start_watcher()
 
     running = {}                 # dev -> (k, Popen, fh, t0, S)
     completed = 0
@@ -329,6 +389,9 @@ def main(argv=None):
             pass
 
     print(f"[chain] chain exit: completed={completed} rc={rc_final}", flush=True)
+    if watcher is not None:
+        print(f"[chain] watcher left running (pid {watcher.pid}); stop it with "
+              f"pkill -f p0_records_to_submit.py", flush=True)
     return rc_final
 
 

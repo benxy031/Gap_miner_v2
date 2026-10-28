@@ -29,13 +29,20 @@ Dry-run an export file (nothing is sent):
     python3 scripts/submit_records.py --in records_to_submit_9.txt \\
         --discoverer Gapcoin --dry-run
 
-Send the three strongest records first and inspect the queue:
-    python3 scripts/submit_records.py --in records_to_submit_9.txt \\
-        --discoverer Gapcoin --sort merit --limit 3
+Send everything in ONE POST (the correct way to bulk-submit):
+    python3 scripts/submit_records.py --in records_to_submit_9.txt \
+        --discoverer Gapcoin --bulk
 
-Send everything (one POST per discovery date, dates from gapchain.sqlite3):
-    python3 scripts/submit_records.py --in records_to_submit_9.txt \\
-        --discoverer Gapcoin --batch-size 10 --delay 3
+Why --bulk, and not the per-date default: the site throttles with
+"You have submitted a records recently / wait 23.0 hours / include 25+ records /
+include a 37+ merit gap".  The 25+ escape is evaluated PER POST, while the
+default splits the batch into one POST per discovery DATE (and --batch-size
+splits again).  Measured 2026-10-28: a 41-record file went out as 10 POSTs of
+1..7 records, exactly ONE of them was accepted (7 records merged) and every
+later POST was throttled.  --bulk sends a single POST, which is what actually
+reaches the escape; the price is that every record in it carries the same date.
+A rejected or throttled reply now ABORTS the remaining POSTs instead of firing
+them into the throttle.
 
 Parse a miner log instead (GAP FOUND blocks, expression numbers):
     python3 scripts/submit_records.py --log miner.log \\
@@ -76,6 +83,13 @@ from html.parser import HTMLParser
 # ── Constants ──────────────────────────────────────────────────────────────
 SITE_URL   = "https://primegaps.cloudygo.com/"
 MERITS_URL = "https://primegaps.cloudygo.com/merits.txt"
+
+# Set when the site answers with its submission throttle.  The remaining POSTs
+# are then pointless (and were measured to cost a whole 23 h window on
+# 2026-10-28), so the submit loop aborts instead of firing them.
+_THROTTLED = False
+_THROTTLE_RE = re.compile(r"submitted a records recently|wait 23\.0 hours",
+                          re.IGNORECASE)
 UA         = "cpugapminer-submit/1.0"
 
 # Minimum gap size the site will accept (smaller gaps are fully catalogued)
@@ -493,6 +507,16 @@ def submit_batch(batch, discoverer, date_str, dry_run):
     for item in items:
         print("  Queued:", item)
 
+    # A throttle is a hard stop for the whole session, not a per-batch hiccup.
+    global _THROTTLED
+    if _THROTTLE_RE.search(message + " " + " ".join(items)):
+        _THROTTLED = True
+        print("  THROTTLED: the site refused this commit (\"wait 23.0 hours / "
+              "include 25+ records / include a 37+ merit gap\").")
+        print("  Fix: ONE POST with >= 25 records (--bulk), or wait out the "
+              "23 h window.  Stopping here so the remaining POSTs are not "
+              "wasted.")
+
     return True
 
 
@@ -546,11 +570,20 @@ def main():
     ap.add_argument("--no-split-by-date", action="store_true",
                     help="Pack every record into one date group instead of one "
                          "POST per discovery date")
+    ap.add_argument("--bulk", action="store_true",
+                    help="Send everything in ONE POST (implies --no-split-by-date "
+                         "and a batch size large enough for the site's 25+ "
+                         "escape). Use this for a bulk submit: the per-date split "
+                         "fragments the batch and the small POSTs get throttled")
     ap.add_argument("--force", action="store_true",
                     help="Allow raw-decimal primes in miner-log input (export "
                          "files always send raw decimals: a Gapcoin number is "
                          "h<<shift + adder and has no primorial form)")
     args = ap.parse_args()
+
+    if args.bulk:
+        args.no_split_by_date = True
+        args.batch_size = 10 ** 9          # one POST, whatever the record count
 
     # ── Validate inputs ───────────────────────────────────────────────────
     if not 3 <= len(args.discoverer) <= 8:
@@ -715,8 +748,20 @@ def main():
               f"each record's own date on the site.", file=sys.stderr)
 
     n_posts = sum(math.ceil(len(rs) / args.batch_size) for _, rs in groups)
+    sizes = [len(rs[i:i + args.batch_size])
+             for _, rs in groups for i in range(0, len(rs), args.batch_size)]
     print(f"\n{len(to_submit)} record(s) → {n_posts} POST(s) "
-          f"(discoverer={args.discoverer}, batch size {args.batch_size})")
+          f"(discoverer={args.discoverer}, batch size {args.batch_size}); "
+          f"per-POST sizes: {sizes[:12]}{' …' if n_posts > 12 else ''}")
+    # The 25+ escape is PER POST, so a batch that could use it must not be
+    # fragmented.  Measured 2026-10-28: 41 records as 10 date groups of 1..7 ->
+    # exactly ONE POST accepted, the rest throttled, 34 records lost.
+    if len(to_submit) >= 25 and min(sizes) < 25:
+        print(f"  WARNING: {len(to_submit)} record(s) could use the site's "
+              f"'include 25+ records' escape, but this plan sends POSTs as small "
+              f"as {min(sizes)}; any POST under 25 is throttled when a submission "
+              f"happened in the last 23 h.", file=sys.stderr)
+        print(f"  Use --bulk to send everything in ONE POST.", file=sys.stderr)
     if args.dry_run:
         print("  [dry-run mode — no HTTP requests will be made]")
 
@@ -731,12 +776,21 @@ def main():
             if not submit_batch(batch, args.discoverer, group_date, args.dry_run):
                 failures += 1
                 print("  Batch failed; continuing with the next one …")
+            if _THROTTLED:
+                break
             if post_no < n_posts and not args.dry_run:
                 print(f"  Waiting {args.delay}s before the next POST …")
                 time.sleep(args.delay)
+        if _THROTTLED:
+            break
 
-    print("\nAll done."
-          + (f"  {failures} POST(s) failed." if failures else ""))
+    if _THROTTLED:
+        print(f"\nABORTED after {post_no}/{n_posts} POST(s): the site is "
+              f"throttling this session.  Re-send the remaining records with "
+              f"--bulk (one POST, >= 25 records) once the 23 h window is open.")
+    else:
+        print("\nAll done."
+              + (f"  {failures} POST(s) failed." if failures else ""))
 
 
 if __name__ == "__main__":

@@ -60,8 +60,18 @@ int p0gpu_class30_sieve(const void *primes, const void *invp, const void *r64,
                         unsigned long long last_slots, void *g_bm,
                         unsigned tile_words, const void *wpidx, int wheel_on,
                         int store_on, unsigned item_chunk,
+                        const void *prep, unsigned nprimes,
                         unsigned grid, unsigned block, size_t shared_bytes,
                         void *stream);
+
+/* Fill the per-(tile, prime) mark-setup table used by p0gpu_class30_sieve when
+   prep != NULL (P0_MARK_PREP=1).  Layout: prep[tile * nprimes + pi], packed
+   pos_base | (j << 21). */
+int p0gpu_class30_prep(const void *primes, const void *invp, const void *r64,
+                       unsigned nprimes, unsigned long long alo,
+                       unsigned long long ahi, unsigned long long tile_slots,
+                       unsigned long long ntiles, void *prep,
+                       unsigned grid, unsigned block, void *stream);
 
 int p0gpu_walk(const void *bm, unsigned long long nwords,
                unsigned long long alo, unsigned long long ahi,

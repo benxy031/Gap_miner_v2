@@ -75,6 +75,88 @@ __device__ static inline int64_t w_prevCand(const uint64_t *bm, int64_t pos) {
     return (w << 6) + 63 - __clzll((long long)word);
 }
 
+/* ---- optional per-(tile, prime) mark setup table (P0_MARK_PREP=1) --------
+   The item-loop setup (3 fastmods + kadj + class work) is paid once per item
+   ROW, and at --walk-primes 150000 the item table is warp-strided, so almost
+   every row re-pays it: 18.6% of the mark (tools/bench_mark_item.cu, P1 vs
+   P5).  pos_base genuinely depends on the tile start, so the table is
+   [tile][prime] and a separate kernel fills it one thread per entry -- a
+   serial per-prime recurrence was measured 2x more expensive (0.269 vs
+   0.134 ms/block) and a per-PRIME-only table cannot reproduce the marks.
+
+   Packing: pos_base < 2^21 for every supported tile size, j < 8, so one
+   uint32 carries both and the row does one load + two ops instead of two
+   divergent constant-memory lookups.
+
+   MEASURED 2026-10-29, RTX 3070, campaign geometry (1e32, --walk-primes
+   150000, tile 753664, K=96), 5e11 ints, three interleaved runs per arm:
+     mark kernel in isolation   P1 inline 1.206 ms -> P5 hoisted 0.982 ms (-18.6%)
+     prep parallel kernel       0.134 ms per block
+     ISOLATED NET               -7.5% of the mark
+     END TO END                 HEAD 3.60-3.66 s -> prep 3.79-3.83 s  (+5%)
+   The isolated win does NOT transfer, for two reasons that are both visible
+   in the numbers: (1) in the pipeline the mark overlaps the walk (P0_PIPE),
+   so the ~1.2 ms/block of setup being hoisted is arithmetic that was hidden
+   under memory latency, while the replacement costs 19.8 MB of table writes
+   plus 23.7 MB of table reads per block from DRAM -- the exact resource the
+   latency-bound walk needs; (2) the prep is a serial prologue on stream A
+   (prep -> sieve), so it cannot overlap the previous block's marking.
+   Do not re-propose this without a design that keeps the table OUT of DRAM
+   (a per-CTA L2-sized slice) AND prepares block j+1 while block j marks;
+   the correctness path is already gated by tools/bench_prep_gate.cu.
+   Historical note: this also shows why the ~3.5% of wall estimated in
+   docs/PHASE0_scan_bench.md section 44 was optimistic -- that model prices
+   posb[] indexed by PRIME (tile-invariant) and no prep pass at all. */
+#define P0_PREP_POS_BITS   21u
+#define P0_PREP_POS_MASK   0x1FFFFFu
+#define P0_PREP_J_SHIFT    21u
+
+__global__ static void class30_prep_kernel(const uint64_t * __restrict__ primes,
+                                           const uint64_t * __restrict__ invp,
+                                           const uint64_t * __restrict__ r64,
+                                           uint32_t nprimes,
+                                           uint64_t Alo, uint64_t Ahi,
+                                           uint64_t tileSlots, uint64_t ntiles,
+                                           uint32_t * __restrict__ prep) {
+    __shared__ uint8_t s_kadj_l[900];
+    __shared__ int8_t  s_clsidx_l[30];
+    /* Build kadj exactly as class30_sieve_kernel does (same definition, so the
+       table reproduces the inline pos_base bit for bit). */
+    for (uint32_t i = threadIdx.x; i < 900u; i += blockDim.x) {
+        uint32_t r0 = i / 30u, pm = i % 30u, k = 0;
+        if (c30_clsidx[pm] >= 0) {
+            uint32_t msk = c30_perm[pm];
+            while (!((msk >> ((r0 + k * pm) % 30u)) & 1u)) k++;
+        }
+        s_kadj_l[i] = (uint8_t)k;
+    }
+    if (threadIdx.x < 30u) s_clsidx_l[threadIdx.x] = c30_clsidx[threadIdx.x];
+    __syncthreads();
+    for (uint64_t tile = blockIdx.x; tile < ntiles; tile += gridDim.x) {
+        const uint64_t t_lo_base = Alo + ((tile * tileSlots) >> 3) * 30u;
+        uint64_t t_lo = t_lo_base + 1ULL;
+        uint64_t t_hi = Ahi + ((t_lo_base < Alo) ? 1ULL : 0ULL);
+        t_hi += (t_lo == 0ULL) ? 1ULL : 0ULL;
+        uint32_t *dst = prep + (size_t)tile * nprimes;
+        for (uint32_t pi = threadIdx.x; pi < nprimes; pi += blockDim.x) {
+            uint64_t p = primes[pi], pv = invp[pi];
+            uint64_t vh = t_fastmod64(t_hi, p, pv);
+            uint64_t vl = t_fastmod64(t_lo, p, pv);
+            uint64_t vm = t_fastmod64(vh * r64[pi] + vl, p, pv);
+            uint64_t d = vm ? (p - vm) : 0;
+            uint32_t phi1 = (uint32_t)(1u + d);
+            uint32_t r0 = phi1 % 30u;
+            uint32_t pm30 = (uint32_t)(p % 30u);
+            uint32_t kadj = s_kadj_l[r0 * 30u + pm30];
+            uint32_t phi = phi1 + kadj * (uint32_t)p;
+            uint32_t r = phi % 30u;
+            uint32_t pos_base = (phi / 30u) * 8u + (uint32_t)s_clsidx_l[r];
+            uint32_t j = (uint32_t)s_clsidx_l[(r * c30_pinv[pm30]) % 30u];
+            dst[pi] = (pos_base & P0_PREP_POS_MASK) | (j << P0_PREP_J_SHIFT);
+        }
+    }
+}
+
 template<int STORE>
 __global__ static void class30_sieve_kernel(const uint64_t * __restrict__ primes,
                                             const uint64_t * __restrict__ invp,
@@ -88,7 +170,9 @@ __global__ static void class30_sieve_kernel(const uint64_t * __restrict__ primes
                                             uint64_t * __restrict__ g_bm,
                                             uint32_t tileWords,
                                             const uint32_t * __restrict__ wpidx, int wheel_on,
-                                            uint32_t itemChunk) {
+                                            uint32_t itemChunk,
+                                            const uint32_t * __restrict__ prep,
+                                            uint32_t nprimes) {
     extern __shared__ uint64_t sh[];
     __shared__ uint64_t wpat[127];
     __shared__ uint32_t wpj[24];
@@ -217,7 +301,25 @@ __global__ static void class30_sieve_kernel(const uint64_t * __restrict__ primes
         for (uint32_t it = it_first; it < it_end; it += it_step) {
             int pi = (int)itemPidx[it];
             uint32_t k0 = itemK0[it];
-            if (pi != cur_pi) {
+            if (prep) {
+                /* Hoisted setup: one load per row; the packed value carries
+                   both pos_base and the class-cycle start j, so the only
+                   remaining per-row work is the 8-step table build below. */
+                uint32_t v = prep[(size_t)tile * nprimes + (uint32_t)pi];
+                pos_base = v & P0_PREP_POS_MASK;
+                if (pi != cur_pi) {
+                    cur_pi = pi;
+                    cur_p = (uint32_t)primes[pi];
+                    uint32_t pm30 = cur_p % 30u;
+                    uint32_t k8 = (cur_p / 30u) * 8u;
+                    uint32_t ri = s_unit[pm30] & 7u;
+                    uint32_t jj = v >> P0_PREP_J_SHIFT;
+                    const uint32_t *tp = &s_step[(jj << 6) + (ri << 3)];
+#pragma unroll
+                    for (int st = 0; st < 8; st++)
+                        step[st] = k8 * s_dm8[(jj + (uint32_t)st) & 7u] + tp[st];
+                }
+            } else if (pi != cur_pi) {
                 cur_pi = pi;
                 uint64_t p = primes[pi];
                 cur_p = (uint32_t)p;

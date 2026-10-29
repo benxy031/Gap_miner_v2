@@ -117,6 +117,7 @@ TEST_GAP_HUNT = $(BIN_DIR)/test_gap_hunt
 TEST_STRATUM = $(BIN_DIR)/test_stratum
 TEST_SMOOTH = $(BIN_DIR)/test_smooth_range
 SMOOTH_PATTERN = $(BIN_DIR)/smooth_pattern
+BENCH_MARK_CACHEBLOCK = $(BIN_DIR)/bench_mark_cacheblock
 BENCH_FERMAT = $(BIN_DIR)/bench_fermat
 BENCH_MARK = $(BIN_DIR)/bench_mark
 BENCH_HUNT_MARK = $(BIN_DIR)/bench_hunt_mark
@@ -369,6 +370,14 @@ $(TEST_SMOOTH): $(BUILD_DIR)/$(TEST_DIR)/test_smooth_range.o | $(BIN_DIR)
 # Admissible smooth-run pattern search (CPU-only dev tool; see the header of
 # tools/smooth_pattern.c for what it computes and why).
 $(SMOOTH_PATTERN): $(BUILD_DIR)/tools/smooth_pattern.o | $(BIN_DIR)
+	$(CC) $(CFLAGS) $^ -o $@
+	@echo "✓ Built: $@"
+
+# Cache-blocked vs streamed mark layout (CPU-only dev tool; see the header of
+# tools/bench_mark_cacheblock.c).  Prices the "apply dense primes in
+# cache-sized blocks and duplicate the scan" idea from MPU-SIQS at our own
+# window/tile sizes.
+$(BENCH_MARK_CACHEBLOCK): $(BUILD_DIR)/tools/bench_mark_cacheblock.o | $(BIN_DIR)
 	$(CC) $(CFLAGS) $^ -o $@
 	@echo "✓ Built: $@"
 

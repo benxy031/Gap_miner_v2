@@ -1589,6 +1589,20 @@ static int run_walk_engine(void) {
             die("P0_MARK_NOSTORE=1 skips the bitmap write; add P0_WALK_OFF=1 "
                 "(the walk would otherwise read an unmarked bitmap)");
     }
+    /* P0_MARK_PREP=1: hoist the per-row item setup into a per-(tile, prime)
+       table filled by class30_prep_kernel.  Measured 2026-10-29: -7.5% on the
+       mark in ISOLATION (tools/bench_mark_item.cu P5+prep_par vs P1) but
+       +5% WALL end to end at the campaign geometry (HEAD 3.60-3.66 s vs
+       3.79-3.83 s over 5e11 ints, identical gap sets).  The mark overlaps the
+       walk in P0_PIPE, so the arithmetic being hoisted was already hidden
+       under memory latency, while the 19.8 MB table round-trips through DRAM
+       and the prep is a serial prologue.  Default OFF; see the verdict block
+       in tools/p0_walk_kern.cuh and docs/PHASE0_scan_bench.md section 45. */
+    int mark_prep = 0;
+    {
+        const char *ev = getenv("P0_MARK_PREP");
+        if (ev && ev[0] && ev[0] != '0') mark_prep = 1;
+    }
     const uint32_t wk_grid = g_wk_grid ? (uint32_t)g_wk_grid : 46;
     const uint32_t wk_block = g_wk_block ? (uint32_t)g_wk_block : 512;
     u128 A = ((g_start | 1) / 30u) * 30u;
@@ -1707,11 +1721,33 @@ static int run_walk_engine(void) {
     e = cudaMalloc(&d_r, np * 8); if (e != cudaSuccess) die_cuda(e, "r64 alloc");
     e = cudaMalloc(&d_ip2, nii2 * 4); if (e != cudaSuccess) die_cuda(e, "items alloc");
     e = cudaMalloc(&d_ik2, nii2 * 4); if (e != cudaSuccess) die_cuda(e, "items alloc");
+    uint32_t *d_prep = NULL;
+    if (mark_prep) {
+        size_t prep_entries = (size_t)tilesPerBlockC * np;
+        e = cudaMalloc(&d_prep, prep_entries * 4);
+        if (e != cudaSuccess) {
+            fprintf(stderr, "[phase0-gpu] P0_MARK_PREP: %.1f MB table alloc failed; "
+                            "falling back to the inline setup\n",
+                    prep_entries * 4 / 1048576.0);
+            d_prep = NULL;
+        } else {
+            printf("[phase0-gpu] walk: mark prep table %.1f MB (%llu tiles x %zu primes)\n",
+                   prep_entries * 4 / 1048576.0,
+                   (unsigned long long)tilesPerBlockC, np);
+        }
+    }
     e = cudaMalloc(&d_wtab, 8 * 4); if (e != cudaSuccess) die_cuda(e, "wtab alloc");
     e = cudaMalloc(&d_wpidx, 3 * 4); if (e != cudaSuccess) die_cuda(e, "wpidx alloc");
     /* P0_PIPE: two result/stat slots, one per alternating bitmap region, so a
        batch's walk can stay in flight while the previous batch is collected. */
     e = cudaMalloc(&d_out, 2 * (size_t)(1u << 20) * sizeof(w_gaprec_t)); if (e != cudaSuccess) die_cuda(e, "gap buffer alloc");
+    /* Each result slot owns FOUR counters (tests, jumps, scan cycles, test
+       cycles).  The slots used to be placed 2 counters apart, so slot 1's
+       memset/atomicAdds overwrote slot 0's cycle counters and every other
+       memset wiped the *other* slot's tests/jumps before the host collected
+       them: the same run reported 9.55e8 or 1.56e9 tests depending only on
+       whether P0_SPLIT was set, with identical gaps (2026-10-29).  Slot
+       stride is now the counter count, i.e. no aliasing. */
     e = cudaMalloc(&d_stats, 8 * sizeof(unsigned long long)); if (e != cudaSuccess) die_cuda(e, "stats alloc");
     cudaMemcpy(d_p, hp, np * 8, cudaMemcpyHostToDevice);
     cudaMemcpy(d_iv, h_iv, np * 8, cudaMemcpyHostToDevice);
@@ -1837,19 +1873,34 @@ static int run_walk_engine(void) {
             uint64_t *bm = d_bm + (size_t)r * region_words;
             u128 Ab = A + (u128)b * (u128)blockNum30;
             w_gaprec_t *out_r = d_out + (size_t)r * (1u << 20);
-            unsigned long long *st_r = d_stats + 2 * (size_t)r;
+            unsigned long long *st_r = d_stats + 4 * (size_t)r;
             e = cudaStreamWaitEvent(sA, evW[r], 0);
             if (e != cudaSuccess) die_cuda(e, "wait evW");
             e = cudaEventRecord(evM[r], sA); if (e != cudaSuccess) die_cuda(e, "record evM");
             for (uint64_t j = 0; j < cnb; j++) {
                 u128 av = A + (u128)(b + j) * (u128)blockNum30;
                 u128 Aj = (av / 30u) * 30u;
+                if (d_prep) {
+#ifdef PHASE0_KERNEL_DLL
+                    if (p0gpu_class30_prep(d_p, d_iv, d_r, (uint32_t)np,
+                                           (uint64_t)Aj, (uint64_t)(Aj >> 64),
+                                           tileSlots, tilesPerBlockC, d_prep,
+                                           (unsigned)tilesPerBlockC, 256u,
+                                           sA) != 0)
+                        die("p0gpu_class30_prep failed");
+#else
+                    class30_prep_kernel<<<(unsigned)tilesPerBlockC, 256, 0, sA>>>(
+                        d_p, d_iv, d_r, (uint32_t)np,
+                        (uint64_t)Aj, (uint64_t)(Aj >> 64),
+                        tileSlots, tilesPerBlockC, d_prep);
+#endif
+                }
 #ifdef PHASE0_KERNEL_DLL
                 if (p0gpu_class30_sieve(d_p, d_iv, d_r, d_ip2, d_ik2, (uint32_t)nii2,
                                        (uint64_t)Aj, (uint64_t)(Aj >> 64),
                                        tileSlots, tilesPerBlockC, lastTileSlots,
                                        bm + j * cWords, tileWords, d_wpidx, 1,
-                                       g_mark_nostore, itemChunk,
+                                       g_mark_nostore, itemChunk, d_prep, (uint32_t)np,
                                        sg_grid, sg_block, (size_t)tileWords * 8,
                                        sA) != 0)
                     die("p0gpu_class30_sieve failed");
@@ -1859,22 +1910,22 @@ static int run_walk_engine(void) {
                     d_p, d_iv, d_r, d_ip2, d_ik2, (uint32_t)nii2,
                     (uint64_t)Aj, (uint64_t)(Aj >> 64), tileSlots, tilesPerBlockC,
                     lastTileSlots, bm + j * cWords, tileWords, d_wpidx, 1,
-                    itemChunk); break;
+                    itemChunk, d_prep, (uint32_t)np); break;
                 case 2: class30_sieve_kernel<2><<<sg_grid, sg_block, (size_t)tileWords * 8, sA>>>(
                     d_p, d_iv, d_r, d_ip2, d_ik2, (uint32_t)nii2,
                     (uint64_t)Aj, (uint64_t)(Aj >> 64), tileSlots, tilesPerBlockC,
                     lastTileSlots, bm + j * cWords, tileWords, d_wpidx, 1,
-                    itemChunk); break;
+                    itemChunk, d_prep, (uint32_t)np); break;
                 case 3: class30_sieve_kernel<3><<<sg_grid, sg_block, (size_t)tileWords * 8, sA>>>(
                     d_p, d_iv, d_r, d_ip2, d_ik2, (uint32_t)nii2,
                     (uint64_t)Aj, (uint64_t)(Aj >> 64), tileSlots, tilesPerBlockC,
                     lastTileSlots, bm + j * cWords, tileWords, d_wpidx, 1,
-                    itemChunk); break;
+                    itemChunk, d_prep, (uint32_t)np); break;
                 default: class30_sieve_kernel<0><<<sg_grid, sg_block, (size_t)tileWords * 8, sA>>>(
                     d_p, d_iv, d_r, d_ip2, d_ik2, (uint32_t)nii2,
                     (uint64_t)Aj, (uint64_t)(Aj >> 64), tileSlots, tilesPerBlockC,
                     lastTileSlots, bm + j * cWords, tileWords, d_wpidx, 1,
-                    itemChunk); break;
+                    itemChunk, d_prep, (uint32_t)np); break;
                 }
 #endif
                 e = cudaGetLastError();
@@ -1940,7 +1991,7 @@ static int run_walk_engine(void) {
         /* ---- collect the batch launched in the PREVIOUS iteration (P0_PIPE) ---- */
         if (prev_r >= 0) {
             w_gaprec_t *out_p = d_out + (size_t)prev_r * (1u << 20);
-            unsigned long long *st_p = d_stats + 2 * (size_t)prev_r;
+            unsigned long long *st_p = d_stats + 4 * (size_t)prev_r;
             e = cudaEventSynchronize(evW[prev_r]); if (e != cudaSuccess) die_cuda(e, "walk sync");
             {   /* P0_SPLIT: accumulate this batch's GPU-timeline stage durations.
                    mark = evM->evS (pure mark-kernel time, stream A); walk =

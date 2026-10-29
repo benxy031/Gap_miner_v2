@@ -1,4 +1,15 @@
-/* Perig/ciosFermatTest128 port from prime_gaps.cu (PGS), used under its license. */
+/* Perig/ciosFermatTest128 port from prime_gaps.cu (PGS), used under its license.
+ *
+ * MEASURED 2026-10-29 - do not add a stateful/incremental reciprocal here.
+ * ciosConstants128 (the 128 % 128 division) is 3.6 % of a full test at 2e20:
+ * full 1.230 ns/test, setup-only 0.044 ns/test (tools/bench_perig_setup.cu,
+ * 1,048,576 candidates, 0 verdict differences vs the full test).  Removing the
+ * per-candidate setup ENTIRELY therefore buys 1.04x, and a compile-time high
+ * word another 1.052x.  Those two are the whole of what PGN's
+ * stateful-u160/barrett70 layer adds on top of THIS file (their source tree
+ * carries this file verbatim apart from an MSVC shim); the rest of their 2.3x
+ * at 68 bits is a 96-bit container we cannot use at 107 bits.  Not worth the
+ * numerical risk for <= 2.5 % of the wall. */
 #ifndef PERIG_CUH
 #define PERIG_CUH
 

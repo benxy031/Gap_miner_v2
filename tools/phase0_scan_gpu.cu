@@ -280,12 +280,28 @@ static double now_s(void) {
 
 static double u128_ln(u128 x) { return (double)logl((long double)x); }
 
-static u128 parse_u128(const char *s) {
+/* Parse decimal into u128, REJECTING overflow.  The old version wrapped
+   silently: --start 340282366920938463463374607431768211456 (2^128) became 0,
+   and the walk then reported "--start must exceed --walk-primes" - a message
+   that points at the wrong thing entirely (found 2026-10-29 while checking the
+   walk's exactness ceiling).  Returns 0 on success, -1 on overflow. */
+static int parse_u128_checked(const char *s, u128 *out) {
     u128 v = 0;
+    const u128 lim = ~(u128)0;
     for (; *s; s++) {
         if (*s < '0' || *s > '9') break;
-        v = v * 10 + (unsigned)(*s - '0');
+        unsigned d = (unsigned)(*s - '0');
+        if (v > (lim - (u128)d) / 10u) return -1;
+        v = v * 10u + (u128)d;
     }
+    *out = v;
+    return 0;
+}
+
+/* Unchecked variant for values this program wrote itself (state files). */
+static u128 parse_u128(const char *s) {
+    u128 v = 0;
+    if (parse_u128_checked(s, &v) != 0) return 0;
     return v;
 }
 
@@ -1617,6 +1633,8 @@ static int run_walk_engine(void) {
     }
     if (g_start <= (u128)g_walk_primes) {
         fprintf(stderr, "[phase0-gpu] --engine walk: --start must exceed --walk-primes\n");
+        /* (a start that PARSED as 0 lands here; the parser now rejects overflow
+           above 2^128 before this point, so this message is now accurate) */
         return 2;
     }
     uint64_t gapmin = g_walk_gapmin;
@@ -2373,7 +2391,14 @@ int main(int argc, char **argv) {
     uint64_t check_len = 0;
 
     for (int i = 1; i < argc; i++) {
-        if (!strcmp(argv[i], "--start") && i + 1 < argc) start = parse_u128(argv[++i]);
+        if (!strcmp(argv[i], "--start") && i + 1 < argc) {
+            if (parse_u128_checked(argv[++i], &start) != 0) {
+                fprintf(stderr, "[phase0-gpu] --start overflows 128 bits; the walk "
+                                "tests with a u128 modulus and cannot represent it "
+                                "(max 3.40e38). Use --engine sieve, or a smaller start.\n");
+                return 2;
+            }
+        }
         else if (!strcmp(argv[i], "--length") && i + 1 < argc) length = strtoull(argv[++i], NULL, 10);
         else if (!strcmp(argv[i], "--sieve-limit") && i + 1 < argc) { sieve_limit = (uint32_t)strtoul(argv[++i], NULL, 10); sl_set = 1; }
         else if (!strcmp(argv[i], "--threads") && i + 1 < argc) threads = atoi(argv[++i]);

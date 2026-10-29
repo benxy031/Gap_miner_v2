@@ -1511,6 +1511,8 @@ static void gh_batch_process(struct gh_batch *b, const uint8_t *flags,
 }
 #endif /* WITH_CUDA (helpers) */
 
+#ifdef WITH_CUDA   /* uses GAP_HUNT_JUMP_CAP and is only called
+                      from the CUDA branch of gap_hunt_run */
 /* Startup advisory for the jump/jump2 per-window pair ceiling.  The chain takes
    at most ~2 x odd_interval_size / thr steps (offsets are in ODD units, thr is
    in ADDERS), measured slack 2-4.6x, so this is an upper bound rather than a
@@ -1531,6 +1533,8 @@ static void gh_jump_capacity_advisory(double min_merit, double thr,
             "larger GAP_HUNT_JUMP_CAP.\n",
             min_merit, thr, odd_span, est, GAP_HUNT_JUMP_CAP);
 }
+#endif /* WITH_CUDA (jump capacity advisory) */
+
 int gap_hunt_run(const struct gap_hunt_config *cfg) {
 #ifndef WITH_CUDA
     (void)cfg;
@@ -1904,9 +1908,18 @@ int gap_hunt_run(const struct gap_hunt_config *cfg) {
        survivor offsets to host memory once per window and, in fill-pipeline
        mode, deliberately leaves those copies in flight, so a pageable
        destination serialises them through the driver's staging path.
-       Measured 2026-10-25 (shift720/p98/m40, K=2048, ABBA below): see
-       docs/ or the repo note; the cost is ~2 x K x win_cap x 8 B of
-       non-pageable RAM, which is why this stays switchable. */
+       MEASURED 2026-10-29 (the note this comment used to point at did not
+       exist): dev RTX 3070, shift720_p98_lex_m40, K=2048, min-merit 40,
+       ABBA order, alternating, three pairs of 55 s arms --
+         pin ON   6993.6 / 6866.2 / 6863.9   (mean 6908)
+         pin OFF  6662.7 / 6620.0 / 6610.9   (mean 6631)
+       i.e. **+4.2%**, and EVERY pin-ON run finishes above EVERY pin-OFF run
+       (min 6863.9 vs max 6662.7), so the sign does not depend on picking a
+       rep.  A single pair measured anywhere from +1.9% to +4.6% depending on
+       machine drift - use pairs, not single runs.  The default is therefore
+       justified and this is not a free knob to flip back.  The price is
+       ~2 x K x win_cap x 8 B of non-pageable RAM, which is why it stays
+       switchable for small-RAM hosts. */
     {
         const char *pin_env = getenv("GAP_HUNT_PIN_OFFSETS");
         int want_pin = !(pin_env && pin_env[0] == '0');

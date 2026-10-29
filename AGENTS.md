@@ -20,6 +20,56 @@ When a task involves a concrete documentation or code change, apply this
 Documentation Update Rule first. Apply the Conceptual Escape Doctrine only
 when explicitly reasoning about design, architecture, or framing decisions.
 
+## Dev box vs fleet (Mandatory)
+
+The repo at `/home/dejan/Git/gapminer_v2` is the **dev box**. The phase0 wall
+campaign does **not** run here — starting it here takes the dev GPU away from
+benchmarks. The campaign runs on the fleet host reached as `ssh gap20`
+(`/home/deki/git/Gap_miner_v2`), one walker per GPU, `--device 0` and
+`--device 1`.
+
+Before touching either side, check what is actually running:
+
+```sh
+ps -eo pid,etime,args | grep -E "p0_rec_campaign|phase0_scan_gpu" | grep -v grep
+nvidia-smi --query-gpu=index,utilization.gpu,memory.used --format=csv,noheader
+```
+
+### Restarting a walker (measured pitfalls, 2026-10-29)
+
+1. **Stop the driver, not only the scanner.** `scripts/p0_rec_campaign.sh`
+   relaunches its segment when the scanner dies; killing the scanner alone
+   spawns a new one within seconds. `ps` does not show the driver as
+   `p0_rec_campaign` — it is `bash scripts/p0_rec_campaign.sh`, so match on
+   `args`, not on `comm`.
+2. **SIGTERM** (plain `kill`) — the scanner checkpoints on SIGTERM and
+   `--state-every 30` keeps the loss under 30 s. Never SIGKILL a running
+   walker.
+3. **Redirect stdout to the `.out` file, never `/dev/null`.** The `.out` file
+   is fed by the shell redirection, not by the scanner: if the restart writes
+   to `/dev/null`, `tail -f data/...out` freezes forever and the last
+   `--- end ---` in it is the summary of the run that was stopped. Restart as:
+
+   ```sh
+   ssh gap20 'cd /home/deki/git/Gap_miner_v2 && \
+     ( setsid ./bin/phase0_scan_gpu --engine walk <same flags> \
+         >> data/p0_walk_wall_c3X_g1664.out 2>&1 </dev/null & ) ; sleep 3'
+   ```
+
+4. **One walker per ssh call.** Chaining two `setsid ... &` in a single ssh
+   command leaves the channel open after the first one and the second never
+   starts (only one GPU comes up, ssh hangs). Two calls, or a loop that
+   returns.
+5. **Verify all three**: the `.out` size grows between two samples,
+   `state`'s `off0` advances, and `nvidia-smi` shows every GPU at 100 %.
+   `setsid` gives the walker its own SID, so it survives the ssh session.
+
+Phase0's measurement log `docs/PHASE0_scan_bench.md` is **gitignored**
+(`.gitignore` line 207) — it is the local working log, so a finding that must
+survive in git belongs in the source comment or in a tracked doc, not only
+there. The shareable copy of the toolkit is the gitignored `phase0/`
+directory; refresh it from `tools/` after changing phase0 sources.
+
 # A Universal Doctrine for Genuine Conceptual Escape
 
 ## Status and purpose

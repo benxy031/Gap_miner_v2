@@ -202,15 +202,23 @@ static int g_mark_nostore = 0;      /* P0_MARK_NOSTORE=0|1|2|3: mark store modes
                                        3 same L2 region - docs section 32) */
 static int g_walk_off = 0;          /* P0_WALK_OFF=1: skip the walk launches
                                        (mark-only wall, honestly measured) */
-static int g_walk_testmode = -1;    /* P0_WALK_TESTMODE=0|1|2: force the walk's
-                                       primality variant (perig/lazy/canonical)
-                                       instead of the magnitude dispatch */
+static int g_walk_testmode = -1;    /* P0_WALK_TESTMODE=0|1|2|3|4: force the walk's
+                                       primality variant (perig/lazy/canonical/
+                                       small-band lazy/wall-band u96) instead of
+                                       the magnitude dispatch; 4 is refused
+                                       outside its exact band (see the launch) */
 static unsigned long long g_scan_cyc = 0, g_test_cyc = 0;   /* PROF sums */
 static int g_walk_prof = 0;         /* P0_WALK_PROF=1: instrument the walk kernel
                                        (scan vs test cycles, stats[2..3]) */
 static uint32_t g_item_chunk = 256;  /* P0_ITEM_CHUNK: marks per mark-kernel item
                                        row (multiple of 8, default 256).  Longer
                                        rows amortise the per-row setup. */
+static int g_item_order = 1;        /* P0_ITEM_ORDER=0|1: mark-kernel item table
+                                       order for tables above P0_ITEM_STRIDE_CUT
+                                       (the warp-strided path).  1 = chunk-major
+                                       (all chunk-0 rows by prime, then chunk-1
+                                       rows, ...); 0 = prime-major (the
+                                       historical order) */
 static int g_wk_grid = 0;           /* P0_WK_GRID=N: walk-kernel CTA count
                                        (0 = 46, the historical value = 512
                                        threads/SM = 33 % occupancy) */
@@ -1580,9 +1588,9 @@ static int run_walk_engine(void) {
         ev = getenv("P0_WALK_TESTMODE");
         if (ev) {
             int v = atoi(ev);
-            if (v >= 0 && v <= 3) g_walk_testmode = v;
+            if (v >= 0 && v <= 4) g_walk_testmode = v;
             else fprintf(stderr, "[phase0-gpu] P0_WALK_TESTMODE %d out of range"
-                                " [0,3]; using the magnitude dispatch\n", v);
+                                " [0,4]; using the magnitude dispatch\n", v);
         }
         ev = getenv("P0_WK_GRID");
         if (ev) { int v = atoi(ev); if (v >= 1 && v <= 4096) g_wk_grid = v; }
@@ -1596,6 +1604,13 @@ static int run_walk_engine(void) {
             if (v >= 8 && v <= 4096) g_item_chunk = (uint32_t)(v & ~7);
             else fprintf(stderr, "[phase0-gpu] P0_ITEM_CHUNK %d out of range"
                                 " [8,4096]; using 256\n", v);
+        }
+        ev = getenv("P0_ITEM_ORDER");
+        if (ev) {
+            int v = atoi(ev);
+            if (v == 0 || v == 1) g_item_order = v;
+            else fprintf(stderr, "[phase0-gpu] P0_ITEM_ORDER %d out of range"
+                                " [0,1]; using 1\n", v);
         }
         if (g_mark_nostore || g_walk_off || g_walk_testmode >= 0)
             fprintf(stderr, "[phase0-gpu] DIAG: mark_nostore=%d walk_off=%d"
@@ -1699,12 +1714,30 @@ static int run_walk_engine(void) {
     uint32_t *h_ip2 = (uint32_t *)malloc(icap2 * 4), *h_ik2 = (uint32_t *)malloc(icap2 * 4);
     if (!h_ip2 || !h_ik2) die("walk item alloc failed");
     size_t nii2 = 0;
-    for (size_t i = 0; i < np; i++) {
-        if (hp[i] <= 13u) continue;
-        uint64_t marks = tileSlots / hp[i] + 2;
-        uint32_t chunks = (uint32_t)((marks + (itemChunk - 1)) / itemChunk);
-        for (uint32_t c = 0; c < chunks; c++) { h_ip2[nii2] = (uint32_t)i; h_ik2[nii2] = c; nii2++; }
+    if (g_item_order && icap2 > P0_ITEM_STRIDE_CUT) {
+        /* Chunk-major.  The kernel gives a warp 32 CONSECUTIVE rows; in the
+           historical prime-major order those are consecutive chunks of ONE
+           prime, whose first marks sit itemChunk*p slots = 8p words apart, so
+           they land on only 4 of the 32 shared-memory banks (8-way conflicts
+           on every atomicOr of every small-prime row).  Chunk-major puts 32
+           different primes in a warp instead. */
+        uint32_t maxc = (uint32_t)((tileSlots / 17u + 2 + (itemChunk - 1)) / itemChunk);
+        for (uint32_t c = 0; c < maxc; c++)
+            for (size_t i = 0; i < np; i++) {
+                if (hp[i] <= 13u) continue;
+                uint64_t marks = tileSlots / hp[i] + 2;
+                uint32_t chunks = (uint32_t)((marks + (itemChunk - 1)) / itemChunk);
+                if (c < chunks) { h_ip2[nii2] = (uint32_t)i; h_ik2[nii2] = c; nii2++; }
+            }
+    } else {
+        for (size_t i = 0; i < np; i++) {
+            if (hp[i] <= 13u) continue;
+            uint64_t marks = tileSlots / hp[i] + 2;
+            uint32_t chunks = (uint32_t)((marks + (itemChunk - 1)) / itemChunk);
+            for (uint32_t c = 0; c < chunks; c++) { h_ip2[nii2] = (uint32_t)i; h_ik2[nii2] = c; nii2++; }
+        }
     }
+    if (nii2 != icap2) die("walk item table size mismatch");
     uint32_t h_wpidx[3] = {0, 0, 0};
     for (size_t i = 0; i < np; i++) {
         if (hp[i] == 7u) h_wpidx[0] = (uint32_t)i;
@@ -1969,9 +2002,34 @@ static int run_walk_engine(void) {
                P0_WALK_OFF skips the launch entirely (mark-only wall). */
             int tmode = (g_walk_testmode >= 0)
                       ? g_walk_testmode : w_test_mode((uint64_t)(Ab >> 64));
+            if (tmode == 4 && g_walk_testmode == 4) {
+                /* mode 4 is exact only below 2^96 - 2^79: above it the lazy
+                   representative no longer fits three limbs and verdicts
+                   would be WRONG.  Below 2^95 the verdicts matched perig in
+                   the 2026-10-30 probes, but the fixed 95-bit exponent
+                   schedule wastes squarings there, so the band is not used
+                   below 2^95.  Outside [2^95, 2^96 - 2^79) a forced run
+                   therefore falls back to the magnitude dispatch (once-
+                   warning). */
+                const uint64_t ab_hi = (uint64_t)(Ab >> 64);
+                if (ab_hi < W_U96_MIN_HI || ab_hi >= W_U96_MAX_HI) {
+                    static int warned4 = 0;
+                    if (!warned4) {
+                        warned4 = 1;
+                        fprintf(stderr, "[phase0-gpu] P0_WALK_TESTMODE=4 only covers"
+                                        " Ahi in [2^31, 2^32-2^15); Ahi=%llu uses the"
+                                        " magnitude dispatch\n",
+                                (unsigned long long)ab_hi);
+                    }
+                    tmode = w_test_mode(ab_hi);
+                }
+            }
             if (!g_walk_off) {
             if (g_walk_prof) {
                 switch (tmode) {
+                case 4: walk_kernel7<4, 1><<<wk_grid, wk_block, 0, sB>>>(bm, cnb * cWords,
+                            (uint64_t)Ab, (uint64_t)(Ab >> 64), d_wtab,
+                            (uint32_t)gapmin, out_r, 1u << 20, st_r); break;
                 case 3: walk_kernel7<3, 1><<<wk_grid, wk_block, 0, sB>>>(bm, cnb * cWords,
                             (uint64_t)Ab, (uint64_t)(Ab >> 64), d_wtab,
                             (uint32_t)gapmin, out_r, 1u << 20, st_r); break;
@@ -1987,6 +2045,9 @@ static int run_walk_engine(void) {
                 }
             } else
             switch (tmode) {
+            case 4: walk_kernel7<4, 0><<<wk_grid, wk_block, 0, sB>>>(bm, cnb * cWords,
+                        (uint64_t)Ab, (uint64_t)(Ab >> 64), d_wtab,
+                        (uint32_t)gapmin, out_r, 1u << 20, st_r); break;
             case 3: walk_kernel7<3, 0><<<wk_grid, wk_block, 0, sB>>>(bm, cnb * cWords,
                         (uint64_t)Ab, (uint64_t)(Ab >> 64), d_wtab,
                         (uint32_t)gapmin, out_r, 1u << 20, st_r); break;

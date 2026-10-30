@@ -19,6 +19,13 @@ struct P0Item {
 
 #define P0_CHUNK 64u
 
+/* Item-loop partition cut of the walk engine's mark kernel
+   (class30_sieve_kernel): item tables with at most this many rows use
+   per-thread contiguous slices (prime-major order, per-prime setup reuse),
+   larger ones the warp-strided walk.  The host orders the table to match, so
+   the constant is shared by the kernel and the host table builder. */
+#define P0_ITEM_STRIDE_CUT 5000u
+
 /* One reported gap of the class-30 walk engine (device kernel output and
    host consumer, hence host-safe here).  out[0].gap is the count. */
 typedef struct { uint64_t slot; uint32_t gap; uint32_t pad; } w_gaprec_t;

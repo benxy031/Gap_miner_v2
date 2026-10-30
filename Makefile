@@ -128,6 +128,7 @@ PHASE0_SCAN = $(BIN_DIR)/phase0_scan
 PHASE0_SCAN_GPU = $(BIN_DIR)/phase0_scan_gpu
 MR68_GPU = $(BIN_DIR)/mr68_gpu
 MR128_BENCH = $(BIN_DIR)/mr128_bench
+BENCH_U96 = $(BIN_DIR)/bench_u96
 
 # Phony targets
 .PHONY: all clean test help update-merits
@@ -234,6 +235,13 @@ $(MR128_BENCH): $(BUILD_DIR)/tools/mr128_bench.o | $(BIN_DIR)
 	$(NVCC) $(BUILD_DIR)/tools/mr128_bench.o -L$(CUDA_LIBDIR) -lcudart -lgmp -lm -o $@
 	@echo "✓ Built: $@"
 
+# Wall-band walk test (P0_WALK_TESTMODE=4, tools/p0_test_u96.cuh): GMP residue
+# gate, verdict parity against perig, ns/test.  Run `bin/bench_u96 gate 200000`
+# after any change to that header.  Build: make bin/bench_u96 WITH_CUDA=1
+$(BENCH_U96): $(BUILD_DIR)/tools/bench_u96.o | $(BIN_DIR)
+	$(NVCC) $(BUILD_DIR)/tools/bench_u96.o -L$(CUDA_LIBDIR) -lcudart -lgmp -lm -o $@
+	@echo "✓ Built: $@"
+
 # GPU live Phase-0 scanner: CPU bucketed sieve + the shared mr68 kernel;
 # GMP host-side for --check and for verifying every reported gap.
 # Build: make bin/phase0_scan_gpu WITH_CUDA=1
@@ -293,13 +301,14 @@ $(BUILD_DIR)/tools/%.o: tools/%.cu | $(BUILD_DIR)
 $(BUILD_DIR)/tools/mr68_gpu.o: tools/mr68_kernel.cuh
 $(BUILD_DIR)/tools/mr128_bench.o: tools/mr128_kernel.cuh tools/mr128_64_kernel.cuh \
     tools/perig.cuh
+$(BUILD_DIR)/tools/bench_u96.o: tools/p0_test_u96.cuh tools/perig.cuh
 $(BUILD_DIR)/tools/phase0_scan_gpu.o: tools/mr68_kernel.cuh tools/perig.cuh \
     tools/p0_mark.cuh tools/p0_types.h tools/p0_walk_kern.cuh tools/phase0gpu_api.h \
-    tools/smooth_range.h tools/p0_test_lazy.cuh
+    tools/smooth_range.h tools/p0_test_lazy.cuh tools/p0_test_u96.cuh
 $(BUILD_DIR)/tools/bench_p0sieve.o: tools/p0_mark.cuh tools/p0_types.h
 $(BUILD_DIR)/tools/phase0gpu_dll.o: tools/phase0gpu_api.h tools/mr68_kernel.cuh \
     tools/p0_mark.cuh tools/p0_types.h tools/p0_walk_kern.cuh tools/perig.cuh \
-    tools/p0_test_lazy.cuh
+    tools/p0_test_lazy.cuh tools/p0_test_u96.cuh
 
 # Link test_gap_priority
 $(TEST_GAP_PRIORITY): $(OBJECTS) $(BUILD_DIR)/$(TEST_DIR)/test_gap_priority.o | $(BIN_DIR)

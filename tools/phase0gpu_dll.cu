@@ -164,6 +164,11 @@ P0GPU_EXPORT int p0gpu_walk(const void *bm, unsigned long long nwords,
        two tests produce an identical gap set.  Note this DLL has no mode
        override: the host's P0_WALK_TESTMODE only affects the monolithic build. */
     switch (w_test_mode(ahi)) {
+    case 4:
+        walk_kernel7<4, 0><<<grid, block, 0, (cudaStream_t)stream>>>(
+            (const uint64_t *)bm, nwords, alo, ahi, (const uint32_t *)wtab,
+            min_gap, (w_gaprec_t *)out, cap, (unsigned long long *)stats);
+        break;
     case 3:
         walk_kernel7<3, 0><<<grid, block, 0, (cudaStream_t)stream>>>(
             (const uint64_t *)bm, nwords, alo, ahi, (const uint32_t *)wtab,

@@ -33,6 +33,8 @@ Current performance (RTX 3070, i3-10100, 8 threads):
 | `bin/mr128_bench`, `tools/mr128_bench.cu` | | 128-bit test validator (`--validate`, GMP cross-check) + benchmark of the production kernel and its faster experimental variants |
 | `tools/mr128_64_range.cpp`, `tools/mr128_64_sqr_range.cpp` | | host-only GMP harnesses for the 2 x 64-bit test and its square (the second one unit-tests the square against the validated generic multiply) |
 | `tools/mr128_range.cpp`, `tools/perig_range.cpp` | | host-only GMP harnesses: MR verdicts vs `mpz_probab_prime_p` per bit length (`g++ -O2 -I tools <harness>.cpp -lgmp`; the headers define the CUDA qualifiers away when not compiled by nvcc) |
+| `tools/p0_test_u96.cuh` | | OUR wall-band primality test (walk `P0_WALK_TESTMODE=4`): the same base-2 Euler/Jacobi predicate as perig for `2^95 <= n < 2^96 - 2^79`, as one fused column-wise 3 x 32-bit Montgomery square+reduce per step (`mad.lo.cc`/`madc.hi.cc` PTX); 1.70x perig standalone, 1.45x end to end at the wall band (§2) |
+| `bin/bench_u96`, `tools/bench_u96.cu` | | gate + A/B of that test against perig and GMP: `gate` (exact `2^e mod n` vs `mpz_powm`, GPU and host), `verd` (verdict parity on consecutive odd n), `sweep` (parity across the whole domain incl. both limits), `time` (ns/test).  Build: `make bin/bench_u96 WITH_CUDA=1` (needs `-lgmp`); gates and example commands: §5 |
 | `scripts/p0_bench.py` | | fixed-range walk-engine bench: runs arms, parses wall/e2e/tests + the GPU-event stage split; `--bin-b` gives the ABBA order; results append to `data/p0_bench_results.txt` |
 | `scripts/phase0_hl_compare.py` | | merit-tail comparison vs HL-1t / HL-4p models (figure) |
 | `scripts/p0_walk_hl_compare.py` | | walk-scan census + first-occurrence comparison vs titanV's HL tables (figure) |
@@ -86,7 +88,7 @@ Defaults:
 | `--merit-min M` | `20.0` | gaps >= M are written to the log and GMP-verified; bands/top-4/records still see every gap with merit >= 6 (internal gate) |
 | `--engine sieve\|walk` | `sieve` | `walk` selects the class-30 bitmap sieve + batched jump-walk engine (~10.6x the sieve engine's throughput at the production default: measured 5.2 s vs 55.8 s for 1e12 integers, identical 5-gap output, 2026-10-02; same log/records/verify/top-4/resume path). `--check`, `--gpu-sieve`/`--cpu-sieve`, `--legacy-mr` and `--sieve-limit` apply to the sieve engine only; combining them with `--engine walk` is an error (or ignored where noted) |
 | `--gap-min G` | `ceil(--merit-min * ln(start))` | walk engine only: report every gap >= G (GMP-verified). G in [100, 1e7]; values < 300 print a warning (walk cost scales ~1/G). Passing `--gap-min` explicitly removes the merit gate; an explicit `--merit-min` stays as an additional bar |
-| `--walk-primes P` | `150000` | walk engine: sieve/item primes 17..P.  Deeper sieving cuts the number of primality tests (measured tests follow 1/ln P exactly) but grows the marking, so the optimum is **tile-dependent and band-dependent**.  With the shipped 92 KB tile the 7.9e28 campaign band measures **2.39 / 2.45-2.48 / 2.33 / 2.30e11 ints/s** for P = 120000 / **150000** / 180000 / 210000 (4e12 ints, `--gap-min 1664`, ABBA), i.e. the optimum moved 100000 -> 150000 when the mark's per-item cost fell (§31).  With the old 64 KB tile the same band measured 2.059 / 2.237 / **2.397** / 2.247 / 1.926 / 1.497e11 for P = 15000 / 40000 / **100000** / 250000 / 500000 / 1e6 (§28).  At shallow starts a smaller depth wins: at `--start 1e20` 40000 gives 4.03e11 vs 3.87-3.95e11 at 150000, and 15000 is the optimum at the 1e13 campaign geometry, so pass `--walk-primes 40000` (or 15000) for shallow bands.  Gap sets are identical at every depth (verified 87034/87034 gaps at `--gap-min 800`, P = 40000..1e6, and 1696/1696 walk-vs-sieve at P = 150000) |
+| `--walk-primes P` | `150000` | walk engine: sieve/item primes 17..P.  Deeper sieving cuts the number of primality tests (measured tests follow 1/ln P exactly) but grows the marking, so the optimum is **tile-dependent and band-dependent**.  With the shipped 92 KB tile the 7.9e28 campaign band measures **2.39 / 2.45-2.48 / 2.33 / 2.30e11 ints/s** for P = 120000 / **150000** / 180000 / 210000 (4e12 ints, `--gap-min 1664`, ABBA), i.e. the optimum moved 100000 -> 150000 when the mark's per-item cost fell (§31).  With the old 64 KB tile the same band measured 2.059 / 2.237 / **2.397** / 2.247 / 1.926 / 1.497e11 for P = 15000 / 40000 / **100000** / 250000 / 500000 / 1e6 (§28).  At shallow starts a smaller depth wins: at `--start 1e20` 40000 gives 4.03e11 vs 3.87-3.95e11 at 150000, and 15000 is the optimum at the 1e13 campaign geometry, so pass `--walk-primes 40000` (or 15000) for shallow bands.  Gap sets are identical at every depth (verified 87034/87034 gaps at `--gap-min 800`, P = 40000..1e6, and 1696/1696 walk-vs-sieve at P = 150000).  **Re-swept 2026-10-30** with the wall-band test (`P0_WALK_TESTMODE=4`, below) and the chunk-major mark order (`P0_ITEM_ORDER`, below), `--start 7.9e28 --length 4.8e12 --gap-min 1664`, dev 3070, 3 interleaved reps: P = 70000 / 85000 / **100000** / 120000 / 150000 -> **13.30 / 12.85 / 12.70 / 12.85 / 12.99 s**.  A cheaper test moves the optimum back toward a shallower sieve: 100000 is -2.2 % against the default and the curve is flat within 1.5 % over 85000..150000 (earlier 2-rep sweep: 40000 13.9 s, 60000 13.6 s, 80000 13.31/12.27 s - an outlier pair, hence the 3-rep round above - 220000 13.3 s, 320000 13.9 s).  **The default is unchanged** (150000) because the fleet's RTX 3060 has not been measured and a rollout should change one variable at a time; opt in with `--walk-primes 100000` (see the chain recipe in §6, a slice resumes from its checkpoint at the new depth) |
 | `--walk-batch B` | `64` | walk engine: super-batch = B x 30-blocks (**default 64 since 2026-10-03**, was 32; range **4..96**, raised from 4..32 the same day). ABBA on 1e13 at `--gap-min 702` (dev 3070, 4 arms): K32 63.68 s vs **K64 62.12 s = +2.45 %**, K96 62.26 s (+2.23 %, no better than 64 but 6.5 GB) - at the 7.9e28 wall with the 92 KB tile K96 measured 16.12/16.33 s vs 16.36/16.94 s for K64 (**+2.5 %**, both pairs), still opt-in because of the VRAM; both K64 arms beat both K32 arms and the emitted sets are identical (parity K32==K64==K96 exact, 1624/1624 on 1e12). VRAM = 2 regions x (B+1) x 33.6 MB + gap buffer: default K=64 -> 4.4 GB, K=32 -> 2.2 GB, K=96 -> 6.5 GB (an over-large K fails the bitmap alloc loudly, never silently) |
 | `--log FILE` | none | appended; one `# phase0-gpu session ...` header per run |
 | `--state FILE` / `--state-every S` | none / `30` s | checkpoint for resume; **deleted when the range completes** |
@@ -126,6 +128,32 @@ Re-swept 2026-10-27 at the campaign band (`--start 1e32 --length 2e12`,
 8.80 / 8.63 / **8.66** / 8.80 / 9.04 / 8.82 s, and tile
 131072/262144/524288/**753664** -> 10.81 / 9.60 / 9.20 / **8.61** s, so both
 defaults still sit at the optimum.
+`P0_ITEM_ORDER=0|1` (walk engine) is the row order of the mark kernel's item
+table when it has more than `P0_ITEM_STRIDE_CUT` = 5000 rows (`tools/p0_types.h`;
+the warp-strided path - every production depth: 16599 rows at P = 150000, 12343
+at 100000), default **`1`** = chunk-major (every prime's chunk-0 row, then every
+prime's chunk-1 row, ...); `0` = the historical prime-major order.  A warp takes
+32 CONSECUTIVE rows.  In prime-major order those are consecutive chunks of ONE
+prime, whose first marks sit `256 * p` bit positions = `8 * p` words apart, so
+they fall on only 4 of the 32 shared-memory banks and every `atomicOr` of a
+small-prime row (the primes with many chunks per tile) is an up-to-8-way bank
+conflict; chunk-major puts 32 different primes in a warp.  The kernel is
+unchanged (the OR-union of the marks does not depend on the row order), so the
+bitmap, the `tests` count and the gap set are identical.  Measured 2026-10-30
+(dev 3070, `--start 79000000000010000000000000000 --length 4.8e12`,
+`--walk-primes 150000`): mark alone (`P0_WALK_OFF=1`, ABBA) **5.69 -> 4.71 s
+(-17 %)**; end to end 13.35 -> 12.98 s (**-2.8 %**, 3 interleaved reps, with
+`P0_WALK_TESTMODE=4`) - the overlap hides most of the mark, so only about a third
+of the gain reaches the wall; `tests=9505435886` in every arm.  Example, A/B
+against the old order:
+
+    P0_ITEM_ORDER=0 ./bin/phase0_scan_gpu --engine walk \
+        --start 79000000000010000000000000000 --length 4800000000000 \
+        --gap-min 1664 --walk-primes 150000 --walk-batch 96 --no-records
+
+An out-of-range value prints `P0_ITEM_ORDER N out of range [0,1]; using 1` on
+stderr; the table builder aborts with `walk item table size mismatch` if the row
+count and the table ever disagree.
 `P0_WK_GRID=N` / `P0_WK_BLOCK=N` (walk engine) are the walk kernel's CTA count and
 threads per CTA, defaults `46` / `512` (ranges 1..4096 and 32..1024).  They are a
 measured optimum: same arm, 46x512 -> 8.67 s against 92x512 9.40 s, 138x512
@@ -136,13 +164,25 @@ longer the knob it was pre-pipeline - keep its default too.
 walk's scan/test split.  At the campaign band it reads **scan 1.8 % / test
 98.2 %**: the walk is arithmetic, not bitmap scanning.
 
-**Ceiling of the arithmetic avenue, measured 2026-10-27** (`--start 1e32`,
-`--length 2e12`): the walk is 91.8 % of the wall and 98 % of the walk is the test,
-yet the MARK is 98.5 % of the wall and the two streams overlap 1.8x, so
-`wall/mark` = **1.5 %** is the whole prize for making the walk free.  That is why
-a device-resident CUDA-graph rewrite of the scan loop was specified, measured up
-to the ceiling and then **rejected**, and why PGN68's 2.18x is not a scheduler
-win: see `docs/PHASE0_pgn_lever_verdict_2026-10-26.md` (§42).
+**Ceiling of the arithmetic avenue, measured 2026-10-27 - CORRECTED 2026-10-30**
+(`--start 1e32`, `--length 2e12`): the walk is 91.8 % of the wall and 98 % of the
+walk is the test, and the MARK stage SPAN is 98.5 % of the wall because the two
+streams overlap 1.8x.  The 2026-10-27 reading of that - "`wall/mark` = 1.5 % is
+the whole prize for making the walk free" - was **wrong**: the span of the mark
+inside the overlapped run is stretched by the walk that shares the SMs, it is not
+what the mark costs.  Measured standalone (`P0_WALK_OFF=1`) the mark is **2.11 s
+of the 8.5 s wall** at this band (full wall 8.54 / 8.51 s, `tests=3634782921`,
+`--gap-min 2002`) and 4.71 s of 12.98 s at the 7.9e28 wall band, so the walk's
+test IS the critical path and a cheaper test pays: the wall-band test (mode 4,
+below) took 19.36 -> 12.98 s per 4.8e12 (**1.49x** with the mark order).  At
+1e32 (n = 2^106) mode 4 does not apply (perig's band), so that lever is still
+open there.  What stands: the device-resident CUDA-graph rewrite of the scan loop
+(a scheduling change) was specified, measured and **rejected** (an nsys trace at
+2e28 shows no GPU idle time for a graph to remove: the kernels cover 7.581 s of
+their 7.582 s span), and PGN68's 2.18x
+is not a scheduler win - it is per-bit-width arithmetic: see
+`docs/PHASE0_pgn_lever_verdict_2026-10-26.md` (§42, corrected there) and
+`docs/PGN_SNAPSHOT_REVIEW_2026-10-20.md` (§12).
 
 Diagnostics for cost isolation (walk engine, docs §32) - **never production
 settings**:
@@ -156,9 +196,13 @@ settings**:
   without `P0_WALK_OFF=1`.  Measured (4e12 ints, P = 150000, mark-only):
   0 -> 4.91 s, 3 -> 4.73 s, 2 -> 4.52 s, 1 -> 4.51 s, i.e. the tile stream costs
   8.1 % of the mark.
-* `P0_WALK_TESTMODE=0|1|2|3` forces the walk's primality variant instead of the
+* `P0_WALK_TESTMODE=0|1|2|3|4` forces the walk's primality variant instead of the
   magnitude dispatch: `0` = perig (2x64 CIOS Montgomery), `1` = exact lazy 2x64,
-  `2` = canonical 2x64, `3` = our three-limb lazy-Barrett test.  Modes 0..2 live
+  `2` = canonical 2x64, `3` = our three-limb lazy-Barrett test, `4` = our fused
+  column-wise three-limb Montgomery test (`tools/p0_test_u96.cuh`, exact only for
+  `2^95 <= n < 2^96 - 2^79`; forced outside that range it prints a one-time
+  `P0_WALK_TESTMODE=4 only covers Ahi in [2^31, 2^32-2^15); Ahi=N uses the
+  magnitude dispatch` on stderr and falls back to the dispatch).  Modes 0..2 live
   in the same 128-bit container (perig is exact to 2^120, the lazy and canonical
   variants past it), so their band boundaries are COST choices, not correctness
   ones - the three agree on the emitted gap set at 1e32 (`--gap-min 1300`:
@@ -167,15 +211,22 @@ settings**:
   19.32/21.56 s vs canonical 24.75/25.14 s with `tests` and the gap set
   identical, so perig is the fastest of those three; re-measured at the campaign
   band (`--start 1e32 --length 2e12 --gap-min 1300`): perig **12.86 s** < lazy
-  16.00 s < canonical 18.40 s.  Mode 3 at
-  `--start 1e22` (hi = 542): see the dispatch default below.
+  16.00 s < canonical 18.40 s.  Modes 3 and 4 at
+  `--start 1e22` (hi = 542) and at the 7.9e28 wall band: see the dispatch
+  default below.
 * Walk test dispatch (default, no environment variable): `n` under 2^70 ->
-  perig, `2^70 .. 2^75` -> mode 3, `2^75 .. 2^120` -> perig, `2^120 .. 2^126` ->
-  mode 1, above -> mode 2.  The band boundaries are exactness limits (mode 3's
-  five-word square needs a < 2^80, perig is exact to 2^120, mode 1 to 2^126),
-  EXCEPT the 2^70 lower bound for mode 3, which is a measured crossover: our
+  perig, `2^70 .. 2^75` -> mode 3, `2^75 .. 2^95` -> perig, `2^95 ..
+  2^96 - 2^79` -> **mode 4**, `2^96 - 2^79 .. 2^120` -> perig, `2^120 .. 2^126`
+  -> mode 1, above -> mode 2.  The upper band boundaries are exactness limits
+  (mode 3's five-word square needs a < 2^80, mode 4's lazy representative must
+  fit three limbs, perig is exact to 2^120, mode 1 to 2^126), EXCEPT the two
+  lower bounds, which are choices: 2^70 for mode 3 is a measured crossover (our
   test's reciprocal costs more up front than perig's constants, so it only pays
-  once the exponent is long enough.  Example:
+  once the exponent is long enough) and 2^95 for mode 4 is the range that was
+  gated and timed (its fixed 95-bit exponent schedule is exactly full there;
+  below it the verdicts still matched perig - 2M consecutive odd n at each of 8
+  high words from 2^70 to 2^95, 0 differences - but squarings are wasted, so it
+  is not selected there).  Example:
   `./bin/phase0_scan_gpu --engine walk --start 1e22 --length 2e12 --merit-min 20`
   runs mode 3 without any variable set.
   **Measured 2026-10-26** (dev 3070, `--start 1e22 --length 2e12 --merit-min 20`,
@@ -184,7 +235,44 @@ settings**:
   1,826,878 at `--merit-min 8` both diff to zero on (lower, gap, upper)).  The
   +7 % is smaller than the test's own 1.23x because the test is only part of the
   walk: at this band mark = 64.7 % and walk = 61.7 % of the wall (they overlap).
-  Above 2^75 nothing changes, so the campaign band (1e32) is unaffected.
+  **Mode 4, measured 2026-10-30** (dev 3070, `--start 79000000000010000000000000000
+  --length 4800000000000 --gap-min 1664 --walk-primes 150000 --walk-batch 96`,
+  3 interleaved reps, same binary): perig (`P0_WALK_TESTMODE=0`, `P0_ITEM_ORDER=0`)
+  **19.36 s** -> mode 4 **13.35 s** (**1.45x**) -> mode 4 + the chunk-major mark
+  order (the new default) **12.98 s** (**1.49x** in total); `tests=9505435886`
+  and zero gaps in all nine runs.  At `--gap-min 1100` (same range, one run per
+  arm) 27.88 -> 18.28 s (1.52x) with 1694 gaps and `tests=14681132483`
+  identical.  Standalone (`bin/bench_u96 time 1048576 200`, 2^20 consecutive odd
+  n at Ahi = 4282402316): **1.70 - 1.72x** (0.91 vs 1.57 ns/test at 1920 MHz; the
+  absolute ns drift with the clock/thermal state, the ratio does not), 26 vs 38
+  registers, 43 vs ~96 SASS instructions per modular squaring.  Why it is faster:
+  one fused column-wise square + Montgomery
+  reduction per step, every product accumulated with the PTX triple
+  `mad.lo.cc / madc.hi.cc / addc` that ptxas fuses into a single in-place
+  `IMAD.WIDE.U32`, and the last squaring of each 4-bit exponent window folds the
+  window's multiply-by-2^v into the Montgomery constant, so 92 squarings and no
+  multiplications.  The code is ours (the PGN snapshot has no license and none of
+  it is used).  A/B on any range in the band (both print the same `tests=`):
+
+      ./bin/phase0_scan_gpu --engine walk --start 79000000000010000000000000000 \
+          --length 4800000000000 --gap-min 1664 --walk-primes 150000 \
+          --walk-batch 96 --no-records                      # mode 4 (default)
+      P0_WALK_TESTMODE=0 P0_ITEM_ORDER=0 ./bin/phase0_scan_gpu --engine walk \
+          --start 79000000000010000000000000000 --length 4800000000000 \
+          --gap-min 1664 --walk-primes 150000 --walk-batch 96 --no-records   # old
+
+  Verification (2026-10-30): `bin/bench_u96 gate 2000000` - the GPU residue
+  `2^((n-1)/2) mod n` equals GMP `mpz_powm` on 2,000,000 random odd n of the
+  domain plus 14 hand-picked edge cases (host path and verdicts: the first
+  200,000), 0 mismatches; verdict parity with perig on 4,294,967,296 candidates
+  over 4096 random high words (`sweep 4096 1048576`: 129,712,962 primes in both,
+  0 differences) plus, in a second run, 1e9 consecutive odd n at the wall band
+  and 3e8 at each domain limit (Ahi = 2^31 and 2^32 - 2^15 - 1), all identical;
+  identical gap sets/test counts end to end; the split build
+  (`phase0_scan_gpu_split`, the Windows-DLL source) gives the same 428 gaps /
+  `tests=3671852807` as the monolithic one at `--gap-min 1100 --length 1.2e12`.
+  Between 2^75 and 2^95 and above 2^96 - 2^79 nothing changes, so the 1e32
+  campaign band is unaffected (and gets no speed-up from mode 4).
 * Kernel-DLL builds (`phase0_scan_gpu_split`, and on Windows `phase0gpu.dll` +
   the MinGW host tools) pick the test from the MAGNITUDE only:
   `P0_WALK_TESTMODE` is a monolithic-build variable.  `p0gpu_walk` must carry a
@@ -192,7 +280,8 @@ settings**:
   while the monolithic path had it, so the split build silently ran perig below
   2^75 (4.19 s vs 3.66 s at `--start 1e22 --length 5e11`, and the gap set is
   identical either way, so only the timing exposed it).  Both dispatch sites are
-  now in sync; `bin/phase0_scan_gpu` and `bin/phase0_scan_gpu_split` agree to
+  now in sync (`case 4` added 2026-10-30); `bin/phase0_scan_gpu` and
+  `bin/phase0_scan_gpu_split` agree to
   the bit (22,939 gaps, 3.66 / 3.64 s).
 
 ### Pipelines
@@ -595,8 +684,10 @@ only removes tests, never changes which numbers are reported) and the exit
 status is non-zero if it is not.  It stops the GPU from being shared: run it
 when no slice is active, and it passes `--no-records` so the campaign's records
 file is never touched.  `--length` accepts `4e12` (the engine itself does not).
-Measured depths for the 7.9e28 band, and why 100000 wins there: section 28 of
-`docs/PHASE0_scan_bench.md`.
+Measured depths for the 7.9e28 band, and why 100000 won there at the old 64 KB
+tile: section 28 of `docs/PHASE0_scan_bench.md` (the 92 KB tile moved the optimum
+to 150000, and the 2026-10-30 wall-band test + chunk-major mark order moved it
+back to 100000 - see the `--walk-primes` row in §2).
 
 ---
 
@@ -609,6 +700,8 @@ Measured depths for the 7.9e28 band, and why 100000 wins there: section 28 of
 | `./bin/mr68_gpu --validate 2000000` | `0 mismatches` (85563 primes) |
 | `./bin/mr128_bench --validate 3000 0 121` | `VALIDATE PASS (0 mismatches vs GMP)` - the 2 x 64-bit walk kernel above 2^120; bits 121/125/130 must pass, 96 is outside its `2^96 < n < 2^128` domain and fails by design (§29) |
 | `./bin/bench_p0sieve --verify 3` | `3 segment(s) bit-exact vs naive CPU marker` |
+| `./bin/bench_u96 gate 200000`, `./bin/bench_u96 sweep 64 1048576` | the walk's mode-4 test (build line: §1) is exact: `gate N=200000 : gpu residue mismatches=0  host mismatches=0  verdict mismatches=0` and `sweep chunks=64 N=1048576: primes u96=2027625 perig=2027625 diff=0` (measured 2026-10-30; the larger verdict runs are in `docs/PGN_SNAPSHOT_REVIEW_2026-10-20.md` §12).  Run it after ANY change to `tools/p0_test_u96.cuh` |
+| walk test-mode parity (wall band) | `--engine walk --start 79000000000010000000000000000 --length 1200000000000 --gap-min 1100 --walk-primes 150000 --walk-batch 96 --no-records --log L` with the default (mode 4) and with `P0_WALK_TESTMODE=0` (perig), and with `bin/phase0_scan_gpu_split`: **428 gaps and `tests=3671852807` in all three**, gap sets identical after stripping the session-id column (measured 2026-10-30) |
 | `./bin/phase0_scan_gpu --length 500000000 --merit-min 10 --log L` | `204` rows, top-4 `724/690/684/682` (merits `15.4883/14.7610/14.6326/14.5898`), 0 unverified |
 | fast vs legacy equivalence | `--merit-min 10` on 1e10: 4439 rows, byte-identical between default and `--legacy-mr` (sorted, timestamp stripped) |
 | PSP fixture | `--start 18447233110000000000 --length 5000000000 --merit-min 15` contains `gap=710 merit=16.0049 verified=1` (the 2-PSP 18447233112263860537 must never appear), 0 unverified |
@@ -688,7 +781,10 @@ unfinished ones (e.g. after a kill) are requeued first, so rerunning the
 same command restarts the continuum (`data/p0_walk_<tag>_chain.state` keeps
 the fixed `start0/index0`).  A slice that does not complete drains the
 chain (no new launches, exit 1); a lock file and a live-scanner check
-refuse a second chain on the same tag.  Before every slice it re-derives
+refuse a second chain on the same tag.  Restart through the chain (rerun its
+command), never with hand-started `phase0_scan_gpu` processes: a bare scanner
+completes only its own slice and exits, and with the chain gone nothing
+launches the next one.  Before every slice it re-derives
 the shortest WINNABLE length at that start (shortest even `g` with
 `g/ln(start) > table(g)` - the shortest length that would beat the record
 table) and warns in BOTH directions: `--gap-min` below it only adds
@@ -734,8 +830,12 @@ because the marking grows faster than the tests fall (`docs/PHASE0_scan_bench.md
 resumes from its checkpoint at the new depth, and the reported gaps are
 identical at every depth, so the census stays consistent across slices taken at
 different depths (record the value in the ledger if that matters for your
-analysis).  Example: a restart that also moves the remaining slices to the
-measured optimum:
+analysis).  With the 2026-10-30 binary (TESTMODE 4 + chunk-major mark) the
+optimum at this band is **100000** (12.70 s vs 12.99 s at 150000 per 4.8e12, -2.2 %;
+with the older binary 150000 stays the optimum, and the engine default stays
+150000 until the fleet's RTX 3060 is measured), so after rolling that binary out
+replace `--walk-primes 150000` by `--walk-primes 100000` in the restart below.
+Example: a restart that also moves the remaining slices to the measured optimum:
 
 ```bash
 nohup setsid python3 scripts/p0_walk_chain.py \

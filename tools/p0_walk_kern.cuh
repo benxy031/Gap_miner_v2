@@ -27,16 +27,17 @@
 #include "mr128_64_kernel.cuh"  /* >= 2^120: exact 2x64-bit CIOS, 1.1x faster
                                    than the 4x32 kernel (tools/mr128_bench.cu) */
 #include "p0_test_lazy.cuh"     /* < 2^75: our lazy-Barrett test, 1.23x faster */
+#include "p0_test_u96.cuh"      /* [2^95, 2^96-2^79): fused product-scanning
+                                   Montgomery test, 1.7x faster than perig */
 
 __device__ __constant__ uint32_t c30_cls[8] = {1, 7, 11, 13, 17, 19, 23, 29};
 __device__ __constant__ int8_t c30_clsidx[30];
 __device__ __constant__ uint32_t c30_perm[30];
 __device__ __constant__ uint32_t c30_pinv[30];
 
-/* Item-loop partition cut (see class30_sieve_kernel): tables at or below this
-   many item rows use the per-thread contiguous slices (setup reuse), larger
-   ones the warp-strided coalesced walk. */
-#define P0_ITEM_STRIDE_CUT 5000u
+/* Item-loop partition cut (see class30_sieve_kernel): tables at or below
+   P0_ITEM_STRIDE_CUT rows (p0_types.h) use the per-thread contiguous slices
+   (setup reuse), larger ones the warp-strided coalesced walk. */
 
 /* x * invp >> 64 (Granlund-Montgomery quotient estimate); was
    ((u128)x * (u128)invp) >> 64. */
@@ -435,10 +436,17 @@ __global__ static void class30_sieve_kernel(const uint64_t * __restrict__ primes
    three-limb test below 2^75 (measured 1.35x perig in that band: 0.94 vs
    1.27 ns/test, gates in tools/bench_lazy.cu), perig in 2^75..2^120, the lazy
    Montgomery ladder (mr128_64_base2_lazy, exact < 2^126, +37%) in
-   2^120..2^126, and the canonical kernel above 2^126.  Above 2^75 the
-   verdicts are bit-for-bit what they were. */
+   2^120..2^126, and the canonical kernel above 2^126.  Mode 4 (p0u96, the
+   fused column-wise Montgomery test, 1.70x perig standalone) takes the
+   2^95 <= n < 2^96 - 2^79 slice of the perig band, which is where the
+   record-wall campaign runs (docs/PGN_SNAPSHOT_REVIEW_2026-10-20.md).  Every
+   mode is bit-for-bit the same predicate, so the verdicts never change. */
 #define W_MODE3_MIN_HI  (64ULL)          /* value >= 2^70: mode 3 is faster */
 #define W_SMALL_MAX_HI  (1ULL << 11)     /* value < 2^75: mode 3 */
+#define W_U96_MIN_HI    (1ULL << 31)     /* value >= 2^95: mode 4 */
+#define W_U96_MAX_HI    ((1ULL << 32) - (1ULL << 15))  /* value < 2^96-2^79: mode 4;
+                                            a CORRECTNESS bound (the lazy
+                                            representative must fit 96 bits) */
 #define W_PERIG_MAX_HI  (1ULL << 56)     /* value < 2^120 */
 #define W_LAZY_MAX_HI   (1ULL << 62)     /* value < 2^126 */
 
@@ -448,6 +456,7 @@ __global__ static void class30_sieve_kernel(const uint64_t * __restrict__ primes
    variant matching the super-batch's high word. */
 template<int MODE>
 __device__ static inline int w_is_probable_prime(uint64_t v, uint64_t Ahi) {
+    if (MODE == 4) return p0u96::test_hi(v, (uint32_t)Ahi) ? 1 : 0;
     if (MODE == 3) return p0lazy::test_hi(v, (uint32_t)Ahi) ? 1 : 0;
     if (MODE == 2) return mr128_64_base2_u128(v, Ahi);
     if (MODE == 1) return mr128_64_base2_lazy_u128(v, Ahi);
@@ -457,6 +466,14 @@ __device__ static inline int w_is_probable_prime(uint64_t v, uint64_t Ahi) {
 __host__ static inline int w_test_mode(uint64_t Ahi) {
     if (Ahi >= W_LAZY_MAX_HI)  return 2;
     if (Ahi >= W_PERIG_MAX_HI) return 1;
+    /* mode 4: 2^95 <= n < 2^96 - 2^79.  Upper bound: from 2^96 - 2^79 up the
+       lazy representative no longer fits three limbs (exactness).  Lower
+       bound: below 2^95 the exponent is shorter than the fixed 95-bit
+       schedule (3 seed bits + 23 windows), so squarings are wasted; verdicts
+       still matched perig there (2026-10-30 probes, 2M candidates at each of
+       8 high words down to 2^70) but the band is not selected until it is
+       measured. */
+    if (Ahi >= W_U96_MIN_HI && Ahi < W_U96_MAX_HI) return 4;
     /* mode 3 wins only once there are enough squarings to amortise its
        reciprocal: measured ours/perig = 0.998 at Ahi=17, 0.960 at 54, 0.960 at
        171, 0.921 at 542, but 1.02 BELOW Ahi~10.  The crossover is in the

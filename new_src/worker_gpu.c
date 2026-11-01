@@ -712,19 +712,26 @@ static void h256_to_limbs(const uint8_t h256[32], uint64_t H[4]) {
     }
 }
 
-/* base = (h256 << shift) + window_start, as `limbs` little-endian 64-bit words.
-   `limbs` must equal the adapter's active limb count (>= ceil((256+shift)/64)). */
-static void compute_base_limbs(const uint64_t H[4], uint32_t shift,
-                               uint64_t window_start, int limbs, uint64_t *base) {
+/* base = (h256 << shift) + window_start, as `limbs` little-endian 64-bit words. */
+static int compute_base_limbs(const uint64_t H[4], uint32_t shift,
+                              uint64_t window_start, int limbs, uint64_t *base) {
     uint32_t q = shift >> 6;   /* shift / 64 */
     uint32_t r = shift & 63;   /* shift % 64 */
     memset(base, 0, (size_t)limbs * sizeof(uint64_t));
     for (int i = 0; i < 4; i++) {
         int lo = (int)q + i;
-        if (lo >= limbs) break;
+        if (lo >= limbs) {
+            if (H[i]) return 0;
+            continue;
+        }
         base[lo] |= H[i] << r;
-        if (r > 0 && lo + 1 < limbs)
-            base[lo + 1] |= H[i] >> (64 - r);
+        if (r > 0) {
+            uint64_t high = H[i] >> (64 - r);
+            if (lo + 1 < limbs)
+                base[lo + 1] |= high;
+            else if (high)
+                return 0;
+        }
     }
     uint64_t carry = window_start;
     for (int i = 0; i < limbs; i++) {
@@ -732,6 +739,7 @@ static void compute_base_limbs(const uint64_t H[4], uint32_t shift,
         carry = (s < base[i]) ? 1ULL : 0ULL;
         base[i] = s;
     }
+    return carry == 0;
 }
 
 static void gpu_pending_flush(uint32_t worker_id, struct worker_config *config,
@@ -745,22 +753,32 @@ static void gpu_pending_flush(uint32_t worker_id, struct worker_config *config,
     uint64_t *packed = gpu_prime ?
         (uint64_t *)malloc((size_t)st->total * (size_t)limbs * sizeof(uint64_t)) : NULL;
     int gpu_ok = gpu_prime && packed;
+    const char *gpu_error = gpu_ok ? NULL : "batch staging allocation failed";
 
     if (gpu_ok) {
         /* Pack limbs directly from h256 + shift + window offsets (no GMP). */
         uint64_t H[4];
         h256_to_limbs(st->h256, H);
         uint64_t *out = packed;
-        for (uint32_t w = 0; w < st->n; w++) {
+        for (uint32_t w = 0; w < st->n && gpu_ok; w++) {
             uint64_t base[GPU_NLIMBS];
-            compute_base_limbs(H, st->shift, st->windows[w].window_start,
-                               limbs, base);
+            if (!compute_base_limbs(H, st->shift, st->windows[w].window_start,
+                                    limbs, base)) {
+                gpu_error = "window base exceeds the active GPU width";
+                gpu_ok = 0;
+                break;
+            }
             for (uint32_t i = 0; i < st->windows[w].count; i++) {
                 uint64_t carry = st->windows[w].offsets[i];
                 for (int j = 0; j < limbs; j++) {
                     uint64_t s = base[j] + carry;
                     carry = (s < base[j]) ? 1ULL : 0ULL;
                     out[j] = s;
+                }
+                if (carry) {
+                    gpu_error = "candidate exceeds the active GPU width";
+                    gpu_ok = 0;
+                    break;
                 }
                 out += limbs;
             }
@@ -777,12 +795,17 @@ static void gpu_pending_flush(uint32_t worker_id, struct worker_config *config,
                batch above it is truncated silently (2026-09-17 incident). */
             uint32_t cap = (uint32_t)gpu_fermat_max_batch(
                 gpu_adapter_get_fermat_ctx(gpu));
-            if (cap == 0) cap = GPU_ADAPTER_MAX_BATCH;
+            if (cap == 0) {
+                gpu_error = "GPU batch capacity is zero";
+                gpu_ok = 0;
+                break;
+            }
             uint64_t remaining = st->total - off;
             uint32_t chunk = remaining > cap ? cap : (uint32_t)remaining;
             if (gpu_adapter_async_submit_packed(gpu, next_slot,
                                                 packed + off * (size_t)limbs,
                                                 chunk) != 0) {
+                gpu_error = "GPU batch submission failed";
                 gpu_ok = 0;
                 break;
             }
@@ -801,6 +824,7 @@ static void gpu_pending_flush(uint32_t worker_id, struct worker_config *config,
                     .is_prime = gpu_prime + chunk_offset[collect_slot]
                 };
                 if (gpu_adapter_async_collect(gpu, collect_slot, &done) != 0) {
+                    gpu_error = "GPU batch collection failed";
                     gpu_ok = 0;
                     break;
                 }
@@ -816,6 +840,7 @@ static void gpu_pending_flush(uint32_t worker_id, struct worker_config *config,
                 .is_prime = gpu_prime + chunk_offset[collect_slot]
             };
             if (gpu_adapter_async_collect(gpu, collect_slot, &done) != 0) {
+                gpu_error = "GPU batch collection failed";
                 gpu_ok = 0;
             }
         }
@@ -829,6 +854,8 @@ static void gpu_pending_flush(uint32_t worker_id, struct worker_config *config,
     }
     free(packed);
     if (!gpu_ok) {
+        fprintf(stderr, "[Worker %u] %s; using CPU for this batch\n",
+                worker_id, gpu_error);
         free(gpu_prime);
         gpu_prime = NULL;
     }
@@ -1299,10 +1326,8 @@ void *worker_thread_run(void *arg) {
                                  &euler_context, is_prime);
             }
             if (gpu) {
-                /* Narrow the GPU arithmetic width to what this shift actually
-                   needs (h256 is 256 bits) instead of the full compiled
-                   GPU_NLIMBS width -- O(limbs^2) cost, so this matters a lot. */
-                gpu_adapter_set_candidate_bits(gpu, 256U + shift);
+                /* Include a guard bit for the end-of-window halo. */
+                gpu_adapter_set_candidate_bits(gpu, 257U + shift);
             }
 #endif
             chunk_next = 0;
@@ -1595,6 +1620,11 @@ static int crt_gpu_batch_test(struct gpu_adapter *gpu, int limbs,
                               uint8_t *is_prime) {
     if (!gpu || !base_limbs || !packed || count == 0) return -1;
 
+    if (!gpu_adapter_window_fits(window_base, 1, limbs)) {
+        fprintf(stderr, "[GPUAdapter] CRT base exceeds the %d-limb GPU width; "
+                "using CPU for this batch\n", limbs);
+        return -1;
+    }
     size_t exported = 0;
     memset(base_limbs, 0, (size_t)limbs * sizeof(uint64_t));
     mpz_export(base_limbs, &exported, -1, sizeof(uint64_t), 0, 0, window_base);
@@ -1607,6 +1637,11 @@ static int crt_gpu_batch_test(struct gpu_adapter *gpu, int limbs,
             uint64_t s = base_limbs[j] + carry;
             carry = (s < base_limbs[j]) ? 1ULL : 0ULL;
             out[j] = s;
+        }
+        if (carry) {
+            fprintf(stderr, "[GPUAdapter] CRT candidate exceeds the %d-limb "
+                    "GPU width; using CPU for this batch\n", limbs);
+            return -1;
         }
         out += limbs;
     }
@@ -2634,7 +2669,12 @@ int crt_gpu_resolve_gap_ex(struct gpu_fermat_ctx *fermat, int slot,
        interleaves garbage into the MR inputs and silently drops interior
        primes — the false-gap bug. */
     int rl = gpu_fermat_get_limbs(fermat);
-    if (nc > 0) {
+    if (nc > 0 && (uint64_t)nc > gpu_fermat_max_batch(fermat)) {
+        fprintf(stderr, "[GPUAdapter] hidden candidate batch exceeds GPU "
+                "capacity; using CPU resolution\n");
+        ok = 0;
+    }
+    if (nc > 0 && ok) {
         uint64_t *limb_buf = NULL;
         uint8_t *flags = NULL;
         if (rl >= 4) {
@@ -2646,20 +2686,33 @@ int crt_gpu_resolve_gap_ex(struct gpu_fermat_ctx *fermat, int slot,
         mpz_t c;
         mpz_init(c);
         if (!limb_buf || !flags || !hid) {
+            fprintf(stderr, "[GPUAdapter] hidden candidate staging failed; "
+                    "using CPU resolution\n");
             ok = 0;
         } else {
             for (int64_t i = 0; i < nc; i++) {
                 mpz_set(c, bsub);
                 mpz_add_ui(c, c, cand[i]);
+                if (!gpu_adapter_window_fits(c, 1, rl)) {
+                    fprintf(stderr,
+                            "[GPUAdapter] hidden candidate exceeds the "
+                            "%d-limb GPU width; using CPU resolution\n", rl);
+                    ok = 0;
+                    break;
+                }
                 uint64_t *limbs = limb_buf + (size_t)i * (size_t)rl;
                 memset(limbs, 0, (size_t)rl * sizeof(uint64_t));
                 size_t cnt = 0;
                 mpz_export(limbs, &cnt, -1, sizeof(uint64_t), 0, 0, c);
             }
-            if (gpu_fermat_submit(fermat, slot, limb_buf, (size_t)nc) != 0 ||
-                gpu_fermat_collect(fermat, slot, flags, (size_t)nc) < 0) {
+            if (ok &&
+                (gpu_fermat_submit(fermat, slot, limb_buf, (size_t)nc) != 0 ||
+                 gpu_fermat_collect(fermat, slot, flags, (size_t)nc) < 0)) {
+                fprintf(stderr, "[GPUAdapter] hidden candidate GPU test "
+                        "failed; using CPU resolution\n");
                 ok = 0;
-            } else {
+            }
+            if (ok) {
                 for (int64_t i = 0; i < nc; i++) {
                     if (!flags[i]) continue;
                     mpz_set(c, bsub);
@@ -3186,21 +3239,19 @@ void *worker_thread_run_crt(void *arg) {
     size_t gpu_sieve_split_index = 0;
     int gpu_sieve_enabled = 0;
     int gpu_sieve_failure_reported = 0;
+    int gpu_width_failure_reported = 0;
     uint64_t *gpu_host_bitmap = NULL;
     if (atomic_load_explicit(&g_gpu_fermat_enabled, memory_order_acquire)) {
-        /* Size the staging for THIS geometry (shift known up front):
-           gpu_fermat_limbs_for_bits(256+shift) limbs instead of the compiled
-           GPU_NLIMBS.  At shift 738 that is 16 vs 32 -> the per-worker staging
-           halves from ~655 MB to ~328 MB, which is what a --threads 8 miner
-           turns into ~5 GB (and ~10 GB as two dual-GPU processes).  Batch stays
-           at GPU_ADAPTER_MAX_BATCH: the CRT path submits a whole flight and
-           gpu_fermat_clamp() TRUNCATES anything past max_batch, so lowering it
-           below the flight's candidate count would silently drop verdicts. */
+        uint32_t candidate_bits =
+            gpu_adapter_crt_candidate_bits(rt->shift, rt->primorial,
+                                           max_interval);
+        /* Bound the alignment, row stride and whole window before sizing
+           staging. Keep the full batch capacity for accumulated flights. */
         gpu = gpu_adapter_init_limbs((int)config->gpu_device,
                                      GPU_ADAPTER_MAX_BATCH,
-                                     gpu_fermat_limbs_for_bits(256U + rt->shift));
+                                     gpu_fermat_limbs_for_bits(candidate_bits));
         if (gpu) {
-            gpu_adapter_set_candidate_bits(gpu, 256U + rt->shift);
+            gpu_adapter_set_candidate_bits(gpu, candidate_bits);
             gpu_limbs = gpu_adapter_get_limbs(gpu);
             gpu_base_limbs = (uint64_t *)calloc((size_t)gpu_limbs,
                                                 sizeof(uint64_t));
@@ -3570,17 +3621,23 @@ void *worker_thread_run_crt(void *arg) {
     }
     mpz_set(rowP, rt->primorial);
 
+#ifdef WITH_CUDA
     /* Row stride P exported once: it is fixed for the whole CRT run. */
     int rowP_limbs_valid = 0;
     uint64_t rowP_limbs[GPU_NLIMBS];
     memset(rowP_limbs, 0, sizeof(rowP_limbs));
     {
-        size_t step_exported = 0;
-        mpz_export(rowP_limbs, &step_exported, -1, sizeof(uint64_t), 0, 0,
-                   rowP);
-        rowP_limbs_valid = (step_exported > 0 && step_exported <= GPU_NLIMBS)
-                               ? 1
-                               : 0;
+        if (mpz_sgn(rowP) > 0 &&
+            mpz_sizeinbase(rowP, 2) <= (size_t)gpu_limbs * 64U) {
+            size_t step_exported = 0;
+            mpz_export(rowP_limbs, &step_exported, -1, sizeof(uint64_t), 0, 0,
+                       rowP);
+            rowP_limbs_valid = step_exported > 0;
+        } else if (gpu) {
+            fprintf(stderr, "[Worker %u] CRT row stride exceeds the "
+                    "%d-limb GPU width; disabling row-batch marking\n",
+                    worker_id, gpu_limbs);
+        }
     }
 
     /* WS-B: cache step_mod_p = P mod p ONCE per run (P is the fixed row
@@ -3597,6 +3654,7 @@ void *worker_thread_run_crt(void *arg) {
                 "(gpu_sieve_set_residue_step failed)\n",
                 (unsigned)worker_id);
     }
+#endif
 
     while (!g_stop_requested) {
         uint64_t generation;
@@ -3724,7 +3782,22 @@ void *worker_thread_run_crt(void *arg) {
                     int fused_async = 0;
 
 #ifdef WITH_CUDA
-                    if (fused_enabled && fused_fermat && gpu_base_limbs) {
+                    int gpu_window_fits = gpu && gpu_limbs > 0 &&
+                        gpu_adapter_window_fits(window_base, interval,
+                                                gpu_limbs);
+                    if (gpu && !gpu_window_fits) {
+                        fused_pending_clear(&fused_pending);
+                        if (!gpu_width_failure_reported) {
+                            fprintf(stderr,
+                                    "[Worker %u] CRT window is negative or "
+                                    "exceeds the %d-limb GPU width; using CPU "
+                                    "for affected windows\n",
+                                    worker_id, gpu_limbs);
+                            gpu_width_failure_reported = 1;
+                        }
+                    }
+                    if (gpu_window_fits && fused_enabled &&
+                        fused_fermat && gpu_base_limbs) {
                         /* Async fused pipeline with K-window MR batch
                            accumulation: collect the flight from two batches
                            ago, then mark + extract the head of THIS window
@@ -4041,7 +4114,8 @@ void *worker_thread_run_crt(void *arg) {
                         }
                     }
 
-                    if (!sieve_ok && gpu_sieve_enabled && gpu_sieve &&
+                    if (!sieve_ok && gpu_window_fits &&
+                        gpu_sieve_enabled && gpu_sieve &&
                         gpu_base_limbs && gpu_host_bitmap) {
                         /* Export the window base limbs for the on-device
                            residue kernel. */
@@ -4130,7 +4204,7 @@ void *worker_thread_run_crt(void *arg) {
                         uint64_t euler_pass_count = 0;
                         int gpu_tested = 0;
 #ifdef WITH_CUDA
-                        if (gpu && gpu_packed &&
+                        if (gpu_window_fits && gpu_packed &&
                             crt_gpu_batch_test(gpu, gpu_limbs, gpu_base_limbs,
                                                gpu_packed, window_base,
                                                candidate_offsets, head_count,
@@ -4172,7 +4246,7 @@ void *worker_thread_run_crt(void *arg) {
                             gpu_tested = 0;
 #ifdef WITH_CUDA
                             uint32_t tail_count = candidate_count - head_count;
-                            if (gpu && gpu_packed &&
+                            if (gpu_window_fits && gpu_packed &&
                                 crt_gpu_batch_test(gpu, gpu_limbs,
                                                    gpu_base_limbs, gpu_packed,
                                                    window_base,

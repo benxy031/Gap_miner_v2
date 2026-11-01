@@ -116,6 +116,7 @@ static void run_case(struct gpu_fermat_ctx *ctx, mpz_t base) {
     mpz_clear(p);
     mpz_clear(nxt);
 }
+#endif /* WITH_CUDA */
 
 int main(void) {
 #ifndef WITH_CUDA
@@ -131,20 +132,41 @@ int main(void) {
         printf("test_gpu_resolve: SKIP (GPU init failed)\n");
         return 0;
     }
-    /* Match the production shift-507 configuration: 12 active limbs. */
-    gpu_fermat_set_limbs(ctx, 12);
-
     mpz_t base;
     mpz_init(base);
-    for (uint64_t variant = 0; variant < 3; variant++) {
+    static const int widths[] = {5, 10, 12};
+    for (size_t w = 0; w < sizeof(widths) / sizeof(widths[0]); w++) {
+        int al = widths[w];
+        if (al > GPU_NLIMBS) continue;
+        gpu_fermat_set_limbs(ctx, al);
+        for (uint64_t variant = 0; variant < 3; variant++) {
+            mpz_set_ui(base, 1);
+            mpz_mul_2exp(base, base, (unsigned long)al * 64UL - 17UL);
+            mpz_add_ui(base, base, variant * 1000000ULL);
+            if (mpz_odd_p(base)) mpz_add_ui(base, base, 1);
+            run_case(ctx, base);
+        }
+    }
+    if (GPU_NLIMBS >= 5) {
+        gpu_fermat_set_limbs(ctx, 5);
         mpz_set_ui(base, 1);
-        mpz_mul_2exp(base, base, 751);   /* ~763-bit, production scale */
-        mpz_add_ui(base, base, variant * 1000000ULL);
-        if (mpz_odd_p(base)) mpz_add_ui(base, base, 1);
+        mpz_mul_2exp(base, base, 320);
+        mpz_sub_ui(base, base, 10000);
         run_case(ctx, base);
     }
     mpz_clear(base);
     gpu_fermat_destroy(ctx);
+
+    struct gpu_fermat_ctx *small = gpu_fermat_init(0, 1);
+    CHECK(small != NULL);
+    if (small && GPU_NLIMBS >= 5) {
+        gpu_fermat_set_limbs(small, 5);
+        mpz_init_set_ui(base, 1);
+        mpz_mul_2exp(base, base, 303);
+        run_case(small, base);
+        mpz_clear(base);
+    }
+    if (small) gpu_fermat_destroy(small);
 
     if (failures) {
         printf("test_gpu_resolve FAILED (%d failures)\n", failures);
@@ -154,4 +176,3 @@ int main(void) {
     return 0;
 #endif
 }
-#endif /* WITH_CUDA */

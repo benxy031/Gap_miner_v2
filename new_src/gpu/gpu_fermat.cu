@@ -810,21 +810,24 @@ cios_fermat_kernel(const uint64_t *__restrict__ cands,
 }
 
 /* ═══════════════════════════════════════════════════════════════════
- *  CGBN-based Fermat kernel: template<BITS, TPI> covers all even AL.
+ *  CGBN-based Fermat kernel: template<BITS, TPI> covers the listed ALs.
  *
  *  Enabled with: make WITH_CGBN_FERMAT=1 ...
  *
  *  TPI selection per AL (per-width defaults since 2026-09-29; launch_fermat
  *  and gpu_fermat_kernel_label share this rule, so the banner never lies):
  *    AL=2  → TPI=4  (128-bit)      AL=4  → TPI=8  (256-bit)
+ *    AL=5  → TPI=2  (320-bit; fixed, unpadded Montgomery radix)
  *    AL=6  → TPI=4  (384-bit; TPI=8 via GPU_FERMAT_TPI=8)
  *    AL=8  → TPI=8  (512-bit; TPI=4 via GPU_FERMAT_TPI=4)
+ *    AL=10 → TPI=4  (640-bit; fixed, unpadded Montgomery radix)
  *    AL=12/16/20 → TPI=4  (768/1024/1280-bit): the throughput regime favours
  *      the extra threads per candidate — measured 2026-09-29, numbers at the
  *      CGBN_DISP_WIDE call sites below: batch 40000 +20/+25/+14 %, batch 2048
  *      −26/−27/−4.5 %, fused mining chain +8.6/+8.8 % at shifts 507/720;
  *      TPI=8/16/32 via GPU_FERMAT_TPI
- *    AL=24/28/32 → TPI=8  (1536/1792/2048-bit; TPI=4/16/32 via env)
+ *    AL=24/28 → scalar (CGBN AoS is not reliable at these widths)
+ *    AL=32 → TPI=8 (2048-bit; TPI=4/16/32 via env)
  *    other AL → no CGBN, scalar fermat_kernel_t fallback.
  *  (The old "largest power-of-2 dividing 2×AL, capped at 8" rule described
  *  the pre-2026-09-29 policy where TPI=8 was the only wide-AL option; the
@@ -1298,11 +1301,17 @@ static __host__ __forceinline__ int cgbn_supports_al(int al)
     #if NL >= 4
     case 4:
     #endif
+    #if NL >= 5
+    case 5:
+    #endif
     #if NL >= 6
     case 6:
     #endif
     #if NL >= 8
     case 8:
+    #endif
+    #if NL >= 10
+    case 10:
     #endif
     #if NL >= 12
     case 12:
@@ -1312,6 +1321,9 @@ static __host__ __forceinline__ int cgbn_supports_al(int al)
     #endif
     #if NL >= 20
     case 20:
+    #endif
+    #if NL >= 32
+    case 32:
     #endif
     /* AL=24 (1536-bit) and AL=28 (1792-bit) are DELIBERATELY absent: the CGBN
        kernel is wrong at exactly those two widths.  Measured 2026-10-25 with
@@ -1435,11 +1447,12 @@ static cudaError_t launch_fermat(int al, cudaStream_t stream,
         #undef CIOS_LAUNCH
     }
 #if defined(CGBN_FERMAT_AVAILABLE)
-    /* CGBN dispatch for even AL values.
+    /* CGBN dispatch for the instantiated AL values.
        Auto rule: TPI=8 for AL%4==0, TPI=4 for AL%2==0 (largest power-of-2 ≤ 8
        dividing 2×AL).  AL=12/16 replace that auto rule with a measured TPI=4
        default (see CGBN_DISP_WIDE just below); GPU_FERMAT_TPI overrides both.
-       Odd AL falls through to the scalar FERMAT_DISPATCH macros below.
+       AL=5 and AL=10 use fixed unpadded TPI values; the other odd widths
+       fall through to the scalar FERMAT_DISPATCH macros below.
        All template instantiations share the same kernel body; nvcc compiles
        only those actually referenced in the switch cases guarded by #if NL>=. */
     {
@@ -1499,6 +1512,9 @@ static cudaError_t launch_fermat(int al, cudaStream_t stream,
             #if NL >= 4
             case 4:  CGBN_LAUNCH( 4, 8);  break;   /* 256-bit  */
             #endif
+            #if NL >= 5
+            case 5:  CGBN_LAUNCH( 5, 2);  break;   /* 320-bit, unpadded */
+            #endif
             #if NL >= 6
             case 6: {  /* 384-bit: default TPI=4 (LIMBS=3); TPI=8 (LIMBS=2) via env.
                           A/B for the "limbs per lane" trend (see TPI<8 project notes). */
@@ -1509,6 +1525,9 @@ static cudaError_t launch_fermat(int al, cudaStream_t stream,
             case 8: {  /* 512-bit: default TPI=8 (LIMBS=2); TPI=4 (LIMBS=4) via env */
                 if (tpi_override == 4) CGBN_LAUNCH( 8, 4); else CGBN_LAUNCH( 8, 8);
             } break;
+            #endif
+            #if NL >= 10
+            case 10: CGBN_LAUNCH(10, 4);  break;   /* 640-bit, unpadded */
             #endif
             #if NL >= 12
             CGBN_DISP_WIDE(12, 4)                    /* 768-bit  (default TPI=4) */
@@ -2237,18 +2256,25 @@ uint64_t gpu_fermat_accounted_us(gpu_fermat_ctx *ctx)
 
 int gpu_fermat_limbs_for_bits(uint32_t bits)
 {
+    if (bits >= (uint32_t)NL * 64U) return NL;
     int limbs = (int)((bits + 63U) / 64U);
     if (limbs < 1) limbs = 1;
 #if defined(CGBN_FERMAT_AVAILABLE)
-    /* Round up to the nearest CGBN-supported width (see
-       gpu_adapter_set_candidate_bits for why some even widths like AL=10
-       have no CGBN instantiation). */
+    const char *narrow_env = getenv("GPU_FERMAT_NARROW_WIDTHS");
+    int narrow = !(narrow_env && narrow_env[0] == '0') &&
+                 !gpu_fermat_no_cgbn() &&
+                 gpu_fermat_mr_kernel() == GPU_MR_KERNEL_DEFAULT;
+    /* AL=5/TPI=2 and AL=10/TPI=4 are unpadded. Other TPIs at these
+       widths would change CGBN's Montgomery radix and are not valid here. */
     if (limbs <= 6) {
         if (limbs <= 2) limbs = 2;
         else if (limbs <= 4) limbs = 4;
+        else if (limbs <= 5 && narrow) limbs = 5;
         else limbs = 6;
     } else if (limbs <= 8) {
         limbs = 8;
+    } else if (limbs <= 10 && narrow) {
+        limbs = 10;
     } else if (limbs <= 12) {
         limbs = 12;
     } else if (limbs <= 16) {
@@ -2292,7 +2318,7 @@ const char *gpu_fermat_kernel_label(int limbs)
                  limbs * 64, limbs * 2);
         return cios_buf;
     }
-    if (cgbn_supports_al(limbs)) {
+    if (!gpu_fermat_no_cgbn() && cgbn_supports_al(limbs)) {
         /* Report the TPI the launcher will actually pick for this width:
            per-width default (4 at AL=12/16/20, else the auto rule) with the
            GPU_FERMAT_TPI override on top.  Keep in sync with the
@@ -2303,8 +2329,10 @@ const char *gpu_fermat_kernel_label(int limbs)
         switch (limbs) {
         case 2:  return "CGBN (128-bit, TPI=4)";
         case 4:  return "CGBN (256-bit, TPI=8)";
+        case 5:  return "CGBN (320-bit, TPI=2)";
         case 6:  return (ov == 8) ? "CGBN (384-bit, TPI=8)" : "CGBN (384-bit, TPI=4)";
         case 8:  return (ov == 4) ? "CGBN (512-bit, TPI=4)" : "CGBN (512-bit, TPI=8)";
+        case 10: return "CGBN (640-bit, TPI=4)";
         default: {
             static char buf[64];
             snprintf(buf, sizeof(buf), "CGBN (%d-bit, TPI=%d)", limbs * 64, tpi);
@@ -2579,11 +2607,17 @@ int gpu_fermat_jump_scan(gpu_fermat_ctx *ctx,
         #if NL >= 4
         case 4:  JUMP_LAUNCH( 4, 8);  break;
         #endif
+        #if NL >= 5
+        case 5:  JUMP_LAUNCH( 5, 2);  break;
+        #endif
         #if NL >= 6
         case 6:  JUMP_LAUNCH( 6, 4);  break;
         #endif
         #if NL >= 8
         case 8:  JUMP_LAUNCH( 8, 8);  break;
+        #endif
+        #if NL >= 10
+        case 10: JUMP_LAUNCH(10, 4);  break;
         #endif
         #if NL >= 12
         case 12: JUMP_LAUNCH(12, 8);  break;

@@ -43,6 +43,7 @@
 #include "stratum.h"
 #ifdef WITH_CUDA
 #include <cuda_runtime.h>
+#include "gpu_adapter.h"
 #include "gpu/gpu_fermat.h"
 #endif
 
@@ -833,14 +834,27 @@ int main(int argc, char *argv[]) {
                     user_shift, 256ULL + (uint64_t)user_shift, GPU_NLIMBS * 64U);
         } else {
             worker_set_gpu_fermat_enabled(1);
-            int limbs = gpu_fermat_limbs_for_bits(256U + user_shift);
+            uint32_t candidate_bits = 257U + user_shift;
+            if (crt_mode) {
+                uint64_t back_limit =
+                    (uint64_t)ceil(2.0 * (256.0 + (double)user_shift) *
+                                   log(2.0));
+                if (back_limit < 4096) back_limit = 4096;
+                if (back_limit & 1ULL) back_limit++;
+                candidate_bits = gpu_adapter_crt_candidate_bits(
+                    user_shift, crt_rt.primorial,
+                    crt_rt.window + back_limit + 2);
+            }
+            int limbs = gpu_fermat_limbs_for_bits(candidate_bits);
             printf("[Main] GPU Fermat pre-filter enabled (CUDA, compiled for "
                    "%u-bit candidates / %u limbs)\n",
                    GPU_NLIMBS * 64U, (unsigned)GPU_NLIMBS);
-            printf("[Main]   shift %u -> %llu-bit candidates -> %d active limb%s "
+            printf("[Main]   shift %u -> %llu-bit nominal candidates "
+                   "(%u-bit conservative bound) -> %d active limb%s "
                    "-> kernel: %s\n",
-                   user_shift, 256ULL + (uint64_t)user_shift, limbs,
-                   limbs == 1 ? "" : "s", gpu_fermat_kernel_label(limbs));
+                   user_shift, 256ULL + (uint64_t)user_shift, candidate_bits,
+                   limbs, limbs == 1 ? "" : "s",
+                   gpu_fermat_kernel_label(limbs));
         }
         printf("[Main] GPU bitmap sieve: %s (GPU_SIEVE=1 to enable, multi-GPU only)\n",
                getenv("GPU_SIEVE") ? getenv("GPU_SIEVE") : "off");

@@ -491,14 +491,14 @@ Optional. Build with the fast [CGBN](https://github.com/NVlabs/CGBN) kernel
 ```bash
 make clean && make WITH_CUDA=1 WITH_CGBN_FERMAT=1
 # GPU_BITS default is 2048 (32 limbs) = h256 256 bits + shift 1792, the widest
-# CGBN instantiation (AL=24/28/32 added 2026-09-23). Every wide AL accepts
-# TPI 4/8/16/32 since 2026-09-29 (division-free Montgomery constants removed
-# the last path into CGBN's unimplemented multi-limb class; see the
-# GPU_FERMAT_TPI row); AL>32 needs TPI=16 and an odd AL falls back to the
-# scalar kernel. A smaller
+# CGBN wide instances accept TPI 4/8/16/32 (see GPU_FERMAT_TPI below).
+# AL=5/10 use fixed unpadded TPI=2/4 respectively; AL=24/28 use the scalar
+# kernel. A smaller
 # GPU_BITS build rejects the shifts above GPU_BITS-256.
 # verify the kernel against CPU/GMP ground truth (must show 0 mismatches):
 ./bin/test_gpu_fermat
+# Width-selection and adapter checks only (default: run the full suite):
+GPU_FERMAT_TPI=8 ./bin/test_gpu_fermat --width-only
 ```
 
 Build flags are tracked: `build/.build_flags` records the compiler and flag
@@ -513,8 +513,8 @@ without `WITH_CGBN_FERMAT=1` prints
 `GPU Fermat: WARNING scalar kernel active ... built WITHOUT WITH_CGBN_FERMAT=1`
 and runs the MR test far slower. Measured 2026-10-30 on an RTX 3070 with
 `--gap-hunt`: 1060 vs 8141 win/s at shift507, and 1295 vs 8798 win/s at
-shift450. A CGBN build that has no CGBN case for the active width (AL=24/28,
-odd AL), or that runs with `GPU_FERMAT_NO_CGBN` set, prints
+shift450. A CGBN build that has no CGBN case for the active width (AL=24/28 or an
+unsupported odd AL), or that runs with `GPU_FERMAT_NO_CGBN` set, prints
 `GPU Fermat: scalar kernel active (AL=.., ...; no CGBN case ...)` once instead.
 
 A native **Windows** build (nvcc + MSVC producing `bin/gapgpu.dll` for the GPU
@@ -526,12 +526,64 @@ base-2 Miller-Rabin test becomes the primality filter and the CPU Euler test is
 skipped. Candidates are batched across windows before each GPU call to amortize
 the kernel launch (a single window is far too small).
 
-The active limb count is rounded **up to the nearest CGBN-supported width**
-(`2, 4, 6, 8, 12, 16, 20, 24, 28, 32` limbs) so widths without a valid CGBN instantiation
-— e.g. 514-bit candidates (AL=10 has no instantiation: no integer
-limbs-per-thread at TPI=4 or 8) — are zero-padded to the next CGBN width instead of falling
-back to the register-heavy scalar kernel (measured on shift258: 610 → 2786
-win/s, ~4.6×).
+The active limb count is rounded up to a supported width: CGBN uses
+`2, 4, 5, 6, 8, 10, 12, 16, 20, 32` limbs; `24/28` use the scalar
+kernel because their CGBN AoS path is not reliable. The 2048-bit (AL=32)
+kernel is reported as CGBN and follows the same batch-layout setting as
+the other CGBN widths: `GPU_FERMAT_CGBN_SOA=1` (default) packs SoA, while
+`0` uses AoS. To test the latter:
+
+```bash
+make WITH_CUDA=1 WITH_CGBN_FERMAT=1 bin/bench_fermat
+GPU_FERMAT_CGBN_SOA=0 ./bin/bench_fermat 32 20000 12
+```
+
+By default, candidates
+that fit use the unpadded **320-bit/TPI=2** or **640-bit/TPI=4** instances
+instead of padding to 384 or 768 bits. The miner accounts for its complete
+window and CRT period, and the hunt accounts for its anchor and walk; an
+out-of-range miner window falls back to CPU, while the hunt exits nonzero and,
+when `--gap-hunt-state` is set, checkpoints the earliest unprocessed window
+for replay. A failed hunt state
+write is also reported as a nonzero exit. The startup line shows
+the nominal candidate bits, the conservative bound and the selected kernel.
+On the dev RTX 3070,
+same-candidate ABBA kernel tests at batch 32768 measured 311-bit candidates
+at 9.43 → 15.45 million/s and 514-bit candidates at 2.54 → 3.48 million/s;
+these are kernel rates, not claims about whole-miner speed. Smaller batches
+can behave differently.
+
+End-to-end, same-binary ABBA tests on the dev RTX 3070 measured:
+
+| Pipeline and configuration | Previous width | Narrow width |
+| --- | ---: | ---: |
+| Hunt, shift258, min-merit 10 | 7,787 windows/s | 9,997 windows/s (+28.4%) |
+| Fused CRT miner, shift258, 4 workers, batch 1024, sieve 11M | 31,425 windows/s | 37,632 windows/s (+19.8%) |
+| Non-CRT miner, shift55, 4 workers, sieve 5M | 265 windows/s | 446 windows/s (+68.4%) |
+
+The hunt arms each scanned 120,832 windows and emitted the same 817 gaps.
+The miner measurements used a local mock pool with submission disabled.
+With the actual automatic CRT batch settings, one comparison measured
+30,771 vs 36,922 windows/s; the narrower buffers allowed batch 2048 rather
+than the previous VRAM-clamped 1024. Results depend on GPU, CPU and geometry.
+
+At shift55 the non-CRT automatic sieve default remains about 19.9M. With the
+new 320-bit kernel, a separate ABBA test on this machine measured 330 vs 468
+windows/s in the second 30-second tick for sieve 19.9M vs 5M. The default has
+not been retuned for other hardware; the older depth recommendation in the
+options table was measured with the padded kernel. An explicit local tuning
+example is:
+
+```bash
+./bin/gapminer --shift 55 --threads 4 --enable-gpu-fermat --sieve-primes 5000000
+```
+
+Set `GPU_FERMAT_NARROW_WIDTHS=0` to restore the previous 384/768-bit dispatch
+when the build's `GPU_BITS` capacity allows it:
+
+```bash
+GPU_FERMAT_NARROW_WIDTHS=0 ./bin/gapminer --shift 55 --enable-gpu-fermat
+```
 
 ```bash
 # GPU-accelerated dry-run
@@ -729,7 +781,7 @@ mark's 52 µs. It is now a deterministic three-kernel sweep (count items →
 exclusive scan of block totals → write), 8 bits per item, many blocks, with the
 **identical** output contract (ascending offsets, contiguous packing from
 `slot_base`, count = total keepers, high bit = capacity overflow, same candidate
-limbs) — verified bit-exact by `test_gpu_sieve` (35 OK, CPU reference) and by
+limbs) — verified bit-exact by `test_gpu_sieve` against a CPU reference and by
 byte-identical jump2 records over 1,000,448 windows (min-merit 18, 5/5 records,
 `test_gap_hunt` bad=0). Measured at shift258 / min-merit 24 / K=1024 (ABBA 45 s
 arms): extract **43.0 → 12.4 µs/window** and **8228 → 9598 win/s = +16.7 %**
@@ -772,7 +824,12 @@ shift258, min-merit 18 — **1 walker 3858 win/s vs 2 walkers on the SAME GPU
 processes split the device.  Never run two walkers per card; use one per GPU.
 State is written to
 `--gap-hunt-state` every 1024 windows and on `SIGINT`/`SIGTERM`; `k` resumes
-from the state file.  The same 1024-window tick prints the walk rate:
+from the state file. When limiting a run with GNU `timeout`, use
+`timeout --foreground -s INT 30s` before the hunt command: the default
+process-group signalling can cause an immediate `SIGKILL` before the final
+checkpoint on some versions. `timeout` returns 124 on a time limit even after
+a clean drain; check the hunt's `stopped:` line. The same 1024-window tick
+prints the walk rate:
 `[GAP_HUNT] k=… windows=… gaps=… best_merit=… win_s=… win_s_avg=…` —
 `win_s` is the instantaneous windows/s since the previous tick and
 `win_s_avg` the average since the walk started (the `stopped:` line also
@@ -795,6 +852,11 @@ carries `win_s_avg`).
     --gap-hunt-min-merit 15 \
     --gap-hunt-state data/gap_hunt_state.txt \
     --gap-hunt-out data/gap_hunt_records.txt
+
+# Example: stop gracefully after 30 seconds and keep a separate checkpoint
+timeout --foreground -s INT 30s ./bin/gapminer --gap-hunt \
+    --crt-file data/crt/m23/shift507_p74_lex_m30.txt \
+    --gap-hunt-state /tmp/gap_hunt_timed.state
 ```
 
 Each out record is `<gap> <merit> <startprime>` (one per line; merit printed
@@ -887,6 +949,7 @@ Environment variables:
 | `FUSED_GPU` | off | Full GPU-resident CRT pipeline (sieve+extract+MR on-device; implies `GPU_SIEVE`, defaults to a 2M deep sieve) |
 | `STRATUM_REFRESH_S` | `10` | Pool mode only: seconds between getwork-style work re-requests (`0` disables). **This is a safety net for a pool that never pushes work, not the mechanism suprnova uses** (it pushes `mining.notify` — see the pool section): its `mining.request` answers with the template cached at session start, so polling cannot detect a rotation (30+ requests in a 5-minute session returned one single template while the pushes carried a newer one). An unchanged answer is not republished, so a short interval costs nothing; two consecutive rejections force an immediate refresh |
 | `FUSED_STAGE_TIMING` | off | Adds a `Fused stage split` line to `ROLLING STATS` with the host wall time of each fused stage (mark / extract / chain, plus the chain's own gather and MR round trips) as a percentage of uptime, and the chain round count. Costs four `clock_gettime` calls per window plus four per chain round — diagnostics only. **`gather` measures the host call only (2026-09-19):** the round's staging kernel now runs on the fermat slot stream with one async parameter upload and no device-wide barrier, so its share of wall dropped from 4.5-17.9% (old binary, chunk 32/16) to **0.2-0.4%** at every chunk, and the time it used to absorb now shows up in `mr` (the submit+collect round trip), which is where the chain's remaining per-round cost lives. Measured (RTX 3070, shift512 `p75_lex_m30`, live difficulty ≈ 23.9, 1 thread, fused chain): at chunk 32 **mark 20.8% + extract 36.2% (host side 57%) vs chain 42.0%** (gather 14.7%, MR round trip 27.0%) with ~16.6k chain rounds per 120 s ≈ 3 ms per round — i.e. after the chunk fix the host sieve side is the bottleneck, not the MR kernel. In the clean chunk-sweep runs the split was mark 35.3% / extract 11.1% / chain 51.8% (rounds 35479) at the default chunk 32 and 36.1% / 11.1% / 51.0% (rounds 23106) at chunk 64; with `GPU MR acc/wall = 0.492` and external `nvidia-smi` utilization **93% (50/50 samples ≥ 90%)** the fused path is GPU-saturated, so the non-MR ~50% of wall is the mark/extract kernels, **not idle time** — hiding the chain round trip (second in-flight context) buys nothing |
+| `GPU_FERMAT_NARROW_WIDTHS` | **`1`** | Use the unpadded 320-bit/TPI=2 and 640-bit/TPI=4 CGBN kernels when the complete candidate range fits; `0` restores the previous padded widths. These two instances use fixed TPI even when `GPU_FERMAT_TPI` is set: other TPIs pad the CGBN radix and are not valid for these kernels. The option has no effect when CGBN is disabled or `GPU_MR_KERNEL=cios` is selected. Example: `GPU_FERMAT_NARROW_WIDTHS=0 ./bin/gapminer --shift 55 --enable-gpu-fermat` |
 | `GPU_FERMAT_TPI` | per width: **`4`** at 768/1024/1280-bit (AL=12/16/20), `8` at AL≥24 | Threads per CGBN arithmetic instance (= per MR candidate) on the wide CGBN MR kernels (768/1024/1280/1536/1792/2048-bit, AL=12/16/20/24/28/32). `4`, `8`, `16` and `32` are accepted at every wide AL (anything else falls back to the width default). Until 2026-09-29 `4` was impossible at these widths because CGBN's divider helpers (`cgbn_bn2mont` → `rem_wide` → `dlimbs_algs_multi`) need NVIDIA's unimplemented multi-limb path; the MR kernels now build the Montgomery constants arithmetically (`np0` by Newton inversion of N mod 2^32, `R mod N` by subtract-and-double), so that class is never instantiated and `TPI=4` compiles at any width. **TPI=4 trades fewer broadcast rounds for 2× the threads per candidate, so it wins only when the MR batch fills the SMs — measured 2026-09-29 (devbox 3070, candidate/prime counts identical in every pair):** `bench_fermat` candidates/s TPI=4 vs TPI=8 — **batch 2048**: 768-bit 769k vs 1,036k (−26%), 1024-bit 419k vs 575k (−27%), 1280-bit 286k vs 300k (−4.5%), 2048-bit 89k vs 98k (−9%); **batch 10000**: 1,463k vs 1,386k (+5.5%), 797k vs 714k (+12%), 458k vs 402k (+14%), 129k vs 120k (+7%); **batch 40000**: 1,768k vs 1,473k (+20%), 887k vs 709k (+25%), 474k vs 416k (+14%), 129k vs 122k (+6%). In the production fused chain (ABBA 70 s arms, K=2048, chunk 12, `--merit 16` dry-run, `tests/window` identical between arms) it wins **+8.6% at shift507** (15,076/14,706 vs 13,758/13,677 win/s) and **+8.8% at shift720 with the fleet cover** (7,704/7,635 vs 7,032/7,063 win/s), with the `CGBN kernel active` banner confirming the kernel and `MINING_JUMP2_VERIFY` parity `bad_windows=0 bad_pairs=0`. In the jump2 hunt walker (K=1024, `--gap-hunt-min-merit 20`, ABBA 70 s arms) it wins **+4.7% windows at shift998** (87,040 vs 91,136; `win_s_avg` 1,243.6 vs 1,290.7, banner-confirmed) but is a **wash at shift1784 (−2.2%)**, so AL=12/16/20 default to 4 while AL≥24 stay at 8 (AL=32 hunt measured; AL=24/28 not yet A/B'd). Every number in this row is **sm_86 (RTX 3070, CGBN's WMAD core)**; on another architecture (e.g. Pascal `sm_61` uses the XMAD core) A/B with the override before trusting the defaults. Rollback / A/B example: `GPU_FERMAT_TPI=8 ./bin/bench_fermat 12 40000 20` |
 | `GPU_FERMAT_CGBN_SOA` | `1` | Layout of the CGBN MR candidate buffer: `1` = structure-of-arrays (`cgbn_fermat_kernel_soa_t`, host packs the limbs), `0`/`n`/`f` = array-of-structures (plain memcpy). Affects the **batch** submit path only (`gpu_fermat_submit_locked`); the chain's own walk kernel is a separate AoS kernel. **Measured 2026-09-24** (devbox 3070, `bench_fermat 12 <batch> 12`): AoS is **+11.3% at batch 2000 (1,003k vs 901k cand/s) and +7.5% at batch 20000 (1,453k vs 1,352k)** — but in the production pipeline (`FUSED_GPU=1`, `shift507_p74_lex_m30`, 3 workers, 60 s arms) the difference is **0.03% (14,259 vs 14,255 win/s, GPU acc/wall 0.915 vs 0.913)**: there the host-side SoA transpose cost and the kernel-side gain cancel. The default therefore stays SoA. Example: `GPU_FERMAT_CGBN_SOA=0 ./bin/bench_fermat 12 20000 12` |
 | `GPU_FERMAT_NO_CGBN` | off | Measurement hook: forces the **scalar** Montgomery path (all AL limbs in one thread's registers) even where CGBN is available, so both arithmetic backends can be A/B'd at the same size from the same binary. They are not comparable by limb count alone -- CGBN runs TPI threads per candidate (1-3 limbs per thread plus inter-thread carries), the scalar path keeps everything in registers -- so this is how the "is CGBN the right backend" question gets a number instead of an assumption. Prints one `CGBN DISABLED` line to stderr when active. **Measured 2026-09-21** (devbox 3070, the same 45 s hunt arms as the `GPU_FERMAT_TPI` row, `scalar-path` confirmed by that DISABLED line): **768-bit 3020 vs 730 win/s (CGBN 4.2x faster), 1024-bit 1765 vs 239 (7.4x), 1280-bit 771 vs 110 (7.0x)**. So a straightforward register-resident 64-bit-limb kernel is far *worse* than CGBN, and the ~80% gap between the MR stream and the raw IMAD/issue bound is intrinsic to 64-bit-limb Montgomery on this GPU, not a CGBN tuning miss. Keep the hook for future backend questions |
@@ -948,6 +1011,8 @@ make clean && make test      # all suites
 ./bin/test_sieve_core        # scalar vs AVX2 sieve equivalence
 ./bin/test_gpu_fermat        # GPU kernel vs GMP ground truth + device-pointer path (WITH_CUDA build)
 ./bin/test_gpu_sieve         # fused extract+pack kernel parity vs CPU sieve (WITH_CUDA build)
+./bin/test_gpu_resolve       # hidden-candidate GPU/CPU parity and fallback (WITH_CUDA build)
+make WITH_CUDA=1 WITH_CGBN_FERMAT=1 test-gap-hunt-width  # parity, width crossings and checkpoint failures; GPU_BITS=2048
 ./bin/test_halfclass         # HALF_CLASS two-pass pipeline parity vs full-class pipeline
 ./bin/test_stratum           # pool protocol conformance vs an in-process mock pool (47 checks)
 ```

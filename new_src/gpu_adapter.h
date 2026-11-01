@@ -21,9 +21,8 @@
 #include <stdint.h>
 #include <gmp.h>
 
-/* Max candidates per gpu_adapter_test_batch() call; callers submitting more
-   must chunk at this boundary (the CUDA context's staging buffers are sized
-   to it, and any candidates beyond it would otherwise go untested).
+/* Maximum CUDA staging capacity. gpu_adapter_test_batch() chunks larger
+   batches; asynchronous callers must respect the context's actual capacity.
    Raised from 8192 to 40000: the CGBN kernel is latency-bound, so larger
    batches amortize the per-launch/tail overhead (measured 1.28M/s @10k →
    1.52M/s @40k candidates, still climbing).
@@ -41,7 +40,7 @@
 
 /* GPU candidate batch (input to GPU) */
 struct gpu_batch {
-    uint32_t count;                    /* Number of candidates (≤4096) */
+    uint32_t count;                    /* Number of candidates */
     mpz_t *candidates;                 /* Array of mpz_t numbers */
     uint8_t *is_prime;                 /* Output: primality verdicts */
 };
@@ -83,6 +82,13 @@ int gpu_adapter_get_limbs(struct gpu_adapter *adapter);
    freed; gpu_adapter_free() owns it. */
 #ifdef WITH_CUDA
 struct gpu_fermat_ctx *gpu_adapter_get_fermat_ctx(struct gpu_adapter *adapter);
+
+/* Bound the CRT miner's hash, alignment/row stride and complete window. */
+uint32_t gpu_adapter_crt_candidate_bits(uint32_t shift, const mpz_t period,
+                                        uint64_t max_interval);
+
+/* Whether every value in [base, base + interval) fits the unsigned stride. */
+int gpu_adapter_window_fits(const mpz_t base, uint64_t interval, int limbs);
 #endif
 
 /* Submit already-packed candidates (count × active_limbs little-endian

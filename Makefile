@@ -25,8 +25,8 @@ BIN_DIR = bin
 # bits, the widest shift CGBN can run at TPI=8: above AL=32 the per-thread limb
 # count exceeds the 8-limb half algorithm CGBN implements. The active limb count is
 # narrowed at runtime per shift (gpu_adapter_set_candidate_bits), so low
-# shifts still run at their actual width (e.g. AL=6 at shift 26) and land on
-# CGBN's AL=6/TPI=4 fast path when WITH_CGBN_FERMAT=1. Without WITH_CUDA,
+# shifts still run at their actual width (e.g. AL=5 at shift 26) and land on
+# CGBN's AL=5/TPI=2 fast path when WITH_CGBN_FERMAT=1. Without WITH_CUDA,
 # gpu_adapter.c falls back to the existing CPU (GMP) Fermat test unchanged.
 GPU_BITS ?= 2048
 GPU_NLIMBS := $(shell echo '$(GPU_BITS) / 64' | bc)
@@ -142,7 +142,7 @@ MR128_BENCH = $(BIN_DIR)/mr128_bench
 BENCH_U96 = $(BIN_DIR)/bench_u96
 
 # Phony targets
-.PHONY: all clean test help update-merits
+.PHONY: all clean test test-gap-hunt-width help update-merits
 
 # Default target
 all: $(BIN_DIR) $(BUILD_DIR) $(OBJECTS) $(MAIN_BINARY) $(TEST_GAP_DETECTION) $(TEST_PRIMALITY) $(TEST_WORKER_THREADS) $(TEST_GAPCOIN_RPC) $(TEST_BLOCK_SUBMISSION) $(TEST_SIEVE_CORE) $(TEST_GPU_FERMAT) $(TEST_GPU_SIEVE) $(TEST_GPU_RESOLVE) $(TEST_GAP_DIST) $(TEST_HALFCLASS) $(TEST_GAP_PRIORITY) $(TEST_CRT_SET) $(TEST_GAP_TARGET) $(TEST_POW_Q48) $(TEST_COVERING) $(TEST_CRT_RUNTIME) $(TEST_CRT_SUBMISSION) $(TEST_GAP_HUNT) $(TEST_STRATUM) $(TEST_SMOOTH) $(SMOOTH_PATTERN) $(CRT_GEN) $(GEN_CRT) $(COVER_MAX)
@@ -376,6 +376,10 @@ $(TEST_GAP_HUNT): $(BUILD_DIR)/$(SRC_DIR)/primality_bpsw.o $(BUILD_DIR)/$(TEST_D
 	$(CC) $(CFLAGS) $^ -lm -lgmp -o $@
 	@echo "✓ Built: $@"
 
+# Requires a CUDA device, CGBN and the default GPU_BITS=2048.
+test-gap-hunt-width: $(MAIN_BINARY) $(TEST_GAP_HUNT)
+	@bash $(TEST_DIR)/test_gap_hunt_width.sh
+
 # Gapcoin legacy stratum client (mock pool server, no network needed)
 $(TEST_STRATUM): $(BUILD_DIR)/$(SRC_DIR)/stratum.o $(BUILD_DIR)/$(TEST_DIR)/test_stratum.o | $(BIN_DIR)
 	$(CC) $(CFLAGS) $^ $(LDFLAGS) -lpthread -o $@
@@ -440,6 +444,8 @@ test: $(TEST_GAP_DETECTION) $(TEST_PRIMALITY) $(TEST_WORKER_THREADS) $(TEST_GAPC
 	@$(TEST_GPU_FERMAT)
 	@echo ""
 	@$(TEST_GPU_SIEVE)
+	@echo ""
+	@$(TEST_GPU_RESOLVE)
 	@echo ""
 	@$(TEST_GAP_DIST)
 	@echo ""

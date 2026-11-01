@@ -174,25 +174,24 @@ int gpu_fermat_gather_run(gpu_fermat_ctx *ctx, int slot,
                           uint32_t *total_out);
 uint64_t *gpu_fermat_gather_buffer(gpu_fermat_ctx *ctx);
 
-/* Set the arithmetic limb count for this context.
-   active_limbs = ceil((256 + shift) / 64) for Gapcoin.
-   Reduces Montgomery multiplication from O(GPU_NLIMBS²) to O(active²).
-   At shift 43: active=5, speedup ≈ (16/5)² ≈ 10×.
-   Must be called before submitting work.  Clamped to [1, GPU_NLIMBS]. */
+/* Set the arithmetic and candidate-storage limb count for this context.
+   Narrower widths reduce Montgomery multiplication from O(GPU_NLIMBS²) to
+   O(active²). Call before submitting work and ensure every candidate fits.
+   Clamped to [1, GPU_NLIMBS]. */
 void gpu_fermat_set_limbs(gpu_fermat_ctx *ctx, int limbs);
 
 /* Get the current active limb count (storage stride per candidate).
    Callers should pack candidates at this width for submit(). */
 int gpu_fermat_get_limbs(gpu_fermat_ctx *ctx);
 
-/* Active limb count for a candidate bit width: ceil(bits/64), rounded up to
-   an even limb count when that lands on CGBN's fast path, clamped to
-   [1, GPU_NLIMBS].  Mirrors gpu_adapter_set_candidate_bits(). */
+/* Active limb count for a candidate bit width, rounded up to a supported
+   width and clamped to [1, GPU_NLIMBS]. The selection honors the CGBN and
+   narrow-width settings. Mirrors gpu_adapter_set_candidate_bits(). */
 int gpu_fermat_limbs_for_bits(uint32_t bits);
 
-/* Nonzero if the compiled build can run the CGBN kernel at this limb count
-   (even widths 2,4,6,8,12,16,20 up to GPU_NLIMBS).  Zero means the scalar
-   kernel is used. */
+/* Nonzero if the compiled build has a CGBN kernel at this limb count:
+   2, 4, 5, 6, 8, 10, 12, 16, 20, or 32, up to GPU_NLIMBS. Runtime settings
+   can still select a different kernel. */
 int gpu_fermat_cgbn_supports_limbs(int limbs);
 
 /* Human-readable kernel label for a limb count, e.g. "CGBN (384-bit, TPI=4)"

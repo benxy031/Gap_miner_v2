@@ -95,19 +95,26 @@ static int save_state(const char *path, uint64_t k, const mpz_t last_prime,
     if (!path)
         return 0;
     char tmp[1024];
-    snprintf(tmp, sizeof(tmp), "%s.tmp", path);
+    int len = snprintf(tmp, sizeof(tmp), "%s.tmp", path);
+    if (len < 0 || (size_t)len >= sizeof(tmp))
+        return -1;
     FILE *f = fopen(tmp, "w");
     if (!f)
         return -1;
-    fprintf(f, "k %llu\n", (unsigned long long)k);
+    int ok = fprintf(f, "k %llu\n", (unsigned long long)k) >= 0;
     if (have_last) {
         char *dec = mpz_get_str(NULL, 10, last_prime);
         if (dec) {
-            fprintf(f, "last_prime %s\n", dec);
+            if (fprintf(f, "last_prime %s\n", dec) < 0)
+                ok = 0;
             free(dec);
-        }
+        } else
+            ok = 0;
     }
-    fclose(f);
+    if (fclose(f) != 0)
+        ok = 0;
+    if (!ok)
+        return -1;
     if (rename(tmp, path) != 0)
         return -1;
     return 0;
@@ -452,6 +459,13 @@ static int gh_fill_mark_phase(struct gh_batch *b, uint32_t i, uint64_t k,
        prefilter is skipped there (mini-sieve alone, still exact). */
     b->base_even[i] = (uint8_t)(mpz_odd_p(g->wb) ? 0 : 1);
 
+    if (!gpu_adapter_window_fits(g->wb, g->interval, g->gpu_limbs)) {
+        fprintf(stderr,
+                "[GAP_HUNT] fill fail: window is negative or exceeds the "
+                "%d-limb GPU width (k=%llu i=%u)\n",
+                g->gpu_limbs, (unsigned long long)k, i);
+        return 0;
+    }
     memset(limbs, 0, (size_t)g->gpu_limbs * sizeof(uint64_t));
     size_t exported = 0;
     mpz_export(limbs, &exported, -1, sizeof(uint64_t), 0, 0, g->wb);
@@ -1756,7 +1770,30 @@ int gap_hunt_run(const struct gap_hunt_config *cfg) {
         crt_runtime_free(&rt);
         return 1;
     }
-    gpu_adapter_set_candidate_bits(gpu, 256U + rt.shift);
+    {
+        uint64_t last_k = UINT64_MAX;
+        if (g_kmax && g_kmax < UINT64_MAX - GAP_HUNT_BATCH_MAX)
+            last_k = g_kmax + GAP_HUNT_BATCH_MAX;
+        mpz_t bound, extra;
+        mpz_inits(bound, extra, NULL);
+        mpz_import(bound, 1, -1, sizeof(last_k), 0, 0, &last_k);
+        mpz_mul(bound, bound, P);
+        mpz_add(bound, bound, b0);
+        mpz_import(extra, 1, -1, sizeof(interval), 0, 0, &interval);
+        mpz_add(bound, bound, extra);
+        size_t bits = mpz_sizeinbase(bound, 2);
+        uint64_t nominal = 256ULL + rt.shift;
+        if (bits < nominal) bits = (size_t)nominal;
+        if (bits > (size_t)GPU_NLIMBS * 64U) {
+            fprintf(stderr,
+                    "[GAP_HUNT] walk may exceed the %u-bit GPU limit; "
+                    "it will stop before an out-of-range window\n",
+                    (unsigned)GPU_NLIMBS * 64U);
+            bits = (size_t)GPU_NLIMBS * 64U;
+        }
+        mpz_clears(bound, extra, NULL);
+        gpu_adapter_set_candidate_bits(gpu, (uint32_t)bits);
+    }
     gpu_limbs = gpu_adapter_get_limbs(gpu);
     fermat = gpu_adapter_get_fermat_ctx(gpu);
     if (gpu_limbs <= 0 || !fermat) {
@@ -1996,9 +2033,9 @@ int gap_hunt_run(const struct gap_hunt_config *cfg) {
                     cfg->out_path);
     }
 
-    /* Persistent handlers: timeout(1) signals the child AND the process
-       group, so a one-shot signal() handler (SA_RESETHAND) dies on the
-       second delivery before the loop can shut down cleanly. */
+    /* Persistent handlers tolerate repeated SIGINT/SIGTERM deliveries while
+       the current flight drains. For timeout(1), use --foreground: some
+       versions escalate the process-group signal before the drain completes. */
     {
 #ifdef _WIN32
         /* No sigaction on Windows; the MS CRT keeps a SIGINT handler
@@ -2208,6 +2245,8 @@ int gap_hunt_run(const struct gap_hunt_config *cfg) {
     uint64_t last_save = windows;
     struct gh_batch *fls[2] = { &A, &B };
     int turn = 0;
+    int exit_status = 0;
+    uint64_t failure_k = next_k;
 
     /* Alternate the two fermat slots so one flight's host processing
        overlaps the other flight's in-flight MR kernel. */
@@ -2218,6 +2257,8 @@ int gap_hunt_run(const struct gap_hunt_config *cfg) {
             if (gpu_fermat_collect(fermat, fl->slot, flags,
                                    (size_t)fl->total) < 0) {
                 fprintf(stderr, "[GAP_HUNT] GPU collect failed\n");
+                exit_status = 1;
+                failure_k = fl->base_k[0];
                 break;
             }
             uint64_t ht_p = g_host_timing ? gh_now_us() : 0;
@@ -2242,15 +2283,26 @@ int gap_hunt_run(const struct gap_hunt_config *cfg) {
                 /* Prefetched while the previous flight scanned. */
                 while (!g_pref.done && !g_pref.failed)
                     gh_prefetch_step(&g_pref, &g);
-                if (g_pref.failed)
+                if (g_pref.failed) {
+                    exit_status = 1;
+                    failure_k = g_pref.k0;
                     break;      /* the failing step printed the reason */
+                }
                 g_pref.b = NULL;
                 filled_now = 1;
             } else if (!g_stop && !(g_kmax && next_k >= g_kmax)) {
+                if (next_k > UINT64_MAX - (uint64_t)g_batch) {
+                    fprintf(stderr, "[GAP_HUNT] window index would overflow\n");
+                    exit_status = 1;
+                    failure_k = next_k;
+                    break;
+                }
                 if (!gh_fill_only(fl, turn, next_k, &g)) {
                     fprintf(stderr,
                             "[GAP_HUNT] batch fill failed (k=%llu)\n",
                             (unsigned long long)next_k);
+                    exit_status = 1;
+                    failure_k = next_k;
                     break;
                 }
                 next_k += (uint64_t)g_batch;
@@ -2260,7 +2312,8 @@ int gap_hunt_run(const struct gap_hunt_config *cfg) {
             }
             struct gh_prefetch *pf = NULL;
             if (filled_now && !g_stop && gh_prefetch_qty() > 0 &&
-                !(g_kmax && next_k >= g_kmax)) {
+                !(g_kmax && next_k >= g_kmax) &&
+                next_k <= UINT64_MAX - (uint64_t)g_batch) {
                 g_pref.b = fls[turn ^ 1];
                 g_pref.slot = turn ^ 1;
                 g_pref.k0 = next_k;
@@ -2277,6 +2330,8 @@ int gap_hunt_run(const struct gap_hunt_config *cfg) {
                     fprintf(stderr,
                             "[GAP_HUNT] batch fill failed (k=%llu)\n",
                             (unsigned long long)fl->base_k[0]);
+                    exit_status = 1;
+                    failure_k = fl->base_k[0];
                     break;
                 }
                 if (pf && !g_pref.done) {
@@ -2284,8 +2339,11 @@ int gap_hunt_run(const struct gap_hunt_config *cfg) {
                        finish it serially (rare, keeps the pipeline simple). */
                     while (!g_pref.done && !g_pref.failed)
                         gh_prefetch_step(&g_pref, &g);
-                    if (g_pref.failed)
+                    if (g_pref.failed) {
+                        exit_status = 1;
+                        failure_k = fl->base_k[0];
                         break;
+                    }
                 }
                 gh_batch_process(fl, flags, cfg, &g, &windows,
                                  &gaps_reported, &best_merit, out,
@@ -2293,9 +2351,17 @@ int gap_hunt_run(const struct gap_hunt_config *cfg) {
                 fl->n_windows = 0;
             }
         } else if (!g_stop && !(g_kmax && next_k >= g_kmax)) {
+            if (next_k > UINT64_MAX - (uint64_t)g_batch) {
+                fprintf(stderr, "[GAP_HUNT] window index would overflow\n");
+                exit_status = 1;
+                failure_k = next_k;
+                break;
+            }
             if (!gh_batch_fill(fl, turn, next_k, &g, flags)) {
                 fprintf(stderr, "[GAP_HUNT] batch fill failed (k=%llu)\n",
                         (unsigned long long)next_k);
+                exit_status = 1;
+                failure_k = next_k;
                 break;
             }
             next_k += (uint64_t)g_batch;
@@ -2352,7 +2418,12 @@ int gap_hunt_run(const struct gap_hunt_config *cfg) {
                         B.active, B.n_windows,
                         (unsigned long long)B.base_k[0],
                         (unsigned long long)k_safe);
-            save_state(cfg->state_path, k_safe, last_prime, have_last);
+            if (save_state(cfg->state_path, k_safe, last_prime, have_last) != 0) {
+                fprintf(stderr, "[GAP_HUNT] failed to save periodic state\n");
+                exit_status = 1;
+                failure_k = k_safe;
+                break;
+            }
             last_save = windows;
             fprintf(stderr,
                     "[GAP_HUNT] k=%llu windows=%llu gaps=%llu best_merit=%.6f "
@@ -2466,12 +2537,22 @@ int gap_hunt_run(const struct gap_hunt_config *cfg) {
         turn ^= 1;
     }
 
+    /* A failed or reserved flight must be replayed, not checkpointed past. */
+    uint64_t save_k = exit_status ? failure_k : next_k;
+    if (g_pref.b && g_pref.k0 < save_k)
+        save_k = g_pref.k0;
+
     /* Drain the in-flight flights so no window is lost. */
     if (A.active) {
         if (gpu_fermat_collect(fermat, A.slot, flags, (size_t)A.total) >= 0)
             gh_batch_process(&A, flags, cfg, &g, &windows,
                              &gaps_reported, &best_merit, out,
                              p1, p2, last_prime, &have_last);
+        else {
+            fprintf(stderr, "[GAP_HUNT] GPU collect failed during drain\n");
+            if (A.base_k[0] < save_k) save_k = A.base_k[0];
+            exit_status = 1;
+        }
         A.active = 0;
     }
     if (B.active) {
@@ -2479,13 +2560,21 @@ int gap_hunt_run(const struct gap_hunt_config *cfg) {
             gh_batch_process(&B, flags, cfg, &g, &windows,
                              &gaps_reported, &best_merit, out,
                              p1, p2, last_prime, &have_last);
+        else {
+            fprintf(stderr, "[GAP_HUNT] GPU collect failed during drain\n");
+            if (B.base_k[0] < save_k) save_k = B.base_k[0];
+            exit_status = 1;
+        }
         B.active = 0;
     }
     gh_batch_clear(&A);
     gh_batch_clear(&B);
     mpz_clears(g.bk, g.wb, g.b0, g.P, NULL);
 
-    save_state(cfg->state_path, next_k, last_prime, have_last);
+    if (save_state(cfg->state_path, save_k, last_prime, have_last) != 0) {
+        fprintf(stderr, "[GAP_HUNT] failed to save final state\n");
+        exit_status = 1;
+    }
     {
         struct timespec tn;
         clock_gettime(CLOCK_MONOTONIC, &tn);
@@ -2497,7 +2586,7 @@ int gap_hunt_run(const struct gap_hunt_config *cfg) {
                 "next_k=%llu win_s_avg=%.1f jump2_pairs_max=%u cap=%d "
                 "jump2_cap_hits=%llu\n",
                 (unsigned long long)windows, (unsigned long long)gaps_reported,
-                best_merit, (unsigned long long)next_k, win_s,
+                best_merit, (unsigned long long)save_k, win_s,
                 g_j2_max_pairs, GAP_HUNT_JUMP_CAP,
                 (unsigned long long)g_j2_cap_hits);
     }
@@ -2513,6 +2602,6 @@ int gap_hunt_run(const struct gap_hunt_config *cfg) {
     sieve_core_free(&sieve);
     mpz_clears(target, b0, P, p1, p2, last_prime, NULL);
     crt_runtime_free(&rt);
-    return 0;
+    return exit_status;
 #endif /* WITH_CUDA */
 }

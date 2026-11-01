@@ -166,8 +166,8 @@ static int run_gpu_fermat_correctness_test(void) {
 
 /* Fused-pipeline Stage 2: the device-pointer entry point (gpu_fermat_test_device)
    must produce bit-identical verdicts to the H2D path (gpu_fermat_test_batch),
-   whose math is already validated against CPU/GMP above.  Covers both the
-   AoS CGBN kernel (even AL) and the AoS scalar kernel (odd AL). */
+   whose math is already validated against CPU/GMP above. Covers both CGBN and
+   scalar AoS kernels at their supported widths. */
 static int run_gpu_fermat_device_path_test(void) {
     printf("[TEST] GPU Fermat device-pointer path vs H2D path...\n");
 
@@ -181,13 +181,8 @@ static int run_gpu_fermat_device_path_test(void) {
     gmp_randinit_mt(rng);
     gmp_randseed_ui(rng, 0xD00D1234u);
 
-    /* 24/28/32 are the wide CGBN TPI=8 widths added with the 2048-bit build
-       (2026-09-23): AL=32 is the last width whose limbs/thread (AL/4) fits
-       CGBN's 8-limb half algorithm, so these three exercise the new
-       instantiation and rounding paths.
-       16 is the hunt's 1024-bit width (shift 720) and, together with 32, the
-       second CIOS instantiation (GPU_MR_KERNEL=cios) -- both are checked
-       against the CPU reference whenever that hook is set. */
+    /* AL=24/28 use scalar; AL=32 is the widest CGBN instance. AL=16 is the
+       hunt's 1024-bit width. Both 16 and 32 also have CIOS implementations. */
     static const int limb_cases[] = {5, 10, 12, 16, 20, 24, 28, 32};
     int all_ok = 1;
 
@@ -228,6 +223,10 @@ static int run_gpu_fermat_device_path_test(void) {
             mpz_urandomb(n, rng, bits);
             mpz_setbit(n, bits - 1UL);
             mpz_setbit(n, 0);
+            if ((AL == 5 || AL == 10) && i < 16U) {
+                mpz_clrbit(n, bits - 2UL);
+                mpz_nextprime(n, n);
+            }
             size_t written = 0;
             mpz_export(h_cands + (size_t)i * (size_t)AL, &written, -1,
                        sizeof(uint64_t), 0, 0, n);
@@ -270,18 +269,54 @@ static int run_gpu_fermat_device_path_test(void) {
 
         int dev_primes =
             gpu_fermat_test_device(ctx, d_cands, dev_results, TEST_CANDIDATE_COUNT);
-        cudaFree(d_cands);
 
         if (dev_primes < 0) {
             fprintf(stderr, "  FAIL: device path returned -1 (AL=%d)\n", AL);
+            cudaFree(d_cands);
             free(h_cands); free(host_results); free(dev_results);
             all_ok = 0;
             break;
         }
 
-        uint32_t mismatches = 0;
-        for (uint32_t i = 0; i < TEST_CANDIDATE_COUNT; i++)
+        uint32_t mismatches = 0, cpu_mismatches = 0;
+        mpz_init(n);
+        for (uint32_t i = 0; i < TEST_CANDIDATE_COUNT; i++) {
             if (host_results[i] != dev_results[i]) mismatches++;
+            if (AL == 5 || AL == 10) {
+                mpz_import(n, (size_t)AL, -1, sizeof(uint64_t), 0, 0,
+                           h_cands + (size_t)i * (size_t)AL);
+                int expected = cpu_mr_base2(n);
+                if (host_results[i] != expected || dev_results[i] != expected)
+                    cpu_mismatches++;
+            }
+        }
+        mpz_clear(n);
+
+        if (AL == 5 || AL == 10) {
+            static const uint32_t counts[] = {1, 31, 32, 33, 63, 64, 65};
+            for (size_t j = 0; j < sizeof(counts) / sizeof(counts[0]); j++) {
+                uint32_t count = counts[j];
+                int h = gpu_fermat_test_batch(ctx, h_cands, host_results, count);
+                int d = gpu_fermat_test_device(ctx, d_cands, dev_results, count);
+                if (h < 0 || d < 0 || h != d) {
+                    fprintf(stderr, "  FAIL AL=%d batch=%u: H2D=%d device=%d\n",
+                            AL, count, h, d);
+                    all_ok = 0;
+                    continue;
+                }
+                for (uint32_t i = 0; i < count; i++) {
+                    mpz_t candidate;
+                    mpz_init(candidate);
+                    mpz_import(candidate, (size_t)AL, -1, sizeof(uint64_t), 0,
+                               0, h_cands + (size_t)i * (size_t)AL);
+                    int expected = cpu_mr_base2(candidate);
+                    if (host_results[i] != expected || dev_results[i] != expected)
+                        cpu_mismatches++;
+                    mpz_clear(candidate);
+                }
+            }
+        }
+        cudaFree(d_cands);
 
         /* Bounded diagnostics (GAPDBG_FERMAT_MISMATCH=1): which candidates
            disagree, and their top-limb shape.  The mismatch count alone cannot
@@ -336,14 +371,16 @@ static int run_gpu_fermat_device_path_test(void) {
             }
         }
 
-        if (mismatches != 0 || host_primes != dev_primes) {
+        if (mismatches != 0 || cpu_mismatches != 0 || host_primes != dev_primes) {
             fprintf(stderr,
-                    "  FAIL AL=%d: host_primes=%d dev_primes=%d mismatches=%u\n",
-                    AL, host_primes, dev_primes, mismatches);
+                    "  FAIL AL=%d: host_primes=%d dev_primes=%d "
+                    "mismatches=%u cpu_mismatches=%u\n",
+                    AL, host_primes, dev_primes, mismatches, cpu_mismatches);
             all_ok = 0;
         } else {
             printf("  OK  AL=%d: %d primes, device path == H2D path "
-                   "(0 mismatches)\n", AL, dev_primes);
+                   "(0 mismatches%s)\n", AL, dev_primes,
+                   (AL == 5 || AL == 10) ? ", 0 CPU mismatches" : "");
         }
 
         free(h_cands);
@@ -538,9 +575,11 @@ static int run_gpu_fermat_pattern_test(void) {
         uint64_t *h_cands =
             (uint64_t *)calloc((size_t)count * (size_t)AL, sizeof(uint64_t));
         uint8_t *results = (uint8_t *)calloc(count, 1);
-        if (!h_cands || !results) {
+        uint8_t *dev_results = (uint8_t *)calloc(count, 1);
+        uint64_t *d_cands = NULL;
+        if (!h_cands || !results || !dev_results) {
             fprintf(stderr, "  FAIL: out of memory (AL=%d)\n", AL);
-            free(h_cands); free(results);
+            free(h_cands); free(results); free(dev_results);
             for (uint32_t i = 0; i < PATTERN_MAX; i++) mpz_clear(pats[i]);
             all_ok = 0;
             break;
@@ -555,27 +594,44 @@ static int run_gpu_fermat_pattern_test(void) {
         int primes = gpu_fermat_test_batch(ctx, h_cands, results, count);
         if (primes < 0) {
             fprintf(stderr, "  FAIL: H2D path returned -1 (AL=%d)\n", AL);
-            free(h_cands); free(results);
+            free(h_cands); free(results); free(dev_results);
             for (uint32_t i = 0; i < PATTERN_MAX; i++) mpz_clear(pats[i]);
             all_ok = 0;
             break;
         }
+        size_t bytes = (size_t)count * (size_t)AL * sizeof(uint64_t);
+        cudaError_t err = cudaMalloc((void **)&d_cands, bytes);
+        if (err == cudaSuccess)
+            err = cudaMemcpy(d_cands, h_cands, bytes, cudaMemcpyHostToDevice);
+        int dev_primes = err == cudaSuccess
+            ? gpu_fermat_test_device(ctx, d_cands, dev_results, count) : -1;
+        if (err != cudaSuccess || dev_primes < 0) {
+            fprintf(stderr, "  FAIL: device pattern path (AL=%d): %s\n",
+                    AL, cudaGetErrorString(err));
+            if (d_cands) cudaFree(d_cands);
+            free(h_cands); free(results); free(dev_results);
+            for (uint32_t i = 0; i < PATTERN_MAX; i++) mpz_clear(pats[i]);
+            all_ok = 0;
+            break;
+        }
+        cudaFree(d_cands);
 
         uint32_t mismatches = 0, gpu_primes = 0, gmp_primes = 0, false_neg = 0;
         uint32_t psp2 = 0;
         for (uint32_t i = 0; i < count; i++) {
             int cpu = cpu_mr_base2(pats[i]);
-            if ((int)results[i] != cpu) {
+            if ((int)results[i] != cpu || (int)dev_results[i] != cpu) {
                 mismatches++;
                 if (mismatches <= 8) {
                     gmp_fprintf(stderr,
-                                "  MISMATCH AL=%d i=%u gpu=%d cpu=%d n=%Zd\n",
-                                AL, i, results[i], cpu, pats[i]);
+                                "  MISMATCH AL=%d i=%u H2D=%d device=%d "
+                                "cpu=%d n=%Zd\n",
+                                AL, i, results[i], dev_results[i], cpu, pats[i]);
                 }
             }
             int gmp_p = mpz_probab_prime_p(pats[i], 25) > 0;
             gmp_primes += (gmp_p != 0);
-            if (gmp_p && !results[i]) false_neg++;
+            if (gmp_p && (!results[i] || !dev_results[i])) false_neg++;
             if (results[i] && !gmp_p) psp2++;
             gpu_primes += results[i] ? 1 : 0;
         }
@@ -589,6 +645,7 @@ static int run_gpu_fermat_pattern_test(void) {
 
         free(h_cands);
         free(results);
+        free(dev_results);
         for (uint32_t i = 0; i < PATTERN_MAX; i++) mpz_clear(pats[i]);
     }
 
@@ -600,22 +657,171 @@ static int run_gpu_fermat_pattern_test(void) {
     gpu_fermat_destroy(ctx);
     return all_ok;
 }
+
+static int run_width_and_adapter_test(void) {
+    printf("[TEST] width selection, window bounds and adapter batching\n");
+    static const uint32_t bit_counts[] = {256, 257, 320, 321,
+                                          512, 513, 640, 641,
+                                          1792, 1793, 2048};
+    int ok = 1;
+    struct gpu_adapter *adapter = gpu_adapter_init_limbs(0, 17, 0);
+    if (!adapter) {
+        fprintf(stderr, "  FAIL: could not initialize adapter\n");
+        return 0;
+    }
+
+#ifdef WITH_CGBN_FERMAT
+    const char *narrow_env = getenv("GPU_FERMAT_NARROW_WIDTHS");
+    const char *scalar_env = getenv("GPU_FERMAT_NO_CGBN");
+    const char *kernel_env = getenv("GPU_MR_KERNEL");
+    int scalar = scalar_env && *scalar_env && *scalar_env != '0' &&
+                 *scalar_env != 'n' && *scalar_env != 'N' &&
+                 *scalar_env != 'f' && *scalar_env != 'F';
+    int cios = kernel_env && (kernel_env[0] == 'c' || kernel_env[0] == 'C') &&
+               (kernel_env[1] == 'i' || kernel_env[1] == 'I');
+    int narrow = !(narrow_env && narrow_env[0] == '0') && !scalar && !cios;
+    int expected[] = {4, narrow ? 5 : 6, narrow ? 5 : 6, 6,
+                      8, narrow ? 10 : 12, narrow ? 10 : 12, 12,
+                      28, 32, 32};
+#else
+    int expected[] = {4, 6, 6, 6, 8, 10, 10, 12, 28, 30, 32};
+#endif
+    for (size_t i = 0; i < sizeof(bit_counts) / sizeof(bit_counts[0]); i++) {
+        int want = expected[i] < GPU_NLIMBS ? expected[i] : GPU_NLIMBS;
+        int actual = gpu_fermat_limbs_for_bits(bit_counts[i]);
+        gpu_adapter_set_candidate_bits(adapter, bit_counts[i]);
+        int adapter_limbs = gpu_adapter_get_limbs(adapter);
+        if (actual != want || adapter_limbs != want) {
+            fprintf(stderr, "  FAIL: %u bits: dispatch=%d adapter=%d expected=%d\n",
+                    bit_counts[i], actual, adapter_limbs, want);
+            ok = 0;
+        }
+    }
+
+#ifdef WITH_CGBN_FERMAT
+    if (!scalar && !cios && GPU_NLIMBS >= 10 &&
+        (strcmp(gpu_fermat_kernel_label(5), "CGBN (320-bit, TPI=2)") != 0 ||
+         strcmp(gpu_fermat_kernel_label(10), "CGBN (640-bit, TPI=4)") != 0)) {
+        fprintf(stderr, "  FAIL: narrow CGBN widths use an invalid TPI\n");
+        ok = 0;
+    }
+    if (scalar && !cios && GPU_NLIMBS >= 6 &&
+        strcmp(gpu_fermat_kernel_label(6), "scalar (384-bit)") != 0) {
+        fprintf(stderr, "  FAIL: disabled CGBN reported as active\n");
+        ok = 0;
+    }
+    if (GPU_NLIMBS >= 32) {
+        char expected_label[96];
+        const char *tpi_env = getenv("GPU_FERMAT_TPI");
+        int tpi = tpi_env ? atoi(tpi_env) : 0;
+        if (tpi != 4 && tpi != 8 && tpi != 16 && tpi != 32) tpi = 8;
+        if (cios) {
+            snprintf(expected_label, sizeof(expected_label),
+                     "CIOS 32-bit (2048-bit, 64 x 32-bit limbs, 1 thread/cand)");
+        } else if (scalar) {
+            snprintf(expected_label, sizeof(expected_label), "scalar (2048-bit)");
+        } else {
+            snprintf(expected_label, sizeof(expected_label),
+                     "CGBN (2048-bit, TPI=%d)", tpi);
+        }
+        if (!gpu_fermat_cgbn_supports_limbs(32) ||
+            strcmp(gpu_fermat_kernel_label(32), expected_label) != 0) {
+            fprintf(stderr, "  FAIL: AL=32 capability/label does not match %s\n",
+                    expected_label);
+            ok = 0;
+        }
+    }
+#endif
+
+    static const int test_limbs[] = {5, 10, 32};
+    mpz_t bound, period;
+    mpz_inits(bound, period, NULL);
+    for (size_t j = 0; j < sizeof(test_limbs) / sizeof(test_limbs[0]); j++) {
+        int al = test_limbs[j];
+        if (al > GPU_NLIMBS) continue;
+        mpz_set_ui(bound, 1);
+        mpz_mul_2exp(bound, bound, (unsigned long)al * 64UL);
+        mpz_sub_ui(bound, bound, 6);
+        if (!gpu_adapter_window_fits(bound, 6, al) ||
+            gpu_adapter_window_fits(bound, 7, al)) {
+            fprintf(stderr, "  FAIL: %d-limb window carry boundary\n", al);
+            ok = 0;
+        }
+    }
+    mpz_set_si(bound, -1);
+    if (gpu_adapter_window_fits(bound, 1, 5)) {
+        fprintf(stderr, "  FAIL: negative window accepted\n");
+        ok = 0;
+    }
+    mpz_set_ui(period, 1);
+    mpz_mul_2exp(period, period, 400);
+    if (gpu_adapter_crt_candidate_bits(55, period, 4096) != 401) {
+        fprintf(stderr, "  FAIL: CRT period omitted from candidate bound\n");
+        ok = 0;
+    }
+    mpz_clears(bound, period, NULL);
+
+    for (size_t j = 0; j < sizeof(test_limbs) / sizeof(test_limbs[0]); j++) {
+        int al = test_limbs[j];
+        if (al > GPU_NLIMBS) continue;
+        enum { COUNT = 35 };
+        mpz_t candidates[COUNT];
+        uint8_t results[COUNT];
+        for (int i = 0; i < COUNT; i++) {
+            mpz_init_set_ui(candidates[i], 1);
+            mpz_mul_2exp(candidates[i], candidates[i],
+                         (unsigned long)al * 64UL - 2UL);
+            mpz_add_ui(candidates[i], candidates[i], (unsigned long)(2 * i + 1));
+            if (i % 7 == 0) mpz_nextprime(candidates[i], candidates[i]);
+        }
+        mpz_set_ui(candidates[COUNT - 1], 1);
+        mpz_mul_2exp(candidates[COUNT - 1], candidates[COUNT - 1],
+                     (unsigned long)al * 64UL);
+        mpz_nextprime(candidates[COUNT - 1], candidates[COUNT - 1]);
+        gpu_fermat_set_limbs(gpu_adapter_get_fermat_ctx(adapter), al);
+        struct gpu_batch batch = {COUNT, candidates, results};
+        if (gpu_adapter_test_batch(adapter, &batch) < 0) {
+            fprintf(stderr, "  FAIL: %d-limb adapter batch\n", al);
+            ok = 0;
+        } else {
+            for (int i = 0; i < COUNT; i++) {
+                if (results[i] != cpu_mr_base2(candidates[i])) {
+                    fprintf(stderr, "  FAIL: %d-limb adapter candidate %d\n",
+                            al, i);
+                    ok = 0;
+                }
+            }
+        }
+        for (int i = 0; i < COUNT; i++) mpz_clear(candidates[i]);
+    }
+    gpu_adapter_free(adapter);
+    if (ok) printf("  OK: width boundaries, carry, fallback and batches\n");
+    return ok;
+}
 #endif /* WITH_CUDA */
 
-int main(void) {
+int main(int argc, char **argv) {
+    int width_only = argc == 2 && strcmp(argv[1], "--width-only") == 0;
+    if (argc > 1 && !width_only) {
+        fprintf(stderr, "usage: %s [--width-only]\n", argv[0]);
+        return 2;
+    }
 #ifndef WITH_CUDA
+    (void)width_only;
     printf("test_gpu_fermat: SKIPPED (built without WITH_CUDA=1)\n");
     return 0;
 #else
     printf("========== GPU Fermat Kernel Tests ==========\n\n");
 
-    int ok = run_gpu_fermat_correctness_test();
+    int ok = run_width_and_adapter_test();
+    if (ok && !width_only)
+        ok = run_gpu_fermat_correctness_test();
     /* Reference FIRST, then the internal H2D-vs-device consistency check: the
        device-path test aborts the chain on failure, and a failing consistency
        check used to hide whether the KERNEL or one of the two PATHS is wrong. */
-    if (ok)
+    if (ok && !width_only)
         ok = run_gpu_fermat_pattern_test();
-    if (ok)
+    if (ok && !width_only)
         ok = run_gpu_fermat_device_path_test();
 
     printf("\n==============================================\n");

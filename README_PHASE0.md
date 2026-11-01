@@ -88,7 +88,7 @@ Defaults:
 | `--merit-min M` | `20.0` | gaps >= M are written to the log and GMP-verified; bands/top-4/records still see every gap with merit >= 6 (internal gate) |
 | `--engine sieve\|walk` | `sieve` | `walk` selects the class-30 bitmap sieve + batched jump-walk engine (~10.6x the sieve engine's throughput at the production default: measured 5.2 s vs 55.8 s for 1e12 integers, identical 5-gap output, 2026-10-02; same log/records/verify/top-4/resume path). `--check`, `--gpu-sieve`/`--cpu-sieve`, `--legacy-mr` and `--sieve-limit` apply to the sieve engine only; combining them with `--engine walk` is an error (or ignored where noted) |
 | `--gap-min G` | `ceil(--merit-min * ln(start))` | walk engine only: report every gap >= G (GMP-verified). G in [100, 1e7]; values < 300 print a warning (walk cost scales ~1/G). Passing `--gap-min` explicitly removes the merit gate; an explicit `--merit-min` stays as an additional bar |
-| `--walk-primes P` | `150000` | walk engine: sieve/item primes 17..P.  Deeper sieving cuts the number of primality tests (measured tests follow 1/ln P exactly) but grows the marking, so the optimum is **tile-dependent and band-dependent**.  With the shipped 92 KB tile the 7.9e28 campaign band measures **2.39 / 2.45-2.48 / 2.33 / 2.30e11 ints/s** for P = 120000 / **150000** / 180000 / 210000 (4e12 ints, `--gap-min 1664`, ABBA), i.e. the optimum moved 100000 -> 150000 when the mark's per-item cost fell (§31).  With the old 64 KB tile the same band measured 2.059 / 2.237 / **2.397** / 2.247 / 1.926 / 1.497e11 for P = 15000 / 40000 / **100000** / 250000 / 500000 / 1e6 (§28).  At shallow starts a smaller depth wins: at `--start 1e20` 40000 gives 4.03e11 vs 3.87-3.95e11 at 150000, and 15000 is the optimum at the 1e13 campaign geometry, so pass `--walk-primes 40000` (or 15000) for shallow bands.  Gap sets are identical at every depth (verified 87034/87034 gaps at `--gap-min 800`, P = 40000..1e6, and 1696/1696 walk-vs-sieve at P = 150000).  **Re-swept 2026-10-30** with the wall-band test (`P0_WALK_TESTMODE=4`, below) and the chunk-major mark order (`P0_ITEM_ORDER`, below), `--start 7.9e28 --length 4.8e12 --gap-min 1664`, dev 3070, 3 interleaved reps: P = 70000 / 85000 / **100000** / 120000 / 150000 -> **13.30 / 12.85 / 12.70 / 12.85 / 12.99 s**.  A cheaper test moves the optimum back toward a shallower sieve: 100000 is -2.2 % against the default and the curve is flat within 1.5 % over 85000..150000 (earlier 2-rep sweep: 40000 13.9 s, 60000 13.6 s, 80000 13.31/12.27 s - an outlier pair, hence the 3-rep round above - 220000 13.3 s, 320000 13.9 s).  **The default is unchanged** (150000) because the fleet's RTX 3060 has not been measured and a rollout should change one variable at a time; opt in with `--walk-primes 100000` (see the chain recipe in §6, a slice resumes from its checkpoint at the new depth) |
+| `--walk-primes P` | `150000` | walk engine: sieve/item primes 17..P.  Deeper sieving cuts the number of primality tests (measured tests follow 1/ln P exactly) but grows the marking, so the optimum is **tile-dependent and band-dependent**.  With the shipped 92 KB tile the 7.9e28 campaign band measures **2.39 / 2.45-2.48 / 2.33 / 2.30e11 ints/s** for P = 120000 / **150000** / 180000 / 210000 (4e12 ints, `--gap-min 1664`, ABBA), i.e. the optimum moved 100000 -> 150000 when the mark's per-item cost fell (§31).  With the old 64 KB tile the same band measured 2.059 / 2.237 / **2.397** / 2.247 / 1.926 / 1.497e11 for P = 15000 / 40000 / **100000** / 250000 / 500000 / 1e6 (§28).  At shallow starts a smaller depth wins: at `--start 1e20` 40000 gives 4.03e11 vs 3.87-3.95e11 at 150000, and 15000 is the optimum at the 1e13 campaign geometry, so pass `--walk-primes 40000` (or 15000) for shallow bands.  Gap sets are identical at every depth (verified 87034/87034 gaps at `--gap-min 800`, P = 40000..1e6, and 1696/1696 walk-vs-sieve at P = 150000).  **Re-swept 2026-10-30** with the wall-band test (`P0_WALK_TESTMODE=4`, below) and the chunk-major mark order (`P0_ITEM_ORDER`, below), `--start 7.9e28 --length 4.8e12 --gap-min 1664`, dev 3070, 3 interleaved reps: P = 70000 / 85000 / **100000** / 120000 / 150000 -> **13.30 / 12.85 / 12.70 / 12.85 / 12.99 s**.  A cheaper test moves the optimum back toward a shallower sieve: 100000 is -2.2 % against the default and the curve is flat within 1.5 % over 85000..150000 (earlier 2-rep sweep: 40000 13.9 s, 60000 13.6 s, 80000 13.31/12.27 s - an outlier pair, hence the 3-rep round above - 220000 13.3 s, 320000 13.9 s).  **Fleet RTX 3060s, measured 2026-10-30** (same band, `--length 4.8e12 --gap-min 1664 --walk-batch 96`, both cards at once as in production, 4 reps ordered F R R F, mean wall s GPU 0 / GPU 1): P = **85000 21.79 / 21.35**, 100000 21.94 / 21.49, 120000 22.04 / 21.55, 150000 22.34 / 21.89, 200000 22.79 / 22.31, 250000 23.36 / 22.91, i.e. **-2.5 % at 85000** against 150000 on both cards (100000 -1.8 %, 120000 -1.5 %, 200000 +2.0 %, 250000 +4.6 %; the two cards agree within 0.3 points).  85000 is the lowest depth tried there, so the 3060's optimum may lie below it.  Gap sets stay identical (428/428 gaps at `--length 1.2e12 --gap-min 1100`, 85000 vs 150000, both cards).  **The engine default is unchanged** (150000: the old binary and other bands prefer it); the fleet wall chain passes `--walk-primes 85000` explicitly (see the chain recipe in §6; a slice resumes from its checkpoint at the new depth) |
 | `--walk-batch B` | `64` | walk engine: super-batch = B x 30-blocks (**default 64 since 2026-10-03**, was 32; range **4..96**, raised from 4..32 the same day). ABBA on 1e13 at `--gap-min 702` (dev 3070, 4 arms): K32 63.68 s vs **K64 62.12 s = +2.45 %**, K96 62.26 s (+2.23 %, no better than 64 but 6.5 GB) - at the 7.9e28 wall with the 92 KB tile K96 measured 16.12/16.33 s vs 16.36/16.94 s for K64 (**+2.5 %**, both pairs), still opt-in because of the VRAM; both K64 arms beat both K32 arms and the emitted sets are identical (parity K32==K64==K96 exact, 1624/1624 on 1e12). VRAM = 2 regions x (B+1) x 33.6 MB + gap buffer: default K=64 -> 4.4 GB, K=32 -> 2.2 GB, K=96 -> 6.5 GB (an over-large K fails the bitmap alloc loudly, never silently) |
 | `--log FILE` | none | appended; one `# phase0-gpu session ...` header per run |
 | `--state FILE` / `--state-every S` | none / `30` s | checkpoint for resume; **deleted when the range completes** |
@@ -144,7 +144,10 @@ bitmap, the `tests` count and the gap set are identical.  Measured 2026-10-30
 `--walk-primes 150000`): mark alone (`P0_WALK_OFF=1`, ABBA) **5.69 -> 4.71 s
 (-17 %)**; end to end 13.35 -> 12.98 s (**-2.8 %**, 3 interleaved reps, with
 `P0_WALK_TESTMODE=4`) - the overlap hides most of the mark, so only about a third
-of the gain reaches the wall; `tests=9505435886` in every arm.  Example, A/B
+of the gain reaches the wall; `tests=9505435886` in every arm.  At the dev 1e32
+campaign geometry (perig test, `--gap-min 2002`, `--length 4.8e12`, ABBA) it is
+neutral, 19.45 -> 19.28 s (-0.9 %, within noise), with identical `tests` and gap
+sets (185/185 at `--length 2e12 --gap-min 1300`).  Example, A/B
 against the old order:
 
     P0_ITEM_ORDER=0 ./bin/phase0_scan_gpu --engine walk \
@@ -273,6 +276,15 @@ settings**:
   `tests=3671852807` as the monolithic one at `--gap-min 1100 --length 1.2e12`.
   Between 2^75 and 2^95 and above 2^96 - 2^79 nothing changes, so the 1e32
   campaign band is unaffected (and gets no speed-up from mode 4).
+  Fleet re-validation (2026-10-30, 2x RTX 3060 sm_86, binary rebuilt there with
+  plain `make`, GCC 13): `bin/bench_u96` `gate`/`verd`/`sweep` 0 mismatches and
+  the same prime counts as on the dev box; `--length 1.2e12 --gap-min 1100`: old
+  (`P0_WALK_TESTMODE=0 P0_ITEM_ORDER=0`) and new both `tests=3671852807`, 428 gaps,
+  identical gap sets on both cards, wall 13.57 -> 8.75 s (GPU 0) and 13.61 -> 8.57 s
+  (GPU 1), 1.55-1.59x.  Resumed from the real wall checkpoints (c34 / c35) the
+  end-to-end rate went from 1.429 / 1.457e11 ints/s (old binary) to 2.179 / 2.214e11
+  at the old depth (**1.52x**) and to 2.243 / 2.276e11 at `--walk-primes 85000`
+  (**1.57x**, first progress line, start-up included), ETA 11 h -> 7 h.
 * Kernel-DLL builds (`phase0_scan_gpu_split`, and on Windows `phase0gpu.dll` +
   the MinGW host tools) pick the test from the MAGNITUDE only:
   `P0_WALK_TESTMODE` is a monolithic-build variable.  `p0gpu_walk` must carry a
@@ -687,7 +699,8 @@ file is never touched.  `--length` accepts `4e12` (the engine itself does not).
 Measured depths for the 7.9e28 band, and why 100000 won there at the old 64 KB
 tile: section 28 of `docs/PHASE0_scan_bench.md` (the 92 KB tile moved the optimum
 to 150000, and the 2026-10-30 wall-band test + chunk-major mark order moved it
-back to 100000 - see the `--walk-primes` row in §2).
+back to 100000 on the dev 3070 and to 85000 or lower on the fleet's 3060s - see
+the `--walk-primes` row in §2).
 
 ---
 
@@ -701,7 +714,7 @@ back to 100000 - see the `--walk-primes` row in §2).
 | `./bin/mr128_bench --validate 3000 0 121` | `VALIDATE PASS (0 mismatches vs GMP)` - the 2 x 64-bit walk kernel above 2^120; bits 121/125/130 must pass, 96 is outside its `2^96 < n < 2^128` domain and fails by design (§29) |
 | `./bin/bench_p0sieve --verify 3` | `3 segment(s) bit-exact vs naive CPU marker` |
 | `./bin/bench_u96 gate 200000`, `./bin/bench_u96 sweep 64 1048576` | the walk's mode-4 test (build line: §1) is exact: `gate N=200000 : gpu residue mismatches=0  host mismatches=0  verdict mismatches=0` and `sweep chunks=64 N=1048576: primes u96=2027625 perig=2027625 diff=0` (measured 2026-10-30; the larger verdict runs are in `docs/PGN_SNAPSHOT_REVIEW_2026-10-20.md` §12).  Run it after ANY change to `tools/p0_test_u96.cuh` |
-| walk test-mode parity (wall band) | `--engine walk --start 79000000000010000000000000000 --length 1200000000000 --gap-min 1100 --walk-primes 150000 --walk-batch 96 --no-records --log L` with the default (mode 4) and with `P0_WALK_TESTMODE=0` (perig), and with `bin/phase0_scan_gpu_split`: **428 gaps and `tests=3671852807` in all three**, gap sets identical after stripping the session-id column (measured 2026-10-30) |
+| walk test-mode parity (wall band) | `--engine walk --start 79000000000010000000000000000 --length 1200000000000 --gap-min 1100 --walk-primes 150000 --walk-batch 96 --no-records --log L` with the default (mode 4) and with `P0_WALK_TESTMODE=0` (perig), and with `bin/phase0_scan_gpu_split`: **428 gaps and `tests=3671852807` in all three**, gap sets identical after stripping the session-id column (measured 2026-10-30; the fleet's two RTX 3060s give the same 428 gaps and `tests=3671852807` with the default and with `P0_WALK_TESTMODE=0`, and at `--walk-primes 85000` the same 428 gaps with `tests=3855397099`) |
 | `./bin/phase0_scan_gpu --length 500000000 --merit-min 10 --log L` | `204` rows, top-4 `724/690/684/682` (merits `15.4883/14.7610/14.6326/14.5898`), 0 unverified |
 | fast vs legacy equivalence | `--merit-min 10` on 1e10: 4439 rows, byte-identical between default and `--legacy-mr` (sorted, timestamp stripped) |
 | PSP fixture | `--start 18447233110000000000 --length 5000000000 --merit-min 15` contains `gap=710 merit=16.0049 verified=1` (the 2-PSP 18447233112263860537 must never appear), 0 unverified |
@@ -822,25 +835,28 @@ chain without `--r-total` reports the per-1e16 yield instead.
 
 `--walk-primes P` (default: the engine's 150000) is passed straight to every
 slice, so the whole campaign can run at one sieve depth.  The depth is a
-property of the band AND of the mark tile: at the 7.9e28 wall with the shipped
-92 KB tile the measured optimum is **150000** (2.45-2.48e11 ints/s, vs 2.39 at
-120000 and 2.33 at 180000), while 250000 and above lose
-because the marking grows faster than the tests fall (`docs/PHASE0_scan_bench.md`
-§28, `scripts/p0_deep_sweep.py`).  It can be changed between restarts - a slice
-resumes from its checkpoint at the new depth, and the reported gaps are
-identical at every depth, so the census stays consistent across slices taken at
-different depths (record the value in the ledger if that matters for your
-analysis).  With the 2026-10-30 binary (TESTMODE 4 + chunk-major mark) the
-optimum at this band is **100000** (12.70 s vs 12.99 s at 150000 per 4.8e12, -2.2 %;
-with the older binary 150000 stays the optimum, and the engine default stays
-150000 until the fleet's RTX 3060 is measured), so after rolling that binary out
-replace `--walk-primes 150000` by `--walk-primes 100000` in the restart below.
-Example: a restart that also moves the remaining slices to the measured optimum:
+property of the band, of the mark tile AND of the primality test: with the old
+binary at the 7.9e28 wall and the shipped 92 KB tile the measured optimum was
+**150000** (2.45-2.48e11 ints/s, vs 2.39 at 120000 and 2.33 at 180000), while
+250000 and above lose because the marking grows faster than the tests fall
+(`docs/PHASE0_scan_bench.md` §28, `scripts/p0_deep_sweep.py`).  With the
+2026-10-30 binary (TESTMODE 4 + chunk-major mark) a test is cheaper and the
+optimum moved to a shallower sieve on both cards that were measured: **100000**
+on the dev RTX 3070 (12.70 s vs 12.99 s at 150000 per 4.8e12, -2.2 %) and
+**85000** (the lowest depth tried) on the fleet's RTX 3060s (21.57 s vs 22.12 s,
+-2.5 %, both cards within 0.3 points; 100000 is -1.8 %).  The fleet wall has
+therefore run with `--walk-primes 85000` since 2026-10-30 17:15.  The depth can
+be changed between restarts - a slice resumes from its checkpoint at the new
+depth (the state file does not store it), and the reported gaps are identical at
+every depth, so the census stays consistent across slices taken at different
+depths (the chain writes `walk_primes=` into its ledger).  With the old binary
+keep 150000.  Example: the fleet's restart at the measured depth, which also
+passes the campaign total:
 
 ```bash
 nohup setsid python3 scripts/p0_walk_chain.py \
     --start 79000000000010000000000000000 --length 10000000000000000 \
-    --gap-min 1664 --tag wall --walk-batch 96 --walk-primes 150000 \
+    --gap-min 1664 --tag wall --walk-batch 96 --walk-primes 85000 \
     --slices 11 --r-total 2e17 > /tmp/wall_chain_stdout.txt 2>&1 &
 ```
 

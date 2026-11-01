@@ -814,7 +814,7 @@ static int run_gpu_sieve_parity_test(void) {
        behind (WS-B). */
     if (pass) pass = run_residue_incr_test(ctx);
 
-    static const int limb_cases[] = {1, 2, 6, 12, 20};
+    static const int limb_cases[] = {1, 2, 5, 6, 10, 12, 20};
     static const uint64_t interval_cases[] = {16384U, 1U << 16};
 
     for (size_t li = 0; li < sizeof(limb_cases) / sizeof(limb_cases[0]); li++) {
@@ -847,17 +847,23 @@ static int run_gpu_sieve_parity_test(void) {
     {
         mpz_t step;
         mpz_init(step);
-        for (int parity = 0; parity < 2 && pass; parity++) {
-            /* Random odd step ~ 2^(64*limbs - 40): rows far apart, parity flips. */
-            mpz_urandomb(step, rng, 64UL * 6UL - 40UL);
-            mpz_setbit(step, 0);
-            mpz_urandomb(base, rng, 64UL * 6UL - 32UL);
-            if (parity) mpz_setbit(base, 0); else mpz_clrbit(base, 0);
-            snprintf(label, sizeof(label), "rows parity=%s",
-                     parity ? "odd" : "even");
-            if (!run_one_row_batch(ctx, base, step, 6, 16384U, 4,
-                                   primes, prime_count, inv_p, label)) {
-                pass = 0;
+        static const int row_limb_cases[] = {5, 6, 10};
+        for (size_t li = 0;
+             li < sizeof(row_limb_cases) / sizeof(row_limb_cases[0]) && pass;
+             li++) {
+            int limbs = row_limb_cases[li];
+            for (int parity = 0; parity < 2 && pass; parity++) {
+                /* An odd step makes row parity alternate. */
+                mpz_urandomb(step, rng, 64UL * (unsigned long)limbs - 40UL);
+                mpz_setbit(step, 0);
+                mpz_urandomb(base, rng, 64UL * (unsigned long)limbs - 32UL);
+                if (parity) mpz_setbit(base, 0); else mpz_clrbit(base, 0);
+                snprintf(label, sizeof(label), "rows limbs=%d parity=%s",
+                         limbs, parity ? "odd" : "even");
+                if (!run_one_row_batch(ctx, base, step, limbs, 16384U, 4,
+                                       primes, prime_count, inv_p, label)) {
+                    pass = 0;
+                }
             }
         }
         mpz_clear(step);

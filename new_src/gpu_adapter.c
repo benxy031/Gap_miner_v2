@@ -7,7 +7,7 @@
  * Without WITH_CUDA: CPU-based fallback (per-candidate GMP Fermat test).
  * With WITH_CUDA: batches candidates to the CUDA Fermat kernel in
  * new_src/gpu/gpu_fermat.cu (scalar kernel, or CGBN when built with
- * WITH_CGBN_FERMAT=1). Any candidate that doesn't fit in GPU_NLIMBS limbs,
+ * WITH_CGBN_FERMAT=1). Any candidate that doesn't fit the active GPU width,
  * or any GPU batch failure, falls back to the CPU Fermat test so a missing
  * or misbehaving GPU never silently drops candidates.
  */
@@ -81,35 +81,7 @@ void gpu_adapter_set_candidate_bits(struct gpu_adapter *adapter, uint32_t bits) 
 #ifdef WITH_CUDA
     gpu_fermat_ctx *ctx = (gpu_fermat_ctx *)adapter->gpu_context;
     if (!ctx) return;
-    int limbs = (int)((bits + 63U) / 64U);
-    if (limbs < 1) limbs = 1;
-#ifdef WITH_CGBN_FERMAT
-    /* Round up to the nearest CGBN-supported width.  Some even widths have no
-       valid CGBN instantiation: AL=10 (640-bit) is 20 32-bit limbs and TPI=4
-       → 5 limbs/thread (the unimplemented dlimbs>4 path), TPI=8 → non-integer
-       2.5.  The scalar fallback for those is register-heavy (~255 regs →
-       ~16% occupancy) and measured ~3.6x slower per candidate than CGBN
-       AL=12.  Padding with zero high limbs is arithmetic-safe
-       (n < 2^bits < 2^(AL*64)) and lands on the production-verified CGBN
-       paths. */
-    {
-        static const int cgbn_als[] = {2, 4, 6, 8, 12, 16, 20, 24, 28, 32};
-        int nl = (int)GPU_NLIMBS;
-        if (limbs > nl) limbs = nl;
-        for (size_t i = 0; i < sizeof(cgbn_als) / sizeof(cgbn_als[0]); i++) {
-            if (cgbn_als[i] >= limbs && cgbn_als[i] <= nl) {
-                limbs = cgbn_als[i];
-                break;
-            }
-        }
-    }
-#else
-    /* CGBN unavailable: round up odd widths to even (the scalar dispatch
-       supports every exact width 1..GPU_NLIMBS). */
-    if ((limbs & 1) != 0 && limbs < GPU_NLIMBS) limbs++;
-    if (limbs > GPU_NLIMBS) limbs = GPU_NLIMBS;
-#endif
-    gpu_fermat_set_limbs(ctx, limbs);
+    gpu_fermat_set_limbs(ctx, gpu_fermat_limbs_for_bits(bits));
 #else
     (void)bits;
 #endif
@@ -129,6 +101,49 @@ struct gpu_fermat_ctx *gpu_adapter_get_fermat_ctx(struct gpu_adapter *adapter) {
     if (!adapter) return NULL;
     return (gpu_fermat_ctx *)adapter->gpu_context;
 }
+
+uint32_t gpu_adapter_crt_candidate_bits(uint32_t shift, const mpz_t period,
+                                        uint64_t max_interval) {
+    mpz_t bound, extra;
+    mpz_inits(bound, extra, NULL);
+    mpz_set_ui(bound, 1);
+    mpz_mul_2exp(bound, bound, 256U + shift);
+    mpz_set_ui(extra, 1);
+    mpz_mul_2exp(extra, extra, shift);
+    if (mpz_cmp(period, extra) > 0)
+        mpz_set(extra, period);
+    mpz_add(bound, bound, extra);
+    mpz_import(extra, 1, -1, sizeof(max_interval), 0, 0, &max_interval);
+    mpz_add(bound, bound, extra);
+    size_t bits = mpz_sizeinbase(bound, 2);
+    mpz_clears(bound, extra, NULL);
+    if (bits > UINT32_MAX) {
+        fprintf(stderr, "[GPUAdapter] CRT candidate bound exceeds uint32_t bits\n");
+        return UINT32_MAX;
+    }
+    return (uint32_t)bits;
+}
+
+int gpu_adapter_window_fits(const mpz_t base, uint64_t interval, int limbs) {
+    if (mpz_sgn(base) < 0 || interval == 0 || limbs <= 0)
+        return 0;
+    size_t width = (size_t)limbs * 64U;
+    size_t bits = mpz_sizeinbase(base, 2);
+    if (bits > width)
+        return 0;
+    if (bits < width && width >= 128U)
+        return 1;
+
+    mpz_t end, delta;
+    uint64_t last_offset = interval - 1U;
+    mpz_init_set(end, base);
+    mpz_init(delta);
+    mpz_import(delta, 1, -1, sizeof(last_offset), 0, 0, &last_offset);
+    mpz_add(end, end, delta);
+    int fits = mpz_sizeinbase(end, 2) <= width;
+    mpz_clears(end, delta, NULL);
+    return fits;
+}
 #endif
 
 int gpu_adapter_async_submit_packed(struct gpu_adapter *adapter, int slot,
@@ -144,19 +159,6 @@ int gpu_adapter_async_submit_packed(struct gpu_adapter *adapter, int slot,
 }
 
 #ifdef WITH_CUDA
-/* Pack n into GPU_NLIMBS little-endian 64-bit limbs, zero-padded.
-   Returns 0 on success, -1 if n is negative or wider than GPU_NLIMBS*64
-   bits (caller must use the CPU fallback for that candidate). */
-static int pack_candidate_limbs(mpz_t n, uint64_t *limbs) {
-    memset(limbs, 0, (size_t)GPU_NLIMBS * sizeof(uint64_t));
-    if (mpz_sgn(n) < 0) return -1;
-    if (mpz_sgn(n) == 0) return 0;
-    if (mpz_sizeinbase(n, 2) > (size_t)GPU_NLIMBS * 64U) return -1;
-    size_t count = 0;
-    mpz_export(limbs, &count, -1, sizeof(uint64_t), 0, 0, n);
-    return 0;
-}
-
 static int pack_candidate_active_limbs(mpz_t n, uint64_t *limbs, int active_limbs) {
     memset(limbs, 0, (size_t)active_limbs * sizeof(uint64_t));
     if (mpz_sgn(n) < 0 ||
@@ -177,22 +179,40 @@ int gpu_adapter_test_batch(struct gpu_adapter *adapter,
     gpu_fermat_ctx *ctx = (gpu_fermat_ctx *)adapter->gpu_context;
     if (ctx) {
         uint32_t n = batch->count;
+        int limbs = gpu_fermat_get_limbs(ctx);
         uint64_t *cand_limbs =
-            (uint64_t *)malloc((size_t)n * (size_t)GPU_NLIMBS * sizeof(uint64_t));
+            (uint64_t *)malloc((size_t)n * (size_t)limbs * sizeof(uint64_t));
         uint8_t *gpu_ok = (uint8_t *)malloc(n);
         uint8_t *needs_cpu = (uint8_t *)calloc(n, 1);
 
         if (cand_limbs && gpu_ok && needs_cpu) {
+            uint32_t too_wide = 0;
             for (uint32_t i = 0; i < n; i++) {
-                if (pack_candidate_limbs(batch->candidates[i],
-                                          cand_limbs + (size_t)i * GPU_NLIMBS) != 0) {
+                if (pack_candidate_active_limbs(
+                        batch->candidates[i],
+                        cand_limbs + (size_t)i * (size_t)limbs, limbs) != 0) {
                     needs_cpu[i] = 1;
+                    too_wide++;
                 }
             }
-
-            if (gpu_fermat_test_batch(ctx, cand_limbs, gpu_ok, n) < 0) {
-                /* GPU batch failed outright: fail closed to CPU for all. */
-                memset(needs_cpu, 1, n);
+            if (too_wide) {
+                fprintf(stderr, "[GPUAdapter] %u candidates exceed the "
+                        "%d-limb GPU width; using CPU for those candidates\n",
+                        too_wide, limbs);
+            }
+            size_t cap = gpu_fermat_max_batch(ctx);
+            for (size_t off = 0; off < n;) {
+                size_t chunk = (size_t)n - off;
+                if (chunk > cap) chunk = cap;
+                if (chunk == 0 ||
+                    gpu_fermat_test_batch(ctx, cand_limbs + off * (size_t)limbs,
+                                          gpu_ok + off, chunk) < 0) {
+                    fprintf(stderr, "[GPUAdapter] GPU batch failed; using CPU "
+                            "for the remaining candidates\n");
+                    memset(needs_cpu + off, 1, (size_t)n - off);
+                    break;
+                }
+                off += chunk;
             }
 
             for (uint32_t i = 0; i < n; i++) {
@@ -210,7 +230,8 @@ int gpu_adapter_test_batch(struct gpu_adapter *adapter,
         free(cand_limbs);
         free(gpu_ok);
         free(needs_cpu);
-        /* malloc failure: fall through to the CPU-only loop below. */
+        fprintf(stderr, "[GPUAdapter] batch staging allocation failed; "
+                "using CPU for this batch\n");
     }
 #endif
     

@@ -1535,6 +1535,26 @@ static cudaError_t launch_fermat(int al, cudaStream_t stream,
     }
 #endif
 
+    /* Make the scalar fallback visible.  A binary built without
+       WITH_CGBN_FERMAT runs every width here at ~6.5x lower hunt throughput
+       (measured 2026-10-30, RTX 3070, AL=12: 1060 vs 8141 win/s) with no other
+       symptom, so say so once on stderr. */
+    {
+        static int scalar_logged = 0;
+        if (!__atomic_exchange_n(&scalar_logged, 1, __ATOMIC_RELAXED)) {
+#if defined(CGBN_FERMAT_AVAILABLE)
+            fprintf(stderr, "GPU Fermat: scalar kernel active (AL=%d, %d-bit; "
+                    "no CGBN case for this width%s)\n", al, al * 64,
+                    gpu_fermat_no_cgbn() ? " or GPU_FERMAT_NO_CGBN set" : "");
+#else
+            fprintf(stderr, "GPU Fermat: WARNING scalar kernel active (AL=%d, "
+                    "%d-bit): binary built WITHOUT WITH_CGBN_FERMAT=1, MR runs "
+                    "several times slower; rebuild with "
+                    "make WITH_CUDA=1 WITH_CGBN_FERMAT=1\n", al, al * 64);
+#endif
+        }
+    }
+
 #define FERMAT_DISPATCH(W) \
     do { \
         int block = use_soa_layout \

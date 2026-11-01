@@ -501,6 +501,22 @@ make clean && make WITH_CUDA=1 WITH_CGBN_FERMAT=1
 ./bin/test_gpu_fermat
 ```
 
+Build flags are tracked: `build/.build_flags` records the compiler and flag
+set, and every object depends on it, so changing `WITH_CUDA`,
+`WITH_CGBN_FERMAT`, `GPU_BITS` or `CUDA_ARCH` recompiles everything instead of
+relinking stale objects (the first build after such a change is a full one).
+Always pass the same flags to every `make` invocation, including `make test`.
+
+Check the kernel banner on stderr. The CGBN build prints
+`GPU Fermat: CGBN kernel active (AL=12, 768-bit, TPI=4)`. A binary built
+without `WITH_CGBN_FERMAT=1` prints
+`GPU Fermat: WARNING scalar kernel active ... built WITHOUT WITH_CGBN_FERMAT=1`
+and runs the MR test far slower. Measured 2026-10-30 on an RTX 3070 with
+`--gap-hunt`: 1060 vs 8141 win/s at shift507, and 1295 vs 8798 win/s at
+shift450. A CGBN build that has no CGBN case for the active width (AL=24/28,
+odd AL), or that runs with `GPU_FERMAT_NO_CGBN` set, prints
+`GPU Fermat: scalar kernel active (AL=.., ...; no CGBN case ...)` once instead.
+
 A native **Windows** build (nvcc + MSVC producing `bin/gapgpu.dll` for the GPU
 side, MinGW-w64 for the host and tests, no WSL) is documented in
 [`README_WINDOWS.md`](README_WINDOWS.md); the Linux Makefile is unaffected.

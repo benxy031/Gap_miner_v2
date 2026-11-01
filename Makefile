@@ -57,6 +57,17 @@ else
 GPU_OBJ =
 endif
 
+# Build-flag stamp: every object depends on it, and it is rewritten only when
+# the compiler/flag set changes, so switching WITH_CUDA / WITH_CGBN_FERMAT /
+# GPU_BITS / CUDA_ARCH recompiles instead of silently relinking stale objects.
+# (2026-10-30: a dev bin/gapminer relinked without the CGBN kernel ran the hunt
+# ~6.5x slower with no error.)
+BUILD_FLAGS_STAMP := $(BUILD_DIR)/.build_flags
+BUILD_FLAGS_SIG := $(CC) $(CFLAGS) | $(NVCC) $(CUDA_ARCH) $(NVCC_FLAGS)
+$(shell mkdir -p $(BUILD_DIR) && \
+  printf '%s\n' '$(BUILD_FLAGS_SIG)' | cmp -s - $(BUILD_FLAGS_STAMP) || \
+  printf '%s\n' '$(BUILD_FLAGS_SIG)' > $(BUILD_FLAGS_STAMP))
+
 # Source files
 SOURCES = $(SRC_DIR)/sieve_core.c \
           $(SRC_DIR)/gap_detection.c \
@@ -148,7 +159,7 @@ $(BUILD_DIR):
 	@mkdir -p $(BUILD_DIR)/$(TEST_DIR)
 
 # Compile source files
-$(BUILD_DIR)/%.o: %.c | $(BUILD_DIR)
+$(BUILD_DIR)/%.o: %.c $(BUILD_FLAGS_STAMP) | $(BUILD_DIR)
 	@mkdir -p $(dir $@)
 	$(CC) $(CFLAGS) -c $< -o $@
 
@@ -391,17 +402,17 @@ $(BENCH_MARK_CACHEBLOCK): $(BUILD_DIR)/tools/bench_mark_cacheblock.o | $(BIN_DIR
 	@echo "✓ Built: $@"
 
 # Compile test objects
-$(BUILD_DIR)/$(TEST_DIR)/%.o: $(TEST_DIR)/%.c
+$(BUILD_DIR)/$(TEST_DIR)/%.o: $(TEST_DIR)/%.c $(BUILD_FLAGS_STAMP)
 	@mkdir -p $(BUILD_DIR)/$(TEST_DIR)
 	$(CC) $(CFLAGS) -c $< -o $@
 
 # Compile dev tools
-$(BUILD_DIR)/tools/%.o: tools/%.c
+$(BUILD_DIR)/tools/%.o: tools/%.c $(BUILD_FLAGS_STAMP)
 	@mkdir -p $(BUILD_DIR)/tools
 	$(CC) $(CFLAGS) -I$(SRC_DIR) -c $< -o $@
 
 # Compile CUDA GPU sources (only reached when WITH_CUDA=1 selects a .o under gpu/)
-$(BUILD_DIR)/$(SRC_DIR)/gpu/%.o: $(SRC_DIR)/gpu/%.cu | $(BUILD_DIR)
+$(BUILD_DIR)/$(SRC_DIR)/gpu/%.o: $(SRC_DIR)/gpu/%.cu $(BUILD_FLAGS_STAMP) | $(BUILD_DIR)
 	@mkdir -p $(dir $@)
 ifdef WITH_CGBN_FERMAT
 	@if [ ! -f "$(CGBN_HDR)" ]; then \

@@ -68,6 +68,43 @@ The port is bit-exact against the node's own implementation and is verified by
 `src/PoWCore/PoWUtils.cpp` (`scripts/gen_pow_q48_vectors.sh`, oracle in
 `tools/pow_q48_oracle.cpp`). See `docs/GAPCOIN_Q48.md`.
 
+### Phase-0 exhaustive scanner
+
+The separate Phase-0 scanner is documented in [README_PHASE0.md](README_PHASE0.md).
+The GPU scanner defaults to `--sieve-limit 10000000` with `--gpu-sieve` and
+`30000` with `--cpu-sieve`; the standalone CPU scanner defaults to
+`100000000`. Bounds are inclusive. Startup reports the count of odd primes
+through that bound; the GPU scanner also counts primes above 13 after its 3..13
+wheel. For example, at the GPU-sieve default those counts are 664,578 and
+664,573:
+
+```bash
+./bin/phase0_scan_gpu --sieve-limit 10000000 --start 200000000000000000000 \
+  --length 10000000000
+```
+
+In walk mode that table is not used; the startup line says so.
+`--walk-primes` controls the separate walk sieve and defaults to `150000`.
+The walk engine automatically selects a four-limb base-2 test for
+`2^105 <= n < 2^108`; other magnitudes retain their existing dispatch. For
+example:
+
+```bash
+./bin/phase0_scan_gpu --engine walk \
+  --start 100000000000000000000000000000000 --length 2000000000000 \
+  --gap-min 2002 --walk-primes 150000 --no-records
+
+# Explicitly select the same test for an experiment.
+P0_WALK_TESTMODE=5 ./bin/phase0_scan_gpu --engine walk \
+  --start 100000000000000000000000000000000 --length 2000000000000 \
+  --gap-min 2002 --walk-primes 150000 --no-records
+```
+
+For comparison, prefix the monolithic scanner command with
+`P0_WALK_TESTMODE=0` to force the previous test. Forcing mode `5` outside its
+range prints a warning and falls back to magnitude dispatch; the split/DLL
+scanner always uses magnitude dispatch.
+
 ## Two search modes
 
 - **Non-CRT** (default) — workers scan fixed windows of adders materialized

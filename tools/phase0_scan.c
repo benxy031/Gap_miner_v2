@@ -98,7 +98,8 @@ static uint32_t *g_primes;
 static size_t    g_nprimes;
 
 static void gen_primes(uint32_t limit) {
-    size_t half = (size_t)(limit / 2) + 1;
+    size_t half = (size_t)(limit / 2u) + (size_t)(limit & 1u);
+    if (half == 0) half = 1;
     uint8_t *comp = (uint8_t *)calloc(half, 1);
     if (!comp) { fprintf(stderr, "[phase0] primes alloc failed\n"); exit(1); }
     for (size_t k = 1; (uint64_t)(2 * k + 1) * (2 * k + 1) <= (uint64_t)limit; k++) {

@@ -202,11 +202,11 @@ static int g_mark_nostore = 0;      /* P0_MARK_NOSTORE=0|1|2|3: mark store modes
                                        3 same L2 region - docs section 32) */
 static int g_walk_off = 0;          /* P0_WALK_OFF=1: skip the walk launches
                                        (mark-only wall, honestly measured) */
-static int g_walk_testmode = -1;    /* P0_WALK_TESTMODE=0|1|2|3|4: force the walk's
+static int g_walk_testmode = -1;    /* P0_WALK_TESTMODE=0|1|2|3|4|5: force the walk's
                                        primality variant (perig/lazy/canonical/
-                                       small-band lazy/wall-band u96) instead of
-                                       the magnitude dispatch; 4 is refused
-                                       outside its exact band (see the launch) */
+                                       small-band lazy/wall-band u96/u108) instead
+                                       of the magnitude dispatch; 4 and 5 are
+                                       guarded by their exact bands */
 static unsigned long long g_scan_cyc = 0, g_test_cyc = 0;   /* PROF sums */
 static int g_walk_prof = 0;         /* P0_WALK_PROF=1: instrument the walk kernel
                                        (scan vs test cycles, stats[2..3]) */
@@ -453,7 +453,8 @@ static int u128_is_probable(u128 x, mpz_t scratch) {
 /* ---------------- odd-prime table (3,5,7,...) ---------------- */
 
 static void gen_primes(uint32_t limit) {
-    size_t half = (size_t)(limit / 2) + 1;
+    size_t half = (size_t)(limit / 2u) + (size_t)(limit & 1u);
+    if (half == 0) half = 1;
     uint8_t *comp = (uint8_t *)calloc(half, 1);
     if (!comp) die("primes alloc failed");
     for (size_t k = 1; (uint64_t)(2 * k + 1) * (2 * k + 1) <= (uint64_t)limit; k++) {
@@ -471,8 +472,14 @@ static void gen_primes(uint32_t limit) {
     g_nprimes = j;
     free(comp);
     while (g_bucket0 < g_nprimes && g_primes[g_bucket0] <= 13u) g_bucket0++;
-    fprintf(stderr, "[phase0-gpu] sieve primes up to %u: %zu odd primes (%zu in buckets after the wheel)\n",
-            limit, g_nprimes, g_nprimes - g_bucket0);
+    if (g_walk_engine)
+        fprintf(stderr, "[phase0-gpu] sieve primes up to %u: %zu odd primes "
+                        "(%zu > 13; unused by walk, which uses --walk-primes)\n",
+                limit, g_nprimes, g_nprimes - g_bucket0);
+    else
+        fprintf(stderr, "[phase0-gpu] sieve primes up to %u: %zu odd primes "
+                        "(%zu > 13 in buckets after the wheel)\n",
+                limit, g_nprimes, g_nprimes - g_bucket0);
 }
 
 /* ---------------- job state ---------------- */
@@ -1588,9 +1595,9 @@ static int run_walk_engine(void) {
         ev = getenv("P0_WALK_TESTMODE");
         if (ev) {
             int v = atoi(ev);
-            if (v >= 0 && v <= 4) g_walk_testmode = v;
+            if (v >= 0 && v <= 5) g_walk_testmode = v;
             else fprintf(stderr, "[phase0-gpu] P0_WALK_TESTMODE %d out of range"
-                                " [0,4]; using the magnitude dispatch\n", v);
+                                " [0,5]; using the magnitude dispatch\n", v);
         }
         ev = getenv("P0_WK_GRID");
         if (ev) { int v = atoi(ev); if (v >= 1 && v <= 4096) g_wk_grid = v; }
@@ -2024,9 +2031,26 @@ static int run_walk_engine(void) {
                     tmode = w_test_mode(ab_hi);
                 }
             }
+            if (tmode == 5 && g_walk_testmode == 5) {
+                const uint64_t ab_hi = (uint64_t)(Ab >> 64);
+                if (ab_hi < W_U108_MIN_HI || ab_hi >= W_U108_MAX_HI) {
+                    static int warned5 = 0;
+                    if (!warned5) {
+                        warned5 = 1;
+                        fprintf(stderr, "[phase0-gpu] P0_WALK_TESTMODE=5 only covers"
+                                        " Ahi in [2^41, 2^44); Ahi=%llu uses the"
+                                        " magnitude dispatch\n",
+                                (unsigned long long)ab_hi);
+                    }
+                    tmode = w_test_mode(ab_hi);
+                }
+            }
             if (!g_walk_off) {
             if (g_walk_prof) {
                 switch (tmode) {
+                case 5: walk_kernel7<5, 1><<<wk_grid, wk_block, 0, sB>>>(bm, cnb * cWords,
+                            (uint64_t)Ab, (uint64_t)(Ab >> 64), d_wtab,
+                            (uint32_t)gapmin, out_r, 1u << 20, st_r); break;
                 case 4: walk_kernel7<4, 1><<<wk_grid, wk_block, 0, sB>>>(bm, cnb * cWords,
                             (uint64_t)Ab, (uint64_t)(Ab >> 64), d_wtab,
                             (uint32_t)gapmin, out_r, 1u << 20, st_r); break;
@@ -2045,6 +2069,9 @@ static int run_walk_engine(void) {
                 }
             } else
             switch (tmode) {
+            case 5: walk_kernel7<5, 0><<<wk_grid, wk_block, 0, sB>>>(bm, cnb * cWords,
+                        (uint64_t)Ab, (uint64_t)(Ab >> 64), d_wtab,
+                        (uint32_t)gapmin, out_r, 1u << 20, st_r); break;
             case 4: walk_kernel7<4, 0><<<wk_grid, wk_block, 0, sB>>>(bm, cnb * cWords,
                         (uint64_t)Ab, (uint64_t)(Ab >> 64), d_wtab,
                         (uint32_t)gapmin, out_r, 1u << 20, st_r); break;

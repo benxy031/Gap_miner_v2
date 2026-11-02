@@ -29,6 +29,7 @@
 #include "p0_test_lazy.cuh"     /* < 2^75: our lazy-Barrett test, 1.23x faster */
 #include "p0_test_u96.cuh"      /* [2^95, 2^96-2^79): fused product-scanning
                                    Montgomery test, 1.7x faster than perig */
+#include "p0_test_u108.cuh"     /* [2^105, 2^108): fused four-limb test */
 
 __device__ __constant__ uint32_t c30_cls[8] = {1, 7, 11, 13, 17, 19, 23, 29};
 __device__ __constant__ int8_t c30_clsidx[30];
@@ -434,19 +435,23 @@ __global__ static void class30_sieve_kernel(const uint64_t * __restrict__ primes
    bits but rejects real primes from 121 bits on (a false negative silently
    splits a gap - see tools/mr128_64_kernel.cuh).  Bands: OUR lazy-Barrett
    three-limb test below 2^75 (measured 1.35x perig in that band: 0.94 vs
-   1.27 ns/test, gates in tools/bench_lazy.cu), perig in 2^75..2^120, the lazy
-   Montgomery ladder (mr128_64_base2_lazy, exact < 2^126, +37%) in
+   1.27 ns/test, gates in tools/bench_lazy.cu), perig in 2^75..2^120 except
+   for modes 4 and 5 below, the lazy Montgomery ladder
+   (mr128_64_base2_lazy, exact < 2^126, +37%) in
    2^120..2^126, and the canonical kernel above 2^126.  Mode 4 (p0u96, the
    fused column-wise Montgomery test, 1.70x perig standalone) takes the
    2^95 <= n < 2^96 - 2^79 slice of the perig band, which is where the
-   record-wall campaign runs (docs/PGN_SNAPSHOT_REVIEW_2026-10-20.md).  Every
-   mode is bit-for-bit the same predicate, so the verdicts never change. */
+   record-wall campaign runs (docs/PGN_SNAPSHOT_REVIEW_2026-10-20.md).
+   Mode 5 uses a four-limb fused square for 2^105 <= n < 2^108.
+   Every mode implements the same base-2 Euler/Jacobi predicate. */
 #define W_MODE3_MIN_HI  (64ULL)          /* value >= 2^70: mode 3 is faster */
 #define W_SMALL_MAX_HI  (1ULL << 11)     /* value < 2^75: mode 3 */
 #define W_U96_MIN_HI    (1ULL << 31)     /* value >= 2^95: mode 4 */
 #define W_U96_MAX_HI    ((1ULL << 32) - (1ULL << 15))  /* value < 2^96-2^79: mode 4;
                                             a CORRECTNESS bound (the lazy
                                             representative must fit 96 bits) */
+#define W_U108_MIN_HI   (1ULL << 41)     /* value >= 2^105 */
+#define W_U108_MAX_HI   (1ULL << 44)     /* value < 2^108 */
 #define W_PERIG_MAX_HI  (1ULL << 56)     /* value < 2^120 */
 #define W_LAZY_MAX_HI   (1ULL << 62)     /* value < 2^126 */
 
@@ -456,6 +461,7 @@ __global__ static void class30_sieve_kernel(const uint64_t * __restrict__ primes
    variant matching the super-batch's high word. */
 template<int MODE>
 __device__ static inline int w_is_probable_prime(uint64_t v, uint64_t Ahi) {
+    if (MODE == 5) return p0u108::test_hi(v, Ahi) ? 1 : 0;
     if (MODE == 4) return p0u96::test_hi(v, (uint32_t)Ahi) ? 1 : 0;
     if (MODE == 3) return p0lazy::test_hi(v, (uint32_t)Ahi) ? 1 : 0;
     if (MODE == 2) return mr128_64_base2_u128(v, Ahi);
@@ -466,6 +472,7 @@ __device__ static inline int w_is_probable_prime(uint64_t v, uint64_t Ahi) {
 __host__ static inline int w_test_mode(uint64_t Ahi) {
     if (Ahi >= W_LAZY_MAX_HI)  return 2;
     if (Ahi >= W_PERIG_MAX_HI) return 1;
+    if (Ahi >= W_U108_MIN_HI && Ahi < W_U108_MAX_HI) return 5;
     /* mode 4: 2^95 <= n < 2^96 - 2^79.  Upper bound: from 2^96 - 2^79 up the
        lazy representative no longer fits three limbs (exactness).  Lower
        bound: below 2^95 the exponent is shorter than the fixed 95-bit

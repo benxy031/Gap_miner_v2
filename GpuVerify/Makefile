@@ -17,7 +17,7 @@ SRC_CU := src/host.cu src/prp_kernel.cu src/sieve_kernel.cu
 OBJS := $(OBJ)/main.o $(OBJ)/parse.o $(OBJ)/host.o $(OBJ)/prp_kernel.o \
         $(OBJ)/sieve_kernel.o
 
-.PHONY: all clean test test-parser
+.PHONY: all clean test test-cli test-parser test-mont
 
 all: $(BIN)
 
@@ -54,8 +54,15 @@ test-mont: bin/test_mont
 bin/test_mont: tests/test_mont.cu src/mont.cuh src/gv.h | $(OBJ)
 	$(NVCC) $(NVFLAGS) -o $@ tests/test_mont.cu $(LDLIBS)
 
-test: $(BIN)
+$(OBJ)/mock_gpuverify: tests/mock_gpu.c src/main.c src/parse.c src/gv.h src/host.h src/parse.h | $(OBJ)
+	$(CC) $(CFLAGS) -o $@ tests/mock_gpu.c src/main.c src/parse.c $(LDLIBS)
+
+test-cli: $(BIN) $(OBJ)/mock_gpuverify
+	sh tests/test_cli.sh ./$(BIN) ./$(OBJ)/mock_gpuverify
+
+test: $(BIN) $(OBJ)/mock_gpuverify
 	./$(BIN) selftest
+	sh tests/test_cli.sh ./$(BIN) ./$(OBJ)/mock_gpuverify
 
 clean:
 	rm -rf $(OBJ) bin

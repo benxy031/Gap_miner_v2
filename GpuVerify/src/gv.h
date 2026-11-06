@@ -30,7 +30,8 @@
 #define GV_COMPOSITE_END  1  /* an endpoint is provably composite           */
 #define GV_PRIME_BETWEEN  2  /* a prime lies strictly inside the gap        */
 #define GV_PARSE_FAIL     3  /* expression or row could not be parsed       */
-#define GV_TOO_LARGE_CPU  4  /* >32768 bits: CPU-only verification          */
+#define GV_INCOMPLETE     4  /* requested verification was not completed    */
+#define GV_RUNTIME_ERROR  5  /* GPU, allocation, or I/O failure             */
 
 #define gv_die(msg) do { fprintf(stderr, "gpuverify: %s\n", (msg)); exit(1); } while (0)
 

@@ -17,14 +17,15 @@ int gv_gpu_available(void);
  * pass_out[i]: 1 = passed strong base-2 PRP (needs host BPSW follow-up),
  *              0 = composite (proved by the base-2 witness),
  *              2 = too large for the GPU (caller must use the CPU path).
- * Returns 0 on success, -1 on CUDA error.
+ * Returns 0 on success, -1 on error; pass_out is usable only on success.
  */
 int gv_gpu_prp_batch(mpz_t *nums, int count, uint8_t *pass_out);
 
 /*
  * Sieve the interval (N, N+gap): returns a host buffer marks[] of
  * (gap/2 - 1) bytes, marks[i]==0 iff the odd candidate N + 2*(i+1)
- * survived all primes <= pmax. Caller frees with free().
+ * survived all primes <= pmax. Caller frees with free(). Returns 0 on
+ * success, -1 on error; outputs are usable only on success.
  */
 int gv_gpu_sieve_gap(mpz_t N, uint64_t gap, uint32_t pmax,
                      uint8_t **marks_out, uint64_t *half_gap_out);

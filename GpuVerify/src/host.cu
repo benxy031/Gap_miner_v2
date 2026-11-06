@@ -1,6 +1,7 @@
 #include "host.h"
 #include "gv.h"
 
+#include <limits.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -19,6 +20,14 @@ extern "C" void launch_sieve(uint8_t *marks, const uint64_t *starts,
 static int g_gpu_ok = -1; /* -1 unknown, 0 no, 1 yes */
 static cudaStream_t g_stream = 0;
 
+static int gv_cuda_check(cudaError_t e, const char *operation)
+{
+    if (e == cudaSuccess)
+        return 0;
+    fprintf(stderr, "gpuverify: %s: %s\n", operation, cudaGetErrorString(e));
+    return -1;
+}
+
 int gv_gpu_init(void)
 {
     if (g_gpu_ok == 1)
@@ -27,17 +36,26 @@ int gv_gpu_init(void)
         return -1;
     int count = 0;
     cudaError_t e = cudaGetDeviceCount(&count);
-    if (e != cudaSuccess || count < 1) {
+    if (e != cudaSuccess) {
         g_gpu_ok = 0;
-        fprintf(stderr, "gpuverify: no CUDA device found, CPU-only mode\n");
+        gv_cuda_check(e, "CUDA device discovery failed");
+        return -1;
+    }
+    if (count < 1) {
+        g_gpu_ok = 0;
+        fprintf(stderr, "gpuverify: no CUDA device found; use --cpu\n");
         return -1;
     }
     e = cudaSetDevice(0);
-    if (e != cudaSuccess) {
+    if (gv_cuda_check(e, "CUDA device selection failed") != 0) {
         g_gpu_ok = 0;
         return -1;
     }
-    cudaStreamCreateWithFlags(&g_stream, cudaStreamNonBlocking);
+    e = cudaStreamCreateWithFlags(&g_stream, cudaStreamNonBlocking);
+    if (gv_cuda_check(e, "CUDA stream creation failed") != 0) {
+        g_gpu_ok = 0;
+        return -1;
+    }
     g_gpu_ok = 1;
     return 0;
 }
@@ -125,6 +143,68 @@ static void gv_mont_prepare(mpz_t n, int bucket, gv_mont_params *p,
     mpz_clear(n1);
 }
 
+static int gv_run_prp_bucket(int bucket, int n_cand, int count,
+                             const gv_mont_params *par, uint32_t **data,
+                             const uint32_t *meta, uint8_t *pass_out)
+{
+    size_t bytes = (size_t)n_cand * (size_t)bucket * 5 * sizeof(uint32_t);
+    size_t meta_bytes = (size_t)n_cand * 4 * sizeof(uint32_t);
+    uint32_t *d_host = (uint32_t *)malloc(bytes);
+    uint32_t *m_host = (uint32_t *)malloc(meta_bytes);
+    uint8_t *p_host = (uint8_t *)malloc((size_t)n_cand);
+    uint32_t *d_buf = NULL, *m_buf = NULL;
+    uint8_t *p_buf = NULL;
+    int k = 0, rc = -1;
+
+    if (!d_host || !m_host || !p_host) {
+        fprintf(stderr, "gpuverify: out of memory preparing GPU batch\n");
+        goto cleanup;
+    }
+    if (gv_cuda_check(cudaMalloc(&d_buf, bytes), "allocating PRP data") != 0 ||
+        gv_cuda_check(cudaMalloc(&m_buf, meta_bytes), "allocating PRP metadata") != 0 ||
+        gv_cuda_check(cudaMalloc(&p_buf, (size_t)n_cand), "allocating PRP results") != 0)
+        goto cleanup;
+
+    for (int i = 0; i < count; i++) {
+        if (par[i].bucket != bucket)
+            continue;
+        memcpy(d_host + (size_t)k * (size_t)bucket * 5, data[i],
+               (size_t)bucket * 5 * sizeof(uint32_t));
+        memcpy(m_host + (size_t)k * 4, meta + (size_t)i * 4,
+               4 * sizeof(uint32_t));
+        k++;
+    }
+    if (gv_cuda_check(cudaMemcpy(d_buf, d_host, bytes, cudaMemcpyHostToDevice),
+                      "copying PRP data to GPU") != 0 ||
+        gv_cuda_check(cudaMemcpy(m_buf, m_host, meta_bytes, cudaMemcpyHostToDevice),
+                      "copying PRP metadata to GPU") != 0 ||
+        gv_cuda_check(gv_launch_prp_bucket(bucket, d_buf, m_buf, p_buf,
+                                           n_cand, g_stream), "launching PRP") != 0 ||
+        gv_cuda_check(cudaDeviceSynchronize(), "running PRP") != 0 ||
+        gv_cuda_check(cudaMemcpy(p_host, p_buf, (size_t)n_cand,
+                                 cudaMemcpyDeviceToHost), "copying PRP results") != 0 ||
+        gv_cuda_check(cudaStreamSynchronize(g_stream), "synchronizing PRP") != 0)
+        goto cleanup;
+
+    k = 0;
+    for (int i = 0; i < count; i++)
+        if (par[i].bucket == bucket)
+            pass_out[i] = p_host[k++];
+    rc = 0;
+
+cleanup:
+    if (d_buf && gv_cuda_check(cudaFree(d_buf), "freeing PRP data") != 0)
+        rc = -1;
+    if (m_buf && gv_cuda_check(cudaFree(m_buf), "freeing PRP metadata") != 0)
+        rc = -1;
+    if (p_buf && gv_cuda_check(cudaFree(p_buf), "freeing PRP results") != 0)
+        rc = -1;
+    free(d_host);
+    free(m_host);
+    free(p_host);
+    return rc;
+}
+
 /*
  * Batch strong PRP base 2. Splits candidates into limb buckets and runs
  * one templated kernel launch per bucket. pass_out[i]: 1 pass / 0 composite
@@ -132,15 +212,23 @@ static void gv_mont_prepare(mpz_t n, int bucket, gv_mont_params *p,
  */
 int gv_gpu_prp_batch(mpz_t *nums, int count, uint8_t *pass_out)
 {
+    if (count < 0 || (count > 0 && (!nums || !pass_out))) {
+        fprintf(stderr, "gpuverify: invalid GPU batch\n");
+        return -1;
+    }
+    if (count == 0)
+        return 0;
     if (gv_gpu_init() != 0)
         return -1;
 
+    int maxb = 0, rc = -1;
     gv_mont_params *par = (gv_mont_params *)calloc((size_t)count, sizeof(*par));
     uint32_t **data = (uint32_t **)calloc((size_t)count, sizeof(*data));
     uint32_t *meta = (uint32_t *)malloc((size_t)count * 4 * sizeof(uint32_t));
-    if (!par || !data || !meta)
-        gv_die("out of memory");
-    int maxb = 0;
+    if (!par || !data || !meta) {
+        fprintf(stderr, "gpuverify: out of memory preparing primality tests\n");
+        goto cleanup;
+    }
 
     for (int i = 0; i < count; i++) {
         if (mpz_cmp_ui(nums[i], 3) < 0) {
@@ -161,11 +249,16 @@ int gv_gpu_prp_batch(mpz_t *nums, int count, uint8_t *pass_out)
             b <<= 1;
         par[i].bucket = b;
         data[i] = (uint32_t *)malloc((size_t)b * 5 * sizeof(uint32_t));
+        if (!data[i]) {
+            fprintf(stderr, "gpuverify: out of memory preparing candidate\n");
+            goto cleanup;
+        }
         gv_mont_prepare(nums[i], b, &par[i], data[i]);
-        meta[i * 4 + 0] = (uint32_t)par[i].L;
-        meta[i * 4 + 1] = (uint32_t)par[i].s;
-        meta[i * 4 + 2] = (uint32_t)par[i].bl;
-        meta[i * 4 + 3] = par[i].np0;
+        size_t pos = (size_t)i * 4;
+        meta[pos + 0] = (uint32_t)par[i].L;
+        meta[pos + 1] = (uint32_t)par[i].s;
+        meta[pos + 2] = (uint32_t)par[i].bl;
+        meta[pos + 3] = par[i].np0;
         if (b > maxb)
             maxb = b;
     }
@@ -178,60 +271,20 @@ int gv_gpu_prp_batch(mpz_t *nums, int count, uint8_t *pass_out)
         if (n_cand == 0)
             continue;
 
-        size_t bytes = (size_t)n_cand * (size_t)bucket * 5 * sizeof(uint32_t);
-        uint32_t *d_host = (uint32_t *)malloc(bytes);
-        uint32_t *m_host = (uint32_t *)malloc((size_t)n_cand * 4 * sizeof(uint32_t));
-        uint8_t *p_host = (uint8_t *)malloc((size_t)n_cand);
-        uint32_t *d_buf, *m_buf;
-        uint8_t *p_buf;
-        cudaMalloc(&d_buf, bytes);
-        cudaMalloc(&m_buf, (size_t)n_cand * 4 * sizeof(uint32_t));
-        cudaMalloc(&p_buf, (size_t)n_cand);
-
-        int k = 0;
-        for (int i = 0; i < count; i++) {
-            if (par[i].bucket != bucket)
-                continue;
-            memcpy(d_host + (size_t)k * (size_t)bucket * 5, data[i],
-                   (size_t)bucket * 5 * sizeof(uint32_t));
-            memcpy(m_host + (size_t)k * 4, meta + (size_t)i * 4,
-                   4 * sizeof(uint32_t));
-            k++;
-        }
-        cudaMemcpy(d_buf, d_host, bytes, cudaMemcpyHostToDevice);
-        cudaMemcpy(m_buf, m_host, (size_t)n_cand * 4 * sizeof(uint32_t),
-                   cudaMemcpyHostToDevice);
-
-        cudaError_t e = gv_launch_prp_bucket(bucket, d_buf, m_buf, p_buf,
-                                             n_cand, g_stream);
-        if (e != cudaSuccess) {
-            fprintf(stderr, "gpuverify: PRP launch failed: %s\n",
-                    cudaGetErrorString(e));
-            return -1;
-        }
-        cudaDeviceSynchronize();
-        cudaMemcpy(p_host, p_buf, (size_t)n_cand, cudaMemcpyDeviceToHost);
-        cudaStreamSynchronize(g_stream);
-
-        k = 0;
-        for (int i = 0; i < count; i++)
-            if (par[i].bucket == bucket)
-                pass_out[i] = p_host[k++];
-
-        cudaFree(d_buf);
-        cudaFree(m_buf);
-        cudaFree(p_buf);
-        free(d_host);
-        free(m_host);
-        free(p_host);
+        if (gv_run_prp_bucket(bucket, n_cand, count, par, data, meta,
+                              pass_out) != 0)
+            goto cleanup;
     }
 
-    for (int i = 0; i < count; i++)
-        free(data[i]);
+    rc = 0;
+cleanup:
+    if (data)
+        for (int i = 0; i < count; i++)
+            free(data[i]);
     free(data);
     free(par);
     free(meta);
-    return 0;
+    return rc;
 }
 
 /* ---- small-prime list ---- */
@@ -242,26 +295,47 @@ static uint32_t g_pmax = 0;
 
 int gv_get_primes(uint32_t pmax, const uint32_t **primes_out, int *count_out)
 {
-    if (g_primes && pmax <= g_pmax) {
-        *primes_out = g_primes;
-        *count_out = g_nprimes;
+    if (pmax < 2) {
+        *primes_out = NULL;
+        *count_out = 0;
         return 0;
     }
-    uint32_t size = (pmax + 63) / 64;
+    if (g_primes && pmax <= g_pmax) {
+        int count = 0;
+        while (count < g_nprimes && g_primes[count] <= pmax)
+            count++;
+        *primes_out = g_primes;
+        *count_out = count;
+        return 0;
+    }
+    size_t size = ((size_t)pmax >> 6) + 1;
     uint64_t *bits = (uint64_t *)calloc(size, sizeof(uint64_t));
-    uint32_t cap = pmax > 1000 ? pmax / 10 + 100 : 200;
+    size_t cap = pmax > 1000 ? (size_t)pmax / 10 + 100 : 200;
     uint32_t *pr = (uint32_t *)malloc(cap * sizeof(uint32_t));
+    if (!bits || !pr) {
+        fprintf(stderr, "gpuverify: out of memory generating sieve primes\n");
+        free(bits);
+        free(pr);
+        return -1;
+    }
     int np = 0;
     pr[np++] = 2;
-    for (uint32_t q = 3; q <= pmax; q += 2) {
+    for (uint64_t q = 3; q <= pmax; q += 2) {
         if (!(bits[q >> 6] & (1ULL << (q & 63)))) {
-            if (np >= (int)cap) {
+            if ((size_t)np >= cap) {
                 cap *= 2;
-                pr = (uint32_t *)realloc(pr, cap * sizeof(uint32_t));
+                uint32_t *grown = (uint32_t *)realloc(pr, cap * sizeof(uint32_t));
+                if (!grown) {
+                    fprintf(stderr, "gpuverify: out of memory growing prime list\n");
+                    free(bits);
+                    free(pr);
+                    return -1;
+                }
+                pr = grown;
             }
-            pr[np++] = q;
-            if ((uint64_t)q * q <= pmax)
-                for (uint64_t m = (uint64_t)q * q; m <= pmax; m += 2 * q)
+            pr[np++] = (uint32_t)q;
+            if (q * q <= pmax)
+                for (uint64_t m = q * q; m <= pmax; m += 2 * q)
                     bits[m >> 6] |= 1ULL << (m & 63);
         }
     }
@@ -280,24 +354,41 @@ int gv_get_primes(uint32_t pmax, const uint32_t **primes_out, int *count_out)
 int gv_gpu_sieve_gap(mpz_t N, uint64_t gap, uint32_t pmax,
                      uint8_t **marks_out, uint64_t *half_gap_out)
 {
+    if (!marks_out || !half_gap_out) {
+        fprintf(stderr, "gpuverify: invalid sieve output pointers\n");
+        return -1;
+    }
+    *marks_out = NULL;
+    *half_gap_out = 0;
     if (gv_gpu_init() != 0)
         return -1;
 
     /* interior candidates: N+k for even k in [2, gap-2] -> gap/2 - 1 */
-    if (gap < 4) {
-        *marks_out = NULL;
-        *half_gap_out = 0;
+    if (gap < 4)
         return 0;
-    }
-    uint64_t half = gap / 2 - 1;
 
-    const uint32_t *primes;
-    int nprimes;
-    gv_get_primes(pmax, &primes, &nprimes);
+    uint64_t half = gap / 2 - 1;
+    const uint32_t *primes = NULL;
+    int nprimes = 0, rc = -1;
+    uint64_t *starts = NULL, *d_starts = NULL;
+    uint32_t *d_primes = NULL;
+    uint8_t *marks = NULL, *d_marks = NULL;
+    mpz_t tmp;
+    if ((half + 255) / 256 > INT_MAX) {
+        fprintf(stderr, "gpuverify: interval exceeds GPU sieve grid limit\n");
+        return -1;
+    }
+    if (gv_get_primes(pmax, &primes, &nprimes) != 0)
+        return -1;
 
     /* per-prime first even k with N+k == 0 (mod p), skipping N+k == p */
-    uint64_t *starts = (uint64_t *)malloc((size_t)nprimes * sizeof(uint64_t));
-    mpz_t tmp;
+    if (nprimes) {
+        starts = (uint64_t *)malloc((size_t)nprimes * sizeof(uint64_t));
+        if (!starts) {
+            fprintf(stderr, "gpuverify: out of memory preparing sieve\n");
+            return -1;
+        }
+    }
     mpz_init(tmp);
     for (int i = 0; i < nprimes; i++) {
         uint32_t p = primes[i];
@@ -321,38 +412,60 @@ int gv_gpu_sieve_gap(mpz_t N, uint64_t gap, uint32_t pmax,
     }
     mpz_clear(tmp);
 
-    uint8_t *d_marks;
-    uint64_t *d_starts;
-    uint32_t *d_primes;
-    cudaMalloc(&d_marks, half);
-    cudaMalloc(&d_starts, (size_t)nprimes * sizeof(uint64_t));
-    cudaMalloc(&d_primes, (size_t)nprimes * sizeof(uint32_t));
-    cudaMemcpy(d_starts, starts, (size_t)nprimes * sizeof(uint64_t),
-               cudaMemcpyHostToDevice);
-    cudaMemcpy(d_primes, primes, (size_t)nprimes * sizeof(uint32_t),
-               cudaMemcpyHostToDevice);
+    if (gv_cuda_check(cudaMalloc(&d_marks, (size_t)half),
+                      "allocating GPU sieve marks") != 0)
+        goto cleanup;
+    if (nprimes &&
+        (gv_cuda_check(cudaMalloc(&d_starts, (size_t)nprimes * sizeof(uint64_t)),
+                       "allocating GPU sieve offsets") != 0 ||
+         gv_cuda_check(cudaMalloc(&d_primes, (size_t)nprimes * sizeof(uint32_t)),
+                       "allocating GPU sieve primes") != 0 ||
+         gv_cuda_check(cudaMemcpy(d_starts, starts,
+                                  (size_t)nprimes * sizeof(uint64_t),
+                                  cudaMemcpyHostToDevice),
+                       "copying sieve offsets to GPU") != 0 ||
+         gv_cuda_check(cudaMemcpy(d_primes, primes,
+                                  (size_t)nprimes * sizeof(uint32_t),
+                                  cudaMemcpyHostToDevice),
+                       "copying sieve primes to GPU") != 0))
+        goto cleanup;
 
     launch_marks_clear(d_marks, half);
-    launch_sieve(d_marks, d_starts, d_primes, gap, nprimes);
-    cudaDeviceSynchronize();
-
-    uint8_t *marks = (uint8_t *)malloc(half);
-    cudaMemcpy(marks, d_marks, half, cudaMemcpyDeviceToHost);
-    cudaError_t e = cudaGetLastError();
-    if (e != cudaSuccess) {
-        fprintf(stderr, "gpuverify: sieve failed: %s\n", cudaGetErrorString(e));
-        free(marks);
-        return -1;
+    if (gv_cuda_check(cudaGetLastError(), "launching sieve initialization") != 0)
+        goto cleanup;
+    if (nprimes) {
+        launch_sieve(d_marks, d_starts, d_primes, gap, nprimes);
+        if (gv_cuda_check(cudaGetLastError(), "launching sieve") != 0)
+            goto cleanup;
     }
+    if (gv_cuda_check(cudaDeviceSynchronize(), "running sieve") != 0)
+        goto cleanup;
+    marks = (uint8_t *)malloc((size_t)half);
+    if (!marks) {
+        fprintf(stderr, "gpuverify: out of memory reading sieve marks\n");
+        goto cleanup;
+    }
+    if (gv_cuda_check(cudaMemcpy(marks, d_marks, (size_t)half,
+                                 cudaMemcpyDeviceToHost),
+                      "copying sieve marks from GPU") != 0)
+        goto cleanup;
+    rc = 0;
 
-    cudaFree(d_marks);
-    cudaFree(d_starts);
-    cudaFree(d_primes);
+cleanup:
+    if (d_marks && gv_cuda_check(cudaFree(d_marks), "freeing sieve marks") != 0)
+        rc = -1;
+    if (d_starts && gv_cuda_check(cudaFree(d_starts), "freeing sieve offsets") != 0)
+        rc = -1;
+    if (d_primes && gv_cuda_check(cudaFree(d_primes), "freeing sieve primes") != 0)
+        rc = -1;
     free(starts);
-
-    *marks_out = marks;
-    *half_gap_out = half;
-    return 0;
+    if (rc == 0) {
+        *marks_out = marks;
+        *half_gap_out = half;
+    } else {
+        free(marks);
+    }
+    return rc;
 }
 
 /* ---- CPU BPSW / reference ---- */

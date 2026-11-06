@@ -26,21 +26,28 @@ Verdict semantics:
 
 | verdict | meaning |
 | --- | --- |
-| `VALID` | both endpoints BPSW-prime, no prime between (GPU interval scan) |
+| `VALID` | both endpoints BPSW-probable-prime, no BPSW-probable-prime between |
 | `INVALID (endpoint composite)` | proven composite (base-2 witness or Lucas) |
 | `INVALID (prime between)` | a prime strictly inside the gap (witness printed) |
+| `UNVERIFIED` | the requested interval was not checked |
+| `ERROR` | verification could not complete because an operation failed |
 
 A failing strong base-2 test is a proof of compositeness; a passing one is
 confirmed with GMP 6.3's `mpz_probab_prime_p(n, 1)`, which includes the
 strong Lucas test (BPSW). Prime verdicts are therefore BPSW probable
-primes — the same standard used for the Payne-row audit.
+primes — the same standard used for the Payne-row audit. `verify` exits with
+0 for `VALID`, 1 for a composite endpoint, 2 for a prime between, 3 for a
+parse error, 4 for an incomplete check, and 5 for an operational error.
+On a CUDA failure the program reports an error, never `VALID`.
+The GPU `selftest` and `bench` commands also return a nonzero exit on failure.
 
 ## Build
 
 ```
 cd GpuVerify
 make            # -> bin/gpuverify, RTX 3070 (sm_86); override with ARCH=sm_XX
-make test       # selftest (no DB needed)
+make test       # GPU selftest and CLI failure-path tests (no DB needed)
+make test-cli   # CLI CPU/GPU and fault-injection tests
 make test-parser
 ```
 
@@ -59,6 +66,9 @@ Requirements: CUDA toolkit (nvcc 12.x), GMP dev (`libgmp-dev`), Linux.
 ./bin/gpuverify sweep --db allgaps.sql --min-digits 400 --max-digits 9864 \
     --out sweep.log
 
+# full CPU-only check, including the interval
+./bin/gpuverify verify --expr 101 --gap 2 --cpu
+
 # throughput measurement
 ./bin/gpuverify bench --bits 4096 --count 5000
 ```
@@ -71,12 +81,19 @@ Flags (see also `--help`):
 | `--gap G` | – | gap size (verify) |
 | `--db FILE` | – | allgaps.sql for sweep |
 | `--min-digits` / `--max-digits` | 0 / 0 | row filter |
-| `--with-interval` | off | also sieve + PRP the gap interval in sweep |
-| `--pmax P` | 1048576 | largest sieving prime for interval scans |
+| `--with-interval` | off | also check the gap interval in sweep |
+| `--pmax P` | 1048576 | largest sieving prime for GPU interval scans; unused with `--cpu` |
 | `--limit K` / `--skip K` | 0 / 0 | process rows [skip, skip+limit) |
-| `--cpu` | off | skip the GPU, BPSW-only |
+| `--cpu` | off | skip the GPU; use GMP BPSW for endpoints and requested intervals |
 | `--cpu-max-digits D` | 200000 | CPU rows above D digits are skipped |
 | `--out LOG` | stdout | sweep failure log |
+
+`--cpu` checks every odd interior candidate with GMP; it may be much slower
+than the GPU sieve. A sweep returns 0 when all selected rows were processed,
+including rows correctly identified as invalid, 4 when any selected row was
+skipped or could not be fully checked, and 5 on an operational failure.
+Its `interval_skipped` and `errors` counters report incomplete and failed
+intervals; neither is included in `ok`.
 
 ## Design
 
@@ -92,11 +109,15 @@ src/
 tests/
   test_mont.cu     GPU-vs-GMP cross-check (7,850 random cases, all sizes)
   test_parse.c     full-DB parse check (123,902/123,902, digits verified)
+  test_cli.sh      CLI CPU/GPU, incomplete-check, and failure-path tests
+  mock_gpu.c       deterministic GPU failure test double
 data/bench_results.txt  measured throughput and sweep projection
 ```
 
 * Numbers up to 32768 bits (≈9,864 digits) run on the GPU in limb buckets
-  (16..1024 limbs, zero-padded); larger numbers fall back to CPU BPSW.
+  (16..1024 limbs, zero-padded); larger endpoints fall back to CPU BPSW.
+  Without `--cpu`, a requested interval above that limit is reported as
+  `UNVERIFIED`; explicitly use `--cpu` to scan it on the CPU.
 * Montgomery constants (`R`, `mont(2)`, `mont(N-1)`, `mont(1)`, `np0`) are
   derived with GMP per candidate; the kernel reads the exponent bits of
   `d = (N-1)/2^s` straight from the modulus.
@@ -123,9 +144,10 @@ Projected full-DB endpoint sweep (94,911 rows, 400..9,864 digits):
   memory). The highest-leverage optimization is a TPI-style
   warp-per-candidate CIOS like the miner's `tools/mr128_kernel.cuh`
   (expected 10–100× in the top bucket).
-* Rows > 9,864 digits (16,110 of them) are CPU BPSW only; interval scans
-  are skipped there (survivor PRPs would take days). `--cpu-max-digits`
-  guards the tail (largest row: 385,713 digits).
+* Rows > 9,864 digits (16,110 of them) are CPU BPSW only; by default their
+  requested intervals are reported as skipped, not valid. Explicit `--cpu`
+  interval scans can be extremely slow. `--cpu-max-digits` guards the tail
+  (largest row: 385,713 digits).
 * The sweep is single-GPU, single-stream; multi-GPU would scale linearly.
 
 ## Validation log

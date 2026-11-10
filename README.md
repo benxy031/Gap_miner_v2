@@ -105,6 +105,204 @@ For comparison, prefix the monolithic scanner command with
 range prints a warning and falls back to magnitude dispatch; the split/DLL
 scanner always uses magnitude dispatch.
 
+### Standalone pseudoprime hunt
+
+`scripts/psp_hunt.py` searches for base-2 Fermat pseudoprimes independently of
+gapminer and Phase-0. It uses Python 3 and `gmpy2` on POSIX systems; it does not
+start a GPU scanner or submit anything. Results and restart progress are stored
+in the specified SQLite database. Run the same command again to resume; a
+conflicting search configuration is rejected.
+
+The `pairs` subcommand also has an opt-in CUDA backend (`--backend cuda`;
+default `cpu`), which additionally requires NumPy. It batches arithmetic
+progressions rather than transferring every candidate to the GPU. The GPU
+tests `2^(p-1) mod q == 1`; the CPU still proves both factors, checks the full
+Fermat congruence modulo `p*q`, and verifies the entire surrounding gap.
+Euler/Jacobi or strong tests are recorded, **not** used to discard Fermat PSPs.
+This is a semiprime hunter, not a Phase-0 scanner or a change to gapminer's
+mining code.
+
+`pairs --min-gap G` (default `0`, retain every hit) keeps and prints only
+PSPs in gaps of size **at least** G, on either CPU or CUDA. Before constructing
+a full record, the CPU proves a prime on each side of the PSP: if their
+separation is less than G, the containing gap cannot reach G. Such hits skip
+the full interior proof and are not stored or printed as `HIT`. Retained hits
+still receive the original full verification. This does not skip any factor
+progressions or reduce the number of GPU congruence tests.
+
+For filtered searches, `confirmed` still counts all proven PSPs;
+`gap_filtered` counts discarded short-gap PSPs and `retained` is their
+difference. These counters are checkpointed atomically, including batches
+with no retained hits. The positive threshold is part of the database search
+identity: use a new database to enable or change it, and repeat it on resume.
+Unfiltered pre-existing databases remain resumable. Filtered product ranges
+must stay below the deterministic MR12 bound; unprovable bracketing endpoints
+abort the batch rather than silently discarding a candidate.
+
+```bash
+make bin/libpsp_pairs_gpu.so WITH_CUDA=1 CUDA_ARCH=-arch=sm_86
+# Pause any competing GPU campaign before benchmarking/running this backend.
+python3 scripts/psp_hunt.py pairs --backend cuda --device 0 \
+  --batch-size 1048576 --p-start 10002000001 --p-end 10003000001 \
+  --db data/psp_pairs_gpu_next.sqlite3
+# Required GPU regression gate: Brian's 61 published >=800-gap PSPs.
+make test-psp-gpu WITH_CUDA=1
+# GMP/CUDA equality and median filter timing on Brian-derived progressions.
+python3 scripts/psp_gpu_bench.py --count 1048576 --repeats 3
+# Brian's entire 10^7-rough 21-digit range, retaining only gaps >=800.
+# The maximum CUDA batch reduces checkpoint overhead in the small-p region.
+python3 -u scripts/psp_hunt.py pairs --backend cuda --device 0 \
+  --start 1e20 --end 1e21 --factor-floor 10000000 \
+  --p-start 10000001 --p-end 31622776602 --min-gap 800 \
+  --batch-size 16777216 --db data/psp_brian_1e20_1e21_g800.sqlite3 \
+  >> data/psp_brian_1e20_1e21_g800.out 2>&1
+python3 scripts/psp_hunt.py show \
+  --db data/psp_brian_1e20_1e21_g800.sqlite3 --limit 0
+```
+
+Repeat the same search command to resume after Ctrl-C or SIGTERM; keep the
+terminal/session open while it runs. Brian published 61 PSPs with gaps >=800;
+two gaps are exactly 800, so use `--min-gap 802` for strictly greater than 800.
+Compare the individual results, not just their count. Only a completed full
+factor-range traversal covers this entire rough-composite interval: below
+`1e21`, three factors each greater than `1e7` are impossible.
+
+CUDA requires odd factors `p,q < 2^63`; unsupported ranges fail explicitly,
+with no CPU fallback. `--device` defaults to `0`; `--gpu-library` defaults to
+`bin/libpsp_pairs_gpu.so` relative to the repository. `--batch-size` keeps its
+existing default `10000`, but `1048576` is recommended for GPU throughput;
+the CUDA limit is `16777216`. Batch telemetry reports `q_tested`,
+`filter_passers`, `kernel_ms`, and `batch_seconds` (including CPU scheduling
+and verification). Since 2026-11-09 the CUDA backend enumerates `p` and the
+exact order of 2 mod `p` with one segmented numpy sieve per `2^21` interval
+(`prime_orders`) instead of per-`p` `next_prime` plus Python trial division of
+`p-1`; orders, stats and records are identical to the CPU backend (pilot near
+`p=2.6e10`: 208339 `p`, 3374 confirmed), and at `p~2.6e10` a batch size of
+1048576 fell from ~130 s to ~13 s. The CUDA scheduler retains at most one
+prime-order segment in memory across checkpoint batches instead of
+recalculating its unconsumed portion. The cache is derived state, discarded
+on exit and rebuilt from the checkpoint on resume; search coverage, checks and
+defaults are unchanged. The speedup depends on how often batches share a
+segment. The segmented sieve also supports the smallest valid factor `p=3`,
+even when its sieving prime table is empty. Device/library/backend choices are
+not part of the search identity: a CPU checkpoint can be resumed on CUDA, and
+vice versa, without changing the interval or skipping candidates. CUDA
+failures do not commit the unfinished batch. This tool never stops or restarts
+another campaign itself.
+On the dev RTX 3070 (CUDA 12.4), three end-to-end CLI runs per case, including
+startup, SQLite checkpoints and verification, had these median times before
+and after segment reuse. All used `--start 1e20 --end 1e21
+--factor-floor 10000000 --min-gap 800`:
+
+| Workload | Batch | Before | After | Speedup |
+|---|---:|---:|---:|---:|
+| `p=[26000000001,26000500001)`, full slice | 10000 | 1.51 s | 0.61 s | 2.5x |
+| `p=[10000001,31622776602)`, first 5 batches | 16777216 | 1.37 s | 0.70 s | 2.0x |
+| `p=[650967613,650977613)`, full slice | 1048576 | 0.377 s | 0.356 s | 1.06x |
+
+These are bounded samples, not a whole-campaign forecast; little or no gain is
+expected when a segment is consumed within one batch, and short runs are
+sensitive to startup and timing noise. To reproduce the first case, use a free
+GPU and a new database:
+
+```bash
+python3 scripts/psp_hunt.py pairs --backend cuda --start 1e20 --end 1e21 \
+  --factor-floor 10000000 --p-start 26000000001 --p-end 26000500001 \
+  --min-gap 800 --batch-size 10000 --db data/psp_cache_example.sqlite3
+# Smallest-factor control; --min-gap defaults to 0.
+python3 scripts/psp_hunt.py pairs --backend cuda --start 3 --end 100 \
+  --factor-floor 2 --p-start 3 --p-end 4 --db data/psp_p3_example.sqlite3
+```
+
+`psp_gpu_bench.py` defaults to `--count 1048576`, `--repeats 3`, `--device 0`,
+and the same `--gpu-library`. It prints JSON with equality-checked filter
+timings (kernel and transfers separately) and a bounded CPU/GPU full-hunt
+comparison near Brian's smallest published factor; it does not write a search
+checkpoint or predict whole-range runtime.
+
+Measured on the dev RTX 3070 (2026-11-07, CUDA 12.4, median of three runs),
+with every returned index compared against scalar GMP:
+
+| workload | CPU | CUDA | speedup |
+|---|---:|---:|---:|
+| 1,048,576 candidates per Brian-derived progression (three factor sizes) | 2.35-2.57 million q/s | 2.21-2.39 billion q/s including filter transfers | 929-941x |
+| Full hunt in `[1e20,1e21)`, `p=[650967613,650977613)`: 6,450,178 q-tests, 246 PSPs | 2.997 s | 0.098 s | 30.6x |
+
+For a positive `pairs --min-gap`, CUDA telemetry also includes
+`gap_filtered` for that batch; progress and `show` additionally report the
+cumulative `retained` and `gap_filtered` counts. The unfiltered output format
+is unchanged.
+
+The filter ratio is **not** a whole-search speedup. CPU prime generation,
+factoring `p-1`, computing orders and proving gaps can dominate at larger `p`.
+All 61 Brian >=800-gap controls were recovered with identical factors/gaps
+(including the 24 that fail Euler/Jacobi); the CPU/CUDA threshold gates test
+both 800 and 802, and Brian's four published short-gap examples are discarded
+without constructing full records. CUDA memcheck reported zero errors.
+The output buffer is sized for every candidate, so a dense batch cannot
+silently drop hits. At most 1,048,576 progression descriptors are scheduled per
+launch; reaching that limit commits the processed prefix and continues normally.
+
+```bash
+# Search a bounded smaller-factor slice beyond 10^21.
+python3 scripts/psp_hunt.py pairs --p-start 10000000001 --p-end 10000003001 \
+  --db data/psp_pairs.sqlite3
+# Continue with the next factor slice in a separate database.
+python3 scripts/psp_hunt.py pairs --p-start 10000003001 --p-end 10000006001 \
+  --db data/psp_pairs_next.sqlite3
+# Show the largest confirmed gaps; an unfiltered search keeps all hits.
+python3 scripts/psp_hunt.py show --db data/psp_pairs.sqlite3 --min-gap 100
+# Search a three-factor Carmichael family, also beyond 10^21.
+python3 scripts/psp_hunt.py chernick --k-end 1670000 \
+  --db data/psp_chernick.sqlite3
+# Generic interval check, here on BrianK's known gap-956 pseudoprime.
+python3 scripts/psp_hunt.py scan --start 160696461657079906273 \
+  --end 160696461657079906274 --db data/psp_control.sqlite3
+```
+
+| option | effective default | meaning |
+|---|---|---|
+| `pairs`, `scan`, `chernick`, `show` | required subcommand | semiprime-factor slice, all-factor interval, Chernick family, or stored results |
+| `--db FILE` | required | SQLite results and checkpoint; one configuration per file |
+| `--start N` | `1e21` (`pairs`, `scan`) | inclusive product/interval start; exact decimal or decimal scientific notation |
+| `--end N` | `2e21` (`pairs`); required (`scan`) | exclusive product/interval end |
+| `--p-start P`, `--p-end P` | required (`pairs`) | inclusive/exclusive bounds for the smaller prime factor |
+| `--k-start K`, `--k-end K` | `1666667`; required (`chernick`) | inclusive/exclusive bounds for the family parameter |
+| `--factor-floor D` | `10000000` | all prime factors of a confirmed hit are strictly greater than D |
+| `--batch-size N` | `10000` (`pairs`, `chernick`); `100000` (`scan`) | checkpoint work size: factor comparisons and completed factors / parameters / interval positions |
+| `--max-batches N` | `0` (no extra limit) | pause after N committed batches; resume with the same search settings |
+| `--min-gap G` (`pairs`) | `0` (retain every hit) | retain/print only PSPs whose proven surrounding gap is >= G; positive G is fixed for that database |
+| `--min-gap G`, `--limit N`, `--status S` | `0`, `20`, `confirmed` (`show`) | filter displayed gaps, limit rows (`0` means all), and select `confirmed`, `pending`, or `all` |
+
+`pairs` is complete only for semiprimes in the stated factor slice and product
+interval; it includes prime squares. The example is a small slice, not all
+semiprimes above `10^21`. For complete semiprime coverage in `[1e21, 2e21)`,
+the contiguous smaller-factor slices must cover
+`[10000001, 44721359550)` with the default floor. `--p-start` must exceed
+`--factor-floor`; advancing to another slice requires a new database.
+`chernick` covers only `(6k+1)(12k+1)(18k+1)` with proven prime factors.
+Neither covers all composites above `10^21`: three or more large prime factors
+become possible there. `scan` checks all eligible odd numbers in its stated
+interval, irrespective of factor count, but is much slower.
+
+The prime-factor table is capped at `25000000`: this limits `scan`'s
+`--factor-floor` and the table needed to factor `p-1` in `pairs`. `pairs` and
+`chernick` reject ranges whose factor primality cannot be proven below the
+exclusive MR12 bound `318665857834031151167461` (the first 12 prime
+Miller-Rabin bases; [Sorenson and Webster](https://arxiv.org/abs/1509.00864)).
+`scan` retains unresolved Fermat passers at or above that bound as `pending`.
+Surrounding gaps below the bound are checked across their entire interior and
+labelled `proven_mr12`; outside it they are labelled `probable_gmp`. Confirmed
+JSON results include the Fermat, Euler/Jacobi and strong-base-2 outcomes,
+factorization or a compositeness witness, and the surrounding gap.
+
+Each checkpoint commits progress and results together; Ctrl-C or SIGTERM
+stops without restarting a campaign, and the same search settings resume from
+the last checkpoint. A changed batch size or batch limit is allowed. An
+incomplete run or unresolved candidates returns exit code 4, invalid input or
+database errors return 2, and an interrupt returns 130 or 143. The tool does
+not claim that a hit is new.
+
 ## Two search modes
 
 - **Non-CRT** (default) — workers scan fixed windows of adders materialized
@@ -470,21 +668,19 @@ scripts/records_report.py --source pool --plot
                                      # the text report prints sigma_nat, the
                                      # covering gain (xG at merit 28/40) and a
                                      # "vs nature" threshold table: the
-                                     # observed tail should sit ABOVE the
-                                     # natural line, and matching it means the
-                                     # cover adds nothing at that size.
+                                     # observed tail is compared with the
+                                     # natural reference; this is descriptive,
+                                     # not a controlled cover-gain test.
                                      #
-                                     # Since 2026-10-27 the estimates are
+                                     # The estimates are
                                      # labelled by what they rest on:
                                      #   rate       -> exact Poisson (Garwood)
                                      #                 interval, not normal
-                                     #   cover gain -> printed twice: MODEL
-                                     #                 (from the fitted sigma)
-                                     #                 and COUNTED (obs vs the
-                                     #                 HL natural law). Quote
-                                     #                 COUNTED: the fit
-                                     #                 absorbs most of the
-                                     #                 cover effect.
+                                     #   vs HL      -> MODEL and COUNTED
+                                     #                 comparisons use the same
+                                     #                 conditional tail anchor;
+                                     #                 neither alone proves a
+                                     #                 causal cover gain.
                                      #   deep scale -> sigma re-read at the
                                      #                 DEEPEST threshold that
                                      #                 still carries counts, with
@@ -493,6 +689,15 @@ scripts/records_report.py --source pool --plot
                                      #                 report says "not
                                      #                 resolvable" and keeps the
                                      #                 global value.
+                                     #   merit tail -> conditional on the
+                                     #                 highest logged template
+                                     #                 target; target coverage
+                                     #                 and drift are shown.
+                                     #                 A shape mismatch is not
+                                     #                 proof of missed
+                                     #                 candidates, since the log
+                                     #                 has no eligible-work
+                                     #                 denominator.
                                      #   records    -> counted per DISTINCT
                                      #                 gap length (the site takes
                                      #                 one per length), with rows
@@ -771,6 +976,65 @@ gap whose both endpoints are BPSW-verified and whose merit is at least
 (the prime-gap community convention, matching external verifiers) — NOT the
 miner's nominal `gap / ln(2^(256+shift))` protocol merit.
 
+`GAP_HUNT_CENTER=1` enables an experimental center-first chain. It finds the
+nearest MR2-positive candidates on both sides of the CRT target's midpoint,
+then searches both outer regions for qualifying gaps. It is **off by default**
+and retains the same MR2-fence and endpoint-BPSW limitations as jump2; it is
+not a proof of primality or a guarantee of higher throughput. It requires the
+default jump2 mode, with serial jump and quarter-class modes disabled. Only
+`0` and `1` are accepted; incompatible settings are rejected before walking.
+An exhausted pair capacity stops the walk with an error and, when a state
+file is configured, checkpoints the first unprocessed flight. After rebuilding
+the CUDA/CGBN binary, for example:
+
+```bash
+make WITH_CUDA=1 WITH_CGBN_FERMAT=1 bin/gapminer
+GAP_HUNT_CENTER=1 GAP_HUNT_KMAX=1024 ./bin/gapminer --gap-hunt \
+    --crt-file data/crt/m23/shift507_p74_lex_m30.txt \
+    --gap-hunt-state /tmp/gap_hunt_center.state \
+    --gap-hunt-out /tmp/gap_hunt_center.txt
+```
+
+The walk banner reports `center=0` or `center=1`. With
+`GAP_HUNT_TIMING=1`, the center chain's `ff` counts both searches for the
+nearest center fences, `jb` counts the outer jump searches in both directions,
+and `fe` counts their endpoint searches. The `tests/window` total counts actual
+MR tests; it is not an estimate of GPU speed. Timing is off by default and
+adds measurement overhead. For example, a longer run can display its periodic
+timing counters:
+
+```bash
+GAP_HUNT_CENTER=1 GAP_HUNT_TIMING=1 GAP_HUNT_KMAX=65536 \
+    ./bin/gapminer --gap-hunt --crt-file data/crt/m23/shift507_p74_lex_m30.txt \
+    --gap-hunt-state /tmp/gap_hunt_center_timing.state \
+    --gap-hunt-out /tmp/gap_hunt_center_timing.txt
+```
+
+On the dev RTX 3070 (2026-11-09, CGBN, batch 1024, chunk 16, wave 8,
+timing instrumentation off), matched `k` ranges were run in ABBA order:
+
+| Cover / threshold / sieve | Windows | Default jump2, win/s | Center, win/s | Mean change | Equal records |
+|---|---:|---:|---:|---:|---:|
+| shift507 / merit 16 / 2M | 131072 | 7821.3, 7761.2 | 7397.0, 7429.2 | -4.9% | 15 |
+| shift1784 / merit 20 / 32M | 8192 | 390.0, 388.4 | 393.6, 394.6 | +1.3% | 1 |
+
+The small wide-cover gain needs replication and is not a general speedup.
+Separate instrumented runs over the first 8192 windows counted 178.0 versus
+191.7 MR tests/window at shift507 and 267.1 versus 267.7 at shift1784 (default
+versus center). The previously simulated center-only count omitted the
+necessary searches on both sides and is not the measured cost of this mode.
+A separate exploratory shift507 sweep over 65536 windows tried six chunk/wave
+combinations once each: center reached 6861-7276 win/s versus 7713-7774 for
+the two bracketing default controls, with the same eight records in every run.
+This was not an exhaustive parameter search.
+
+The CPU state-machine oracle is part of `make test`; on a CUDA/CGBN machine,
+`make WITH_CUDA=1 WITH_CGBN_FERMAT=1 test-gap-hunt-center` also checks
+full-scan/jump2/center output parity, resume, option validation and safe
+checkpointing across 320-, 640- and 2048-bit CGBN widths. To leave the normal
+build untouched, pass isolated paths, for example
+`make WITH_CUDA=1 WITH_CGBN_FERMAT=1 BUILD_DIR=/tmp/gh-build BIN_DIR=/tmp/gh-bin test-gap-hunt-center`.
+
 Windows are `P` apart (not contiguous), so gaps are chained only within a
 window; the first prime of each window is skipped for gap measurement
 (unknown predecessor).  Windows accumulate into **K=1024 async MR batches**
@@ -1010,6 +1274,7 @@ Verified: default K=2048 at shift507 with 2 workers (11.8k win/s) and with 3 wor
 | `GAPMINER_CPU_LIMBS` | off | Use the ported fixed-limb Montgomery Fermat/Euler path instead of GMP `mpz_powm` for the CPU-only Euler filter (slower than GMP 6 on the dev host; opt-in for hosts without GMP's tuned asm) |
 | `GAPMINER_CPU_WINDOW_OVERRIDE` | `4` | Force the CPU limb path's exponentiation window width (`3`, `4` or `5`; `4` is the specialized default) |
 | `GAPMINER_CPU_WINDOW_LOG` | off | Log the selected window width once per limb count (diagnostic) |
+| `GAP_HUNT_CENTER` | `0` (off) | Experimental center-first bidirectional jump2 chain. `1` enables it; it searches both flanks and the center gap, uses the existing MR2 fence semantics and remains subject to their pseudoprime limitation. Requires `GAP_HUNT_JUMP2=1`, `GAP_HUNT_JUMP=0`, and `GAP_HUNT_QUARTER=0`. The walk banner reports `center=0` or `center=1`. Example: `GAP_HUNT_CENTER=1 GAP_HUNT_KMAX=1024 ./bin/gapminer --gap-hunt --crt-file data/crt/m23/shift507_p74_lex_m30.txt --gap-hunt-state /tmp/center.state --gap-hunt-out /tmp/center.txt` |
 | `GHDBG_DUMP_K` | none | Bounded per-window dump for hunting a lost record: writes EVERY candidate (index, offset, MR verdict) of windows `<k>` .. `<k>+GHDBG_DUMP_RANGE-1` plus the prime offsets to `GHDBG_DUMP_FILE` (default `/tmp/ghdump_<k>.txt`), hard-capped at 300000 lines PER WINDOW (raised from 40000 when ranges were added; the file is opened append-per-window, so delete it before a run). It is how a missing gap is diagnosed (endpoint absent vs present-with-wrong-flag vs present-but-unpaired). **Gotcha (2026-10-03): the hook lives in the full-scan batch path, so with the default `GAP_HUNT_JUMP2=1` it never fires** — dump with `GAP_HUNT_JUMP2=0` (the candidate list and MR verdicts are identical either way; only the resolver differs) |
 | `GHDBG_DUMP_RANGE` | `1` | Number of consecutive windows dumped by `GHDBG_DUMP_K` (2026-10-03). A range > 1 feeds offline chain simulators with a real candidate/verdict corpus; keep it small (30 windows ≈ 56k lines, ~2 MB). Example: `GHDBG_DUMP_K=100 GHDBG_DUMP_RANGE=30 GAP_HUNT_JUMP2=0 ./bin/gapminer --gap-hunt ...` |
 | `GHDBG_DUMP_FILE` | `/tmp/ghdump_<k>.txt` | Destination of the `GHDBG_DUMP_K` dump. There is deliberately **no** "dump every window" mode: an earlier version of it wrote 8.1 GB in one run and took the editor down (`docs/BUILD_HYGIENE_INCIDENT.md`) |
@@ -1450,8 +1715,8 @@ overhead.
 
 `GpuVerify/` is an independent tool (own build, own sources; CUDA + GMP
 only) that re-verifies prime-gap records: BPSW-grade endpoint checks
-batched on the GPU plus a GPU interval sieve proving no prime lies between
-the endpoints. It was built for the prime-gap-list data-quality audit
+batched on the GPU plus a GPU interval sieve and probable-prime checks for
+the interior. It was built for the prime-gap-list data-quality audit
 (issue primegap-list-project/prime-gap-list#38): its parser reads **100%**
 of `allgaps.sql` rows (714 more than `check.py`), and it reproduces the 4
 invalid Payne rows as endpoint-composite / prime-between with witnesses.
@@ -1460,7 +1725,15 @@ invalid Payne rows as endpoint-composite / prime-between with witnesses.
 cd GpuVerify && make            # -> GpuVerify/bin/gpuverify
 ./bin/gpuverify verify --expr "10^19662 - 58727" --gap 161450
 ./bin/gpuverify sweep --db allgaps.sql --min-digits 400 --max-digits 9864
+./bin/gpuverify verify --expr 101 --gap 2 --cpu  # full CPU-only check
 ```
+
+GPU verification is the default; `--cpu` defaults to off and checks the
+endpoints and any requested interval with GMP without using a GPU. Sweep checks
+endpoints only by default; add `--with-interval` for the interval. A CUDA
+or I/O failure yields an error and a nonzero exit, never `VALID`; a requested
+interval that cannot be checked is reported as incomplete. CPU interval
+checks can be slow.
 
 Measured on the idle RTX 3070: 87k PRP/s at 256-bit down to 3 PRP/s at
 8192-bit; the full 94,911-row endpoint sweep (400..9,864 digits) projects

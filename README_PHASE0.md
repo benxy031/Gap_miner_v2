@@ -40,6 +40,10 @@ Current performance (RTX 3070, i3-10100, 8 threads):
 | `scripts/p0_bench.py` | | fixed-range walk-engine bench: runs arms, parses wall/e2e/tests + the GPU-event stage split; `--bin-b` gives the ABBA order; results append to `data/p0_bench_results.txt` |
 | `scripts/phase0_hl_compare.py` | | merit-tail comparison vs HL-1t / HL-4p models (figure) |
 | `scripts/p0_walk_hl_compare.py` | | walk-scan census + first-occurrence comparison vs titanV's HL tables (figure) |
+| `scripts/p0_rec_hl_compare.py` | | record-campaign census + record-yield comparison vs titanV's HL tables at x = 1e32 (figure) |
+| `scripts/hl_validate_tables.py` | | out-of-sample test of titanV's HL tables at three scan scales, and what our data can/cannot improve in them (figure + CSV) |
+| `scripts/psp_probe.py` | | pseudoprime risk of the census: Euler/Jacobi vs strong test on Carmichael numbers, and the surviving-pseudoprime density at a scan scale |
+| `scripts/psp_hunt.py`, `scripts/psp_math.py` | | independent, resumable base-2 Fermat pseudoprime search and its shared exact test predicates |
 | `scripts/p0_record_forecast.py` | | what records are still available at a fixed scan scale: deterministic winnable set, expected yield, durability |
 | `scripts/p0_pgs_bench.py` | | head-to-head vs PGS (`briankehrig/prime-gaps-cuda`): same box, same start, identical ranges; steady + startup rates and a cross-tool gap-set audit |
 | `scripts/p0_deep_sweep.py` | | walk-engine stage split vs sieve depth at a fixed band: e2e, mark/walk spans and the pacer per depth, two arms (production + mark-only), with a gap-set identity check; needs the GPU to itself, results append to `data/p0_deep_sweep_results.txt` |
@@ -549,6 +553,733 @@ the end of any run; any `verified=0` row is a reportable bug.
   boundary gaps are correct; segmented resume is duplicate-free (content-keyed
   check: 0 duplicates across an interrupted + resumed 4e10 test).
 
+### Pseudoprimes and Carmichael numbers (completeness doctrine)
+
+```
+scripts/psp_probe.py                     # all three blocks, defaults (~5 s)
+scripts/psp_probe.py --fixtures          # only the two known gaps (0.2 s)
+scripts/psp_probe.py --carmichael        # only the test-strength block
+scripts/psp_probe.py --density [--x 1e32] [--sieve 150000] [--odds 2000000]
+scripts/psp_probe.py --brik          # score tests vs BrianK's published list
+scripts/psp_probe.py --sieve-class   # what a plain sieve of depth S leaves behind
+```
+
+`psp_hunt.py` is a separate PSP search, not a Phase-0 campaign. It requires
+Python 3 and `gmpy2` on a POSIX system and records results/checkpoints in SQLite:
+
+```
+python3 scripts/psp_hunt.py pairs --p-start 10000000001 --p-end 10000003001 \
+    --db data/psp_pairs.sqlite3
+python3 scripts/psp_hunt.py pairs --p-start 10000003001 --p-end 10000006001 \
+    --db data/psp_pairs_next.sqlite3  # adjacent factor slice, new database
+python3 scripts/psp_hunt.py show --db data/psp_pairs.sqlite3 --min-gap 100
+python3 scripts/psp_hunt.py chernick --k-end 1670000 \
+    --db data/psp_chernick.sqlite3
+python3 scripts/psp_hunt.py scan --start 160696461657079906273 \
+    --end 160696461657079906274 --db data/psp_control.sqlite3
+```
+
+| option | effective default | meaning |
+|---|---|---|
+| subcommand | required | `pairs`: semiprime-factor slice; `chernick`: a three-factor family; `scan`: generic interval; `show`: stored results |
+| `--db FILE` | required | SQLite results/checkpoint; resume with identical search settings |
+| `--start N`, `--end N` | `1e21`, `2e21` (`pairs`); `1e21`, required (`scan`) | inclusive/exclusive number range; decimal and decimal scientific notation are exact |
+| `--p-start P`, `--p-end P` | required (`pairs`) | inclusive/exclusive range for the smaller prime factor |
+| `--k-start K`, `--k-end K` | `1666667`, required (`chernick`) | inclusive/exclusive range of family parameters |
+| `--factor-floor D` | `10000000` | confirmed hits have no prime factor <= D |
+| `--batch-size N` | `10000` (`pairs`, `chernick`); `100000` (`scan`) | work per committed checkpoint |
+| `--max-batches N` | `0` | no extra limit; a positive N pauses after N committed batches |
+| `--min-gap G` (`pairs`) | `0` | retain/print only PSPs in gaps >= G; positive G is part of the database identity |
+| `--min-gap G`, `--limit N`, `--status S` | `0`, `20`, `confirmed` (`show`) | filter displayed gaps, row limit (`0` = all), and `confirmed`, `pending` or `all` |
+
+`pairs` exhausts only semiprimes (including squares) in its factor slice and
+product interval; the example is only a small slice. Complete semiprime
+coverage in `[1e21, 2e21)` with the default floor requires contiguous
+smaller-factor slices covering `[10000001, 44721359550)`. `--p-start` must
+exceed `--factor-floor`, and each new slice uses a new database. `chernick`
+covers only the specified family. Neither covers all composites above `1e21`,
+where three or more factors above the floor are possible. The generic `scan`
+checks all eligible odd integers in its interval but is much slower.
+
+The prime-factor table is capped at `25000000`, limiting `scan`'s factor floor
+and the table needed for `pairs`. The `pairs` and `chernick` modes reject
+factor ranges outside the exclusive deterministic MR12 bound
+`318665857834031151167461`
+([Sorenson and Webster](https://arxiv.org/abs/1509.00864)).
+`scan` retains unresolved Fermat passers at or above that bound as `pending`.
+Gaps entirely below it are checked across the interior and labelled
+`proven_mr12`; those beyond it are labelled `probable_gmp`. Confirmed JSON
+records include the test outcomes, proven factors or a compositeness witness,
+and the surrounding gap.
+
+Each checkpoint atomically commits progress and results; Ctrl-C or SIGTERM
+stops safely, and the same search settings resume from the checkpoint. Batch
+size and batch limit may change on resume. Incomplete work or unresolved
+candidates returns exit 4; invalid input or database errors return 2, and an
+interrupt returns 130 or 143. A hit is not claimed to be novel, and none of
+these searches touches the dev or fleet campaign.
+
+`pairs --backend cuda` (default backend `cpu`) uses a standalone CUDA
+progression filter and additionally requires NumPy.
+It accelerates the base-2 congruence for `q`, **not** Phase-0 discovery or
+gapminer's mining code; CPU verification is unchanged. Build and check it with
+`make test-psp-gpu WITH_CUDA=1`, then, with the GPU free:
+
+```bash
+python3 scripts/psp_hunt.py pairs --backend cuda --device 0 \
+    --batch-size 1048576 --p-start 10002000001 --p-end 10003000001 \
+    --db data/psp_pairs_gpu_next.sqlite3
+```
+
+`--device` defaults to `0`, `--gpu-library` to the repository's
+`bin/libpsp_pairs_gpu.so`, and the batch default remains `10000` (CUDA maximum
+`16777216`). The GPU backend requires `p,q < 2^63` and rejects unsupported
+ranges or CUDA failures without fallback or committing unfinished work.
+CPU/GPU checkpoints are interchangeable. CUDA batch telemetry reports
+`q_tested`, `filter_passers`, `kernel_ms` and `batch_seconds`; Brian's published
+61 PSPs with gaps >=800 are the regression controls.
+
+The CUDA scheduler reuses at most one in-memory prime-order sieve segment
+across checkpoint batches. This cache is discarded on exit and reconstructed
+from the checkpoint on resume; it changes neither candidate coverage nor the
+default batch size. Its benefit depends on how many batches share a segment.
+On the dev RTX 3070, a 17-batch slice near `p=2.6e10` fell from 1.51 s to
+0.61 s (median of three end-to-end runs); this is not a whole-campaign estimate.
+The slice used `--start 1e20 --end 1e21 --factor-floor 10000000 --min-gap 800
+--p-start 26000000001 --p-end 26000500001 --batch-size 10000`.
+The sieve also handles the smallest valid factor `p=3` without sieving primes.
+
+For a Brian comparison, use a new database:
+
+```bash
+python3 -u scripts/psp_hunt.py pairs --backend cuda --device 0 \
+    --start 1e20 --end 1e21 --factor-floor 10000000 \
+    --p-start 10000001 --p-end 31622776602 --min-gap 800 \
+    --batch-size 16777216 --db data/psp_brian_1e20_1e21_g800.sqlite3 \
+    >> data/psp_brian_1e20_1e21_g800.out 2>&1
+```
+
+The threshold is inclusive; strictly greater than 800 means `--min-gap 802`.
+CPU and CUDA use the same lossless short-gap check: two proven bracketing
+primes less than G apart exclude a containing gap >= G. Only retained hits
+receive full interior verification and are stored/printed. Factor coverage
+and GPU work are unchanged. Positive thresholds require product ranges and
+bracketing endpoints below the deterministic MR12 bound; proof failures abort
+without committing the unfinished batch.
+
+`confirmed` counts all proven PSPs, `gap_filtered` counts discarded short-gap
+hits, and `retained = confirmed - gap_filtered`. Counters and progress are
+committed even when no hits are retained. Repeat the threshold on resume;
+changing it requires a new database. Unfiltered older databases are unchanged.
+CUDA telemetry adds batch `gap_filtered`; progress and `show` add cumulative
+`retained` and `gap_filtered`. The maximum CUDA batch above reduces checkpoint
+overhead; the same command resumes after Ctrl-C or SIGTERM. Keep the session
+open while it runs. The tool does not launch a campaign itself.
+
+Pass `--sieve` to match the campaign you are asking about - the engine default
+is 150000, the dev record campaign runs 150000, the fleet wall runs 85000, and
+the 2e20 corpus used `sieve_limit 1e7`.  Comparing 85000 with 150000 at 7.9e28
+is itself informative: same Euler-pass count, 1885 extra survivors that all fail
+the test.
+`--fixtures` walks the interior of each known pseudoprime gap with both tests and
+prints which one is lost; `--carmichael` compares the two tests on Carmichael
+numbers; `--density` sieves `--odds` odd numbers at `--x` to depth `--sieve` and
+runs the Euler/Jacobi criterion on the survivors, printing the 95 % upper bound
+per odd number (3/odds) and per Euler pass.  `--x` is parsed **exactly** -
+`int(1e32)` is smaller than `10**32` by 5.4e15, which would silently move the
+window.  Reaching a tighter bound costs linear time: `--odds 2e7` is ~10x
+slower and ~3x tighter.
+
+A high-merit hunt only needs *some* gap above a threshold: a pseudoprime there
+costs a candidate, and the next candidate is minutes away.  An exhaustive census
+has no second chance - a gap it misses is missing from the record forever - and
+the distinction was put sharply on Discord:
+
+> For the normal high merit search with hundred+ digit numbers, we don't care
+> about PSPs since all we want is to find high-merit gaps, but with this search,
+> we want to find ALL gaps.  If we treat a pseudoprime as prime, then we could
+> miss a large gap, which is not acceptable if we want the search to be
+> comprehensive (unless you can find all missed pseudoprimes and deal with them
+> another way).
+
+The same thread (2026-11-03, the PGN / BrianK channel) settled which test each
+program actually runs, and produced the counter-example this section now
+carries.  Wizz confirmed that PGN's "Fermat" test is Euler/Jacobi underneath -
+an improved version of Perig's test that kept the misleading name - and BrianK
+named the risk exactly: *it sounds like it knows it can miss a real gap if it
+happens to include a pseudoprime that cuts it in two*.  That is precisely the
+failure mode described below, and it is not hypothetical for us (see the two
+fixtures).
+
+The mechanism is asymmetric and worth stating once:
+
+* a **prime never fails** a Fermat/Euler/MR test, so a *failed* test really is a
+  proof of compositeness, and an interior position that fails is provably not a
+  prime.  The census therefore **cannot invent** a gap;
+* a *passing* test is only a probable-prime verdict.  A composite that passes
+  **splits** one real gap into two, and if both halves fall below the reporting
+  threshold the real gap is **lost silently**.  `verified=1` on every logged row
+  does not help: `mpz_probab_prime_p` + `mpz_nextprime` re-proves a *reported*
+  gap and can never recover one that was never reported.
+
+### The three tests, and why they are not interchangeable
+
+For odd composite `n` with `gcd(2,n) = 1`:
+
+| test | condition | what it inspects |
+|---|---|---|
+| **Fermat** base 2 | `2^(n-1) = 1 (mod n)` | only the endpoint of the squaring chain |
+| **Euler/Jacobi** base 2 | `2^((n-1)/2) = (2/n) (mod n)`, `(2/n)` the Jacobi symbol | the half-power itself, against a sign predicted by cheap arithmetic (`(2/p) = +1` iff `p = +-1 mod 8`) |
+| **strong** base 2 (Miller-Rabin) | `n-1 = 2^s d`, `d` odd: `2^d = 1`, or `2^(2^r d) = -1` for some `0 <= r < s` | every rung of the chain |
+
+The nesting is `strong` `subset` `Euler/Jacobi` `subset` `Fermat`.  Euler implies
+Fermat by squaring (`(+-1)^2 = 1`); strong implies Euler is the classical
+theorem, and the first 51 Carmichael numbers confirm it empirically - Fermat
+accepts 51, Euler/Jacobi 41, strong 5, with `strong subset Euler subset Fermat`
+holding on the nose.
+
+Neither strengthening is cosmetic, and each is illustrated by a small number:
+
+* **Fermat but not Euler: `341 = 11*31`.**  `2^170 = 1`, but `(2/341) = -1`
+  (341 = 5 mod 8), so the Euler test demands `340` and fails.  A composite `n`
+  has up to `2^k` square roots of 1 (`k` = number of prime factors); Fermat only
+  asks for *some* root, Euler pins the sign from outside.
+* **Euler but not strong: our gap-956 pseudoprime.**  `n-1 = 2^5 d`, and the
+  chain runs `2^d = 18297422721374251885`, then `103980063429580871173`, then
+  `1`.  The last value is exactly what the Euler test wants, so Euler passes -
+  but `103980063429580871173^2 = 1 (mod n)` with the value neither `1` nor `-1`
+  is a **nontrivial square root of 1**, and the strong test looks for the `-1`
+  that must precede a `1` and does not find it.  Euler inspects the endpoint;
+  strong inspects the chain.
+
+That is why "the kernel is a probable-prime test" is not a specification: the
+three variants differ by which composites they let through, and the difference
+is exactly the class that can swallow a gap.
+
+So the only question that matters for completeness is what the **discovery**
+test is, and every design pays for it with speed.  The three programs:
+
+| | discovery test | guard against a split | what happens to a lost gap |
+|---|---|---|---|
+| **this repo** (`--engine walk`) | base-2 **Euler/Jacobi** (`perig` / `p0u96` / `p0u108`, `w_test_mode` modes 0/3/4/5). The sieve engine uses strong `mr_base2` instead | none in-tree. Every *reported* gap is GMP-verified (`mpz_probab_prime_p(lower,25)` + `mpz_nextprime(lower) == upper`) | silent: both halves below `--gap-min` -> nothing logged |
+| **PGS** (`briankehrig/prime-gaps-cuda`) | Perig base-2 Fermat, jump-by-`minGap` walk | (a) **2-PSP sieve**: marks `n = 0 mod p` with `n/p = 1 mod ord_p(2)` for every sieved prime below the 4096th prime, 38873 (7..83 by wheel, 89..38873 by the medium sieve) - the exact subset of multiples of `p` that the base-2 Fermat test would wrongly accept, so it closes every PSP whose factors are inside the sieve at ~1 mark per `p^2` instead of 1 per `p`; (b) CPU re-walk of each reported gap with `isPrime84` = strong MR to bases 2..37, deterministic below 318665857834031151167461 | documented and *bounded*, in the repo's own words: the author's separate search for base-2 PSPs with **no** factor `< 1e7` is "now complete up to 1e21.  The largest prime gap that contains one of them is of length 1194.  Thus, this code will not miss any gaps of size >= 1200 under 1e21", while `minGap < 960` "is not guaranteed to be 100 % exhaustive". The declared domain stays inside the deterministic MR12 band, so the CPU re-walk is a proof, not a probable-prime verdict |
+| **PGN / Prime Gap Scout** (`wizz13150/prime-gap-scout`) | PGN's own fused base-2 Euler/Jacobi - the headers are literally `namespace specialized_euler` and the criterion is `terminalEquation`, an Euler congruence with a Jacobi-derived sign; Wizz has said so himself ("an undercover Euler/Jacobi test").  Same class as ours, so it **splits at exactly the same pseudoprimes** | mandatory `PGN_VERIFY_GAPS` GPU certificate - the runtime will not build without it (`"Production source adapter requires GPU gap certificates"`): both endpoints must be **proven** prime by 12-base MR and every interior candidate that passes Euler must be **proven composite** by the same test.  Inside the qualified window that is a real proof (MR12 is deterministic below 3.19e23).  But `candidate_walk.cuh` emits a gap only `if (gap >= minGapVal)`, and the verifier only inspects emitted gaps - see the emission analysis below | the strictest verifier of the three, and it does not claim more: `"prime_certificate":"MR12 below318665857834031151167461"`, `"coverage":"SOURCE_PRP_INDEPENDENT_PROOF_PENDING"`, README says "baseline independent exhaustive coverage remains pending".  Window is one high word, `supported_high_word: 10` = 1.8446744e20..2.0291418e20 - which contains only **5 of BrianK's 61** published gaps |
+
+### Two fixtures, and a correction to one of them
+
+`scripts/psp_probe.py --fixtures` reproduces all of this and checks it:
+
+| gap | interior number | factorisation | Fermat | Euler/Jacobi | strong | engines |
+|---|---|---|---|---|---|---|
+| 156 | 108081990803 | 42443 x 2546521 | **yes** | no | no | both FOUND |
+| 710 | 18447233112263860537 | 4015729 x 4593744526153 | no | no | no | both FOUND |
+| 956 | 160696461657079906273 | 2142738313 x 74995840921 | yes | **YES** | no | walk MISS, sieve FOUND |
+
+The three rows bracket our test exactly: 156 is the Fermat-but-not-Euler class
+and our Euler/Jacobi test catches it; 710 is not a pseudoprime at all; 956 is
+the Euler/Jacobi class the walk cannot see.  `--gap-min` 155 / 709 / 955
+respectively, so each row is "just under the true gap".
+
+All three *gaps* pass the scanner's own `verify_gap` (`mpz_probab_prime_p(lower,
+25)` + `mpz_nextprime(lower) == upper`, the check `tools/phase0_scan_gpu.cu`
+runs on every reported gap), and GMP's `mpz_probab_prime_p(interior, 25)` calls
+all three interior numbers composite - so the pseudoprime label is decided by
+the Fermat/Euler/strong columns alone, never by a disagreement about primality
+itself.
+
+**The 156 row is constructed, not mined.**  No public example of that class was
+available at a usable scale (the canonical small one is `341 = 11 x 31`, whose
+enclosing gap is 2 and therefore below the walk's `--gap-min >= 100` floor), so
+it was built with the classical sufficient condition: for primes `p`, `q`,
+`p*q` is a base-2 Fermat pseudoprime whenever `q = 1 (mod ord_p(2))` and
+`ord_q(2) | p-1`.  Taking `p = 42443`, `q = 2546521` gives
+`n = 108081990803`, and it lands inside the prime gap of 156 from
+108081990733 to 108081990889 with both factors above the 30000 sieve.  Running
+the same construction over 300 primes with `p` in `(42000, 60000)` and
+`q < 8e6` produced 180 such numbers, 20 of them inside a gap `>= 100` - so the
+recipe is cheap to repeat if this fixture ever needs replacing.
+
+**Correction (2026-11-04).** PGS's `worktodo.txt` calls the 710 number "a base-2
+PSP that is contained in a gap of size 710", `docs/PGS_GPU_TOOL_REVIEW.md`
+repeated that, and this document repeated it too until it was checked:
+`2^(n-1) mod n = 16649844496336080870`, not 1.  It is **not** a pseudoprime of
+any kind - it is a semiprime with two large factors, and no number in that gap's
+interior passes Fermat or Euler/Jacobi at all.  So the 710 gap is found by *any*
+test, it cannot bracket anything, and the "PSP fixture" gate below was never
+testing a pseudoprime.  Verified three ways: `gmpy2.powmod`, Python's builtin
+`pow`, and the factorisation `4015729 x 4593744526153 = n`.
+
+Only the 956 entry is real, and it is the Euler/Jacobi one:
+
+* gap 956 at `--gap-min 955`: **the strong test reports it and our engine does
+  not** - the number passes Fermat *and* Euler/Jacobi base 2, splitting the gap
+  into 410 + 546, both below the threshold.  Verified against the engine's own
+  predicate, not a re-implementation: `ciosFermatTest128_hi(13122509067403493345,
+  8)` returns "probable prime" for it, and it is
+  `2142738313 x 74995840921` - both factors are far above both depths we run
+  (85000 on the fleet wall, 150000 on the dev box) and above PGS's 38873, so
+  **no sieve of either program can remove it**.
+
+BrianK's 1194 and 1044 gaps are presumably the *natural* members of that third
+class below 1e21, but reproducing them means enumerating base-2 pseudoprimes
+with no factor `< 1e7` up to 1e21 - his "separate search".  Following that
+constraint: a number below 1e21 with all prime factors above 1e7 has at most
+two of them, since `(1e7)^3 = 1e21` exactly, so every member of the class is a
+**semiprime** and no Carmichael number can appear.  That makes his enumeration a
+semiprime search over `q = 1 (mod ord_p(2))`, the same progression used above -
+a research-scale run, and one we do not need, because the constructed fixture
+exercises the identical code path at four orders of magnitude less cost.
+
+### The statistics a miner actually needs
+
+Two numbers decide whether pseudoprime recovery is worth building into a mining
+program, and both are measurements from BrianK's published enumeration rather
+than estimates:
+
+* **How many pseudoprimes can share one gap?**  2 789 289 gaps `>= 300` in
+  `1e20..1e21` contain a 1e7-rough base-2 PSP, i.e. a density of `3.1e-15` per
+  position.  In a gap of 1200 that is an expectation of `3.7e-12`, so
+  `P(two or more) = 7e-24`.  **Gaps with two pseudoprimes do not occur at this
+  scale**, which is why the cheap `nextprime(p1)` repair (re-walk from the lower
+  prime of a suspicious gap) is sufficient with an enormous margin.
+* **What is the at-risk set at a given merit?**  Merit 20.5 at 2e20 is gap 958.
+  Of BrianK's 61 published gaps `>= 800`, only **three** pass Euler/Jacobi at
+  `>= 900` (956 and two of 902) and exactly **one** exceeds 958 - the 956 gap.
+  So for an Euler/Jacobi engine the risk in that decade is one gap, not 61, and
+  the 1194/1044 often quoted are Fermat-only and are found normally.
+
+For scale, base-2 Fermat pseudoprimes below `1e19` number 91,210,364
+(OEIS A055550) and grow 2.6-2.7x per decade, so the `2e20..3e20` window holds
+about `6.1e7` of them; the 1e7-rough subset is ~`1.4e6` per half decade.  Work
+for an enumeration is linear in range length while the yield grows only 2.6x per
+decade, so each further decade costs ~10x the time for ~2.6x the pseudoprimes.
+
+### Does this project need to fix it?  The exposure number
+
+The two halves of the problem have different answers, and only one of them is
+open.
+
+**Publishing is already closed.**  `verify_gap()` (`tools/phase0_scan_gpu.cu`,
+"gap verification / reporting") demands `mpz_probab_prime_p(lower, 25) >= 1`
+**and** `mpz_nextprime(lower) == upper` for every row it reports, and
+`process_prime_gap()` logs the outcome as `verified=`.  A pseudoprime therefore
+cannot become a published endpoint, and it cannot sit unrecorded in a published
+interior: `nextprime` establishes that no prime exists strictly between the two
+endpoints.  The guard is exercised, not assumed: walking the 956 window at
+`--gap-min 400` makes the walk *accept* the pseudoprime and emit two fragments
+(410 and 546), and both come out `verified=0` - see the gate row
+"pseudoprime endpoint rejected at emission".  Measured on every campaign log in
+this tree - **10 622 wall rows and 700 record rows, 10 622/10 622 and 700/700
+`verified=1`, zero unverified**, 18.3 M and 1.4 M interior positions
+respectively.
+
+**Discovery is open, and its size is measurable.**  A pseudoprime can only lose
+a gap, and only if it lands inside one we would have reported.  So the expected
+loss over a finished campaign is
+
+    E = d_psp(x) * sum(gap - 1)          over the gaps that campaign reported
+
+with `d_psp` the 1e7-rough base-2 PSP density per position.  Using the measured
+`d_psp(1e20) = 3.1e-15` and the `x^-0.585` fall implied by A055550 (the PSP
+count grows 2.6x per decade while positions grow 10x, so the density divides by
+3.8 per decade; extrapolated over 9 and 12 decades, which is the one soft number
+here):
+
+| campaign | x | reported gaps | `gap-1` summed | `d_psp` | E\[lost\] |
+|---|---|---|---|---|---|
+| wall (`g >= 1664`) | 7.9e28 | 10 622 | 1.83e7 | 1.9e-20 | **3.5e-13** |
+| record (`g >= 2002`) | 1e32 | 700 | 1.45e6 | 3.0e-22 | **4.3e-16** |
+
+Both are far below one lost gap per campaign, and the reason is not luck: the
+two thresholds are merit 25.0 and merit 27.2, while BrianK's entire published
+list - the only complete measurement that exists - tops out at gap 1100 at
+`1e20`, i.e. **merit 23.9**.  We are asking a question the data cannot answer
+directly, at a PSP density five to seven orders of magnitude below his.
+
+The rule that follows is a function of threshold and height, not a constant:
+
+* at `1e20` with `--gap-min 700`, one decade (9e20 positions) holds **559**
+  PSP-containing gaps (`>= 300`: 2.79e6) - a program with that threshold over a
+  whole decade has hundreds of candidate silent losses, which is why "check for
+  pseudoprimes in parallel" is the right advice for PGN/Scout and not a
+  theoretical worry;
+* at `1e28..1e32` with `--gap-min >= 1664` the figure is `1e-13..1e-16`.
+
+**Conclusion: no hot-path change.**  If a campaign ever drops below ~`1e22`, or
+to a `--gap-min` under ~1000, the discovery test itself has to change, and the
+costs are already measured: strong base-2 is `1.81x` the wall and does **not**
+close the class (26 of BrianK's 61 are genuine strong pseudoprimes to base 2),
+bases 2+3 score 0/61 but `spsp(2,3)` numbers exist and are infinite, so 0/61 is
+an empirical result and must never be written up as a proof, and PGN's
+complementary 2-PSP sieve closes the `(sieve depth, 1e7]` factor class exactly at
+a GPU rate cost inside the noise (431.7 -> 433.9 Gpos/s).  None of the three
+touches the 1e7-rough class, which no in-program test can enumerate.
+
+
+### PGN's own attempt at this (report of 4 November 2026)
+
+PGN published a private engineering report implementing the complementary sieve
+BrianK described, and it agrees with the analysis above in every particular:
+
+* the sieve covers `(80 000, 1e7]` by marking `N = p (mod p*ord_p(2))`, which is
+  the same construction as PGS's and is provably safe (every mark is divisible
+  by `p` and larger than it, so composite; it over-marks, which is harmless);
+* **the 956 example is not recovered by that sieve** - both of its factors
+  exceed `1e7` - it is recovered by a separate "large-factor witness" family,
+  which they state is **bounded and not exhaustive**;
+* "Complete pseudoprime coverage over 67-95 bits remains open", i.e. they
+  explicitly do not claim the census property we are discussing;
+* the cost is what makes the sieve attractive for us: GPU rate unchanged within
+  noise (431.693 -> 433.853 Gpos/s), `5 544 292` small-factor marks in a `1e12`
+  cohort, a 656 742-row canonical table verified by a pinned SHA-256 and loaded
+  in 0.165 s; the `+24.19 %` cold-worker time in that build is 1.014 s of
+  CPU-side preparation, which they identify as a prototype artifact and expect a
+  resident pipeline to remove;
+* 19 native executions, thresholds 954/956/960, a shifted origin, a descriptor
+  boundary and a 1554-gap positive control - all certified reference gaps
+  conserved, with exactly the 956 gap added.
+
+Their numbers were not reproduced here (no build on this box, and their `high =
+10` backend is absent from the public tree: `bits_69` accepts `high` in
+`[16, 32)`), so treat them as their measurement, quoted, not ours.
+
+### Does a certifying verifier (PGN Scout) find those gaps?  No.
+
+A verifier is not a detector.  `candidate_walk.cuh` emits a gap only
+`if (gap >= minGapVal)`, and `PGN_VERIFY_GAPS` only inspects emitted gaps; PGS's
+`checkGapAndPrint` works the same way.  A pseudoprime splits `G` at offset `a`
+into `a` and `G-a`, so:
+
+* `minGap <= max(a, b)` - a half is emitted, the verifier sees the pseudoprime,
+  and the gap is **rejected**.  Loud, correct - and the gap is still not found.
+* `minGap > max(a, b)` - nothing is emitted, the verifier never runs, and the
+  gap is **silently lost**.
+
+Scored against the 61 published gaps (`scripts/psp_probe.py --brik`, last block):
+
+```
+minGap   loud      silent
+300      61 / 61     0 / 61
+500      49 / 61    12 / 61
+700      28 / 61    33 / 61
+800      11 / 61    50 / 61
+1000      0 / 61    61 / 61
+```
+
+So at the thresholds a real hunt uses most of those gaps are lost silently
+rather than caught - and even the "loud" cases end with the gap discarded, never
+reported.  **Scout cannot find them: its search layer is Euler/Jacobi, the same
+class as ours, so it splits identically.**  What it adds over us is that it
+refuses to *publish* an uncertifiable gap; what it lacks, exactly like us, is
+any way to *see* one that never became a candidate at all.
+
+### Ground truth: how leaky is each test, measured
+
+BrianK published the **complete** list of gaps >= 800 in `1e20..1e21` whose
+interior holds a base-2 Fermat pseudoprime with no prime factor `< 1e7` - 61
+gaps (out of 2 789 289 gaps `>= 300` in that range), i.e. exactly the gaps his
+program would miss without its separate PSP search.  That is the only public
+ground truth for "how leaky is test X", so it is now a regression set in the
+tool: `scripts/psp_probe.py --brik`.
+
+| discovery test | gaps missed | note |
+|---|---|---|
+| Fermat base 2 | **61 / 61** | useless here, as expected |
+| Euler/Jacobi base 2 (our walk) | **37 / 61** | the engine we run |
+| strong base 2 (`mr_base2`) | **26 / 61** | **still not sound** |
+| strong base 2 **and** base 3 | 0 / 61 | sufficient for this list, not proven in general |
+| strong bases 2..37 (12 bases) | 0 / 61 | deterministic below 3.19e23, so a *proof* here |
+
+Two corrections follow, and the first one retracts something this document said
+earlier.
+
+1. **"Switch to the sieve engine" is not a fix.**  Its `mr_base2` is a strong
+   base-2 test, and 26 of the 61 published gaps contain numbers that **pass** a
+   strong base-2 test - they are genuine strong pseudoprimes to base 2 (largest
+   in a gap of 902).  The sieve engine is *less* leaky than the walk, not sound.
+   No single-witness base-2 test of any strength closes this range; only a second
+   base (3 suffices for this list) or a PSP sieve does.
+2. **The relevant constant is different in each range.**  For `1e20..1e21` a
+   12-base MR is a *deterministic* primality proof (the Sorenson-Webster bound
+   is 3.19e23), which is what PGS's `isPrime84` exploits - that is why his CPU
+   re-walk of reported gaps is a proof and why his PSP sieve is the piece that
+   makes the *search* complete.  At our wall band (2^96 = 7.9e28) that bound is
+   far behind us: no small set of bases is a proof, so there the only sound
+   options are a PSP sieve or a census claim that is explicitly probabilistic.
+
+The 956 fixture is in that published list exactly as we factored it
+(`160696461657079906273 2142738313 74995840921 956`), and the 1194 and 1044
+entries confirm the Euler/Jacobi refinement numerically: both are Fermat-only
+(`eul()` returns False for both), so **an Euler/Jacobi engine finds those two
+gaps** - 956 really is the worst case for our engine class below 1e21.
+
+**Our own 2e20 campaign is clear.**  Its range `[2e20, 2.0001e20]` contains
+**zero** of the 61 published >= 800 pseudoprime gaps: the nearest below is at
+1.982154e20 (gap 826) and the nearest above at 2.005452e20 (gap 936).  So the
+HL validation anchor loses nothing to this class at `>= 800`; the `[701, 800)`
+slice is not covered by the published list (he kept the `>= 300` data but posted
+only the `>= 800` extract), and would need the full 2.79M-row set to settle.
+
+**Cross-engine check, run end to end (2026-11-04).**  The same binary, the same
+3000-number window, the same thresholds - only `--engine` differs:
+
+| fixture | `--engine sieve` (strong base-2 `mr_base2`) | `--engine walk` (Euler/Jacobi) |
+|---|---|---|
+| gap 956 (Euler/Jacobi pseudoprime) | **FOUND** `956 20.5476 ... verified=1` | **MISSED**, log has zero rows |
+| gap 710 (semiprime, not a pseudoprime - see above) | FOUND | FOUND |
+
+```
+./bin/phase0_scan_gpu --engine sieve --start 160696461657079904863 \
+    --length 3000 --merit-min 20 --sieve-limit 30000 --no-records --log /tmp/s.log
+./bin/phase0_scan_gpu --engine walk  --start 160696461657079904863 \
+    --length 3000 --gap-min 900 --merit-min 0 --walk-primes 30000 --walk-batch 8 \
+    --no-records --log /tmp/w.log
+```
+
+So the two engines are not interchangeable for a completeness claim.  Note the
+scope carefully: the sieve engine is the *less leaky* of the two here, but the
+ground-truth block below shows it is **not sound either** - 26 of BrianK's 61
+published gaps contain numbers that pass a strong base-2 test.  A trap worth recording
+because it cost a run: **`--gap-min` is a walk-only flag** (the binary rejects it
+with "`--engine walk`: `--gap-min` must be in [100, 1e7]" outside that path);
+the sieve engine filters gaps by **`--merit-min`**, and its default of 20 is
+high enough to hide a merit-20.55 gap if you pass a gap threshold and assume it
+applied.  The 956 gap is merit 20.5476.
+
+A refinement that follows, and that is worth more than the fixture itself:
+Brian's public claim is "the largest prime gap that contains one of them is of
+length 1194, so no gap >= 1200 is missed under 1e21" - but that is stated for
+**Fermat** pseudoprimes.  In the thread he adds the decisive detail: of the
+three Fermat-PSP-carrying gaps >= 960 below 1e21 (sizes 1194, 1044, 956), the
+two larger ones are **not** Euler-Jacobi pseudoprimes.  So for an engine that
+runs Euler/Jacobi - ours, PGN's, and PGS's own `FERMAT_TEST`, which is Euler/
+Jacobi despite the name - the relevant bound below 1e21 is **956, not 1194**,
+and only that one gap is at risk.  Smaller bound, same conclusion, but it is
+the correct number to quote for our engine class.
+
+Two facts make the table sharper than it looks, and a third retracts one of
+them.
+
+**1. A base-2 Euler/Jacobi test is much weaker against Carmichael numbers than
+a strong test.**  Reproduce with `scripts/psp_probe.py --carmichael`.  Measured
+2026-11-03 on the first 51 Carmichael numbers:
+**41 pass** the Euler/Jacobi congruence that `perig`/`p0u96`/`p0u108` and PGS's
+`FERMAT_TEST` implement, but only **5 pass** the strong base-2 MR that our sieve
+engine uses.  So "Euler/Jacobi base-2" and "strong base-2" are not
+interchangeable for a completeness claim, and both our production campaigns sit
+on the weak side (wall 7.9e28 -> `w_test_mode` 4, record 1e32 -> mode 5) purely
+for speed.  The Chernick family `(6k+1)(12k+1)(18k+1)` makes it concrete: for
+`k = 25025` the factors 150151, 300301, 450451 are all prime, so
+`n = 150151*300301*450451 = 2.03e16` has **no factor below either sieve depth
+we run (85000 / 150000)**,
+survives it, passes Euler/Jacobi base-2, and is rejected by the strong test -
+and no PSP sieve can remove it either, because by construction none of its
+factors is small enough (that point is developed below).
+
+da li wizzov program nalazi te pseudpprimes**2. (retracts part of 1.) "Strong is stricter" is true about Carmichael
+numbers and false about pseudoprimes as a class.**  Point 1 compares the tests on
+*Carmichael* numbers, where strong wins 5-to-41.  On the actual pseudoprimes that
+occur in our kind of range the ordering is very different: of BrianK's 61
+published `>= 800` pseudoprime gaps in `1e20..1e21`, Euler/Jacobi misses 37 and
+**strong base 2 misses 26** - those 26 are genuine strong pseudoprimes to base 2.
+A second base (3) catches all 61 (`scripts/psp_probe.py --brik`).  So a
+base-2-only test, at any strength, cannot support a completeness claim in that
+range; and the deterministic MR bound (3.19e23) that makes a 12-base check a
+*proof* there does not reach our wall band at 7.9e28.
+
+**3. At our scale the risk is nonetheless vanishingly small, and the bound is
+measured, not assumed.**  Reproduce with `scripts/psp_probe.py --density`.
+Direct probe at the production wall (x = 1e32, sieve depth 150000, the
+`--walk-primes` default):
+
+```
+odd numbers sampled           2,000,000
+survived the sieve              188,405   (9.4 % of odds)
+passed base-2 Euler/Jacobi       54,536   of which 100.0 % are primes
+COMPOSITE that passed                 0   (95 % CL < 1.5e-6 per odd number)
+```
+
+Zero in 54536 Euler passes.  That is far below the small-x literature because
+the pseudoprime count grows much slower than `x`: over `10^12..10^19` the
+count of base-2 pseudoprimes grows 2.60-2.70x per decade (OEIS A055550:
+`psi(1e10) = 14884`, `psi(1e11) = 38975`, `psi(1e19) = 91210364`), i.e. a local
+exponent of only ~0.42-0.43 in `log-log`.  Carrying that exponent to 1e32 puts
+the count of base-2 pseudoprimes anywhere in a whole campaign's range
+(`R ~ 1.6e17`) at order 0.02-2, so pseudoprimes are not impossible in the range
+- they simply cannot do damage, for a second reason:
+
+**a pseudoprime can only lose a gap of size `< 2 x gap-min`.**  Split `G` at
+offset `a` into `a` and `G-a`; both fall below the threshold only if
+`G < 2*gap_min`.  A split of a longer gap always leaves one half `>= gap_min`,
+that half IS reported, and its GMP check fails - so it surfaces as
+`verification_failures`, not as a silent loss.  That single rule sorts our
+campaigns, and the sort is the useful result:
+
+```
+campaign            gap_min   sieve   at-risk window    #gaps   frac of R
+2e20 (HL anchor)        701   1.0e7    [ 701, 1402)    169276   1.26e-6
+wall (fleet)           1664   8.5e4    [1664, 3328)     10962   6.25e-11
+record (dev)           2002   1.5e5    [2002, 4004)       697   9.19e-12
+```
+
+The wall's sieve is **85000**, not the engine default 150000: the fleet's chain
+runs `--walk-primes 85000`, the depth measured best on its RTX 3060s with the
+u96 binary (AGENTS.md).  That difference was measured too, at 7.9e28 over
+2 000 000 odd numbers:
+
+```
+sieve 85000 : survived 197916 (9.90 % of odds)   passed Euler/Jacobi 60429   PSP 0
+sieve 150000: survived 188481 (9.42 % of odds)   passed Euler/Jacobi 60429   PSP 0
+```
+
+**The verdict set is identical** - 60429 Euler passes either way.  The shallower
+sieve leaves 9435 more survivors and every one of them fails the Euler/Jacobi
+test, so it costs tests, not correctness, at this scale.  The trade is also why a
+shallower depth can win at all: 85000 marks with 8277 primes instead of 13848
+(-40 % of the marking work) to buy +5.1 % more tests.  §26.5 has the sweep on the
+dev box (40000 best there, flat to 250000, collapsing at 1e6) and the direct
+check that settles the correctness half: at `--gap-min 400` over 1e10 integers at
+the wall both depths reported **277746 gaps and the sets are equal, 0
+differences** - as they must be, since the sieve only removes numbers that have a
+prime factor `<= P`, and those are certainly composite.
+
+It does widen the surviving *class* in principle: a Chernick number whose
+smallest factor lies in `(85000, 150000]`, e.g. `k = 14206` giving
+`85237 x 170473 x 255709 = 3.7e15`, is sieved out on the dev box and survives on
+the fleet, and it passes Euler/Jacobi.  At 7.9e28 the equivalent would need all
+three factors near 1e9, which is far outside anything we have found (or Brian's
+enumeration, whose cases are products of two primes); the measurement above is
+the reason to expect none, not the sieve depth.  Note also that the identical
+verdict count is a measurement, not a theorem - the Chernick family is a valid
+counter-class - so it is worth re-running this probe after any change to the
+sieve depth or the test.
+
+Three things follow.
+
+* **The high-threshold campaigns are structurally the safest**, and for a
+  reason that has nothing to do with density: every pseudoprime-in-a-gap found
+  so far is in a gap of 956-1194, which is *below* both thresholds.  A gap that
+  small cannot be reported at `--gap-min 1664` in the first place, so it cannot
+  be lost either.  Only the `[1664, 3328)` / `[2002, 4004)` windows matter, and
+  they occupy `6.3e-11` / `9.2e-12` of the scanned range.
+* **The 2e20 campaign is the exposed one** (`gap_min 701 < 956`, and
+  `1.26e-6` of its range is in the at-risk window) **- and it is also the one
+  that can be settled rigorously.**  Its sieve depth is **1e7**
+  (`sieve_limit=10000000` in its session header), which is exactly the class
+  Brian's enumeration covers ("base-2 pseudoprimes with no prime factor
+  `< 1e7`, complete up to 1e21"), and its range `[2e20, 2.0001e20]` lies inside
+  that.  Of the three PSP-carrying gaps `>= 960` below 1e21, only the 956 one is
+  an Euler-Jacobi case, and it sits at 1.6069e20 - **below our start**.  So the
+  HL validation anchor is complete with respect to that class, by a published
+  enumeration rather than by extrapolation.  (The enumeration is quoted for gaps
+  `>= 960`; the `[701, 960)` slice of our window is not covered by it.)
+* **The wall and record campaigns cannot use that argument**, because they sieve
+  only to 150000 and scan at 7.9e28 / 1e32, ten to eleven decades above where
+  any enumeration exists.  For them the bound is the measurement above:
+
+    E[lost gaps] ~ E[pseudoprimes in range] x (fraction of R in the window)
+                 ~ O(1) x 9.2e-12  ~  1e-12 .. 1e-11   (record campaign)
+
+  and the census agreement with the HL tables (597 found vs 591 predicted at
+  the time of measurement) is consistent with zero loss.  Nothing at this scale
+  can distinguish the two.
+
+**The 2-PSP sieve DOES transfer to us - an earlier version of this document
+said it did not, and that was wrong.**  The sieve marks the exact subset of
+multiples of `p` that pass the Fermat test (`n = 0 mod p` with
+`n/p = 1 mod ord_p(2)`) for every prime `p` in `(sieve_depth, 1e7]`.  The
+mistaken argument was "our sieve to 150000 already removes every PSP with a
+small factor".  It removes every composite with a factor `<= 150000` - but a
+pseudoprime whose factors all lie in `(150000, 1e7]` is untouched by that and
+still passes Euler/Jacobi.  The Chernick number
+`n = 150151*300301*450451 = 2.03e16` is exactly such a case: smallest factor
+150151, so it survives BOTH of our depths (85000 and 150000), and
+`2^((n-1)/2) = 1` with `jacobi(2/n) = +1`, so our pipeline calls it **prime**.
+The class is open for us, and the 2-PSP sieve is the cheap way to close it.
+
+What the sieve cannot close, for us or for PGN, is the class where **all**
+factors exceed `1e7` - BrianK's semiprime class.  PGN's own report is explicit:
+their complementary sieve covers `(80 000, 1e7]`, and the 956 recovery comes
+from a *separate* "large-factor witness" family they describe as **bounded and
+not exhaustive** ("Complete pseudoprime coverage over 67-95 bits remains open").
+So the sieve closes one of the two classes; the other is exactly the 2.79M-entry
+object of BrianK's enumeration, and no cheap construction currently covers it.
+
+**What a comprehensive claim would still need.**  The measurement bounds the
+risk, it does not prove absence.  Three guards were on the table; the thread and
+the sieve-depth argument above remove one of them:
+
+| guard | effect | cost | verdict |
+|---|---|---|---|
+| sample slices with the strong test (`P0_WALK_TESTMODE=2`) and diff the gap sets | turns the *claim* into a *check*: any gap in one set and not the other exposes a pseudoprime | one slice, no code change | **recommended** - the only cheap one, and the walk already supports it |
+| the complementary 2-PSP sieve in the marking | closes the whole `(sieve_depth, 1e7]` factor class, including Chernick-type numbers our sieve leaves behind | Brian: sub-1 % of runtime.  PGN's qualified build: GPU rate unchanged within noise (431.7 -> 433.9 Gpos/s), **+24 % cold-worker time from 1.014 s of CPU table prep** they expect a resident pipeline to remove; table is 656 742 rows, 0.165 s verified load | **recommended, and nearly free for us** - a segment is 8.5e14 positions (~850 PGN cohorts), so 1 s of table load amortises to 0.04 %, and ~5.5e6 marks per 1e12 positions is noise |
+| a strong discovery test | closes Carmichael numbers *and* the Euler/Jacobi gap exemplified by the 956 fixture | **measured 2026-11-04: 1.81x wall, -45 % throughput** (below) | **not sufficient on its own** - 26/61 of the published PSP gaps pass strong base 2; needs a second base |
+| a second base (3) on top of strong | closes all 61 published gaps | ~2x the strong test, i.e. ~3.6x the wall | the cheapest option that is complete *for the published list*; still not a proof above 3.19e23 |
+
+**The cost, measured rather than estimated** (dev RTX 3070, wall slice of 1e12
+integers at 7.9e28, `--walk-primes 85000`, `--walk-batch 16`, two runs each,
+`P0_WALK_TESTMODE` forced):
+
+```
+mode 4  p0u96  Euler/Jacobi (production)   3.44 s / 3.14 s   3.04e11 ints/s
+mode 1  mr128_64_base2_lazy  strong base-2 5.95 s / 5.99 s   1.68e11 ints/s
+                                                        -> 1.81x wall, -45 %
+```
+
+Per test alone the strong variant is much closer: `bin/bench_walk_test` on
+~96-bit candidates gives 1.699 ns for perig and 2.151 ns for the strong 2x64
+kernel (+26.6 %); the wall's 1.81x is larger because the production path is the
+fused u96 kernel, which is already 1.70x faster than perig - the two multiply to
+1.82x, matching the measurement.  So the honest price of strictness here is
+**1.81x campaign time**, not the +26 % a per-test reading suggests.
+
+Two cheaper options were checked and rejected: a second witness (base-3
+Fermat/Euler) costs about one more full exponentiation, ~+100 % of test time,
+i.e. worse than strong MR; and a *conditional* strong test only for candidates
+near a prime buys nothing, because the condition "previous prime within
+`2*gap_min`" is almost always true (3328 positions against a mean gap of 66).
+The remaining path to strictness without the 1.81x would be a *fused* strong
+kernel for the u96/u108 containers - it does not exist, and building it is a
+hypothesis, not a measurement.
+
+An **audit slice** is the middle ground: a contiguous sub-range of a campaign
+scanned **twice**, once with the production discovery test and once with the
+stricter one, whose two gap sets are then compared.  It is a *detector*, not a
+proof - it says nothing about the integers outside the slice - and it is only as
+sensitive as the number of gaps the slice contains.  The recipe, with the trap:
+
+```
+S=79000000000000000000000000000
+for m in 4 1; do                     # 4 = p0u96 (production), 1 = strong base-2
+  P0_WALK_TESTMODE=$m ./bin/phase0_scan_gpu --engine walk --start $S \
+      --length 10000000000 --gap-min 400 --walk-primes 85000 --walk-batch 16 \
+      --no-records --log /tmp/aud$m.log
+done
+# compare (lower, gap) pairs, AFTER sorting: the two modes emit in a
+# different order, so a raw diff reports hundreds of spurious differences
+diff <(grep -v '^#' /tmp/aud4.log | awk '{print $2,$3}' | sort) \
+     <(grep -v '^#' /tmp/aud1.log | awk '{print $2,$3}' | sort)
+```
+
+Measured at the wall (1e10 integers, `--gap-min 400`, 277 707 gaps):
+**the gap sets are identical**, which is the expected result and the reason the
+recipe is worth keeping as a check rather than as a campaign.  Its statistics
+are what limit it: gaps are rare, so a 1 % slice of the wall campaign (~110 gaps)
+only detects a loss rate of ~3 % and costs +0.8 %, while bounding the rate below
+0.3 % takes ~9 % of the range (+7 %).  The density probe above is the tighter
+instrument per unit cost, because Euler passes are far more numerous than gaps.
+Note also that at `--gap-min 400` the walk is dominated by the jump-walk itself
+(3.6e8 ints/s, three orders below the production rate), so an audit slice must
+be run at the campaign's own `--gap-min` if its *timing* is to mean anything -
+here only its *gap set* does.
+
+Brian's framing in the thread is the right default and it matches ours: a
+deterministic test "will completely kill the speed; it's much better to stick
+with a probabilistic one and then separately deal with all the pseudoprimes that
+the code would have missed".  The difference is that his separate search can be
+run to 1e21 because his domain stops there, while ours does not - which is
+exactly why the two fixtures and the measurement matter more to us than to him.
+
 ---
 
 ## 3. `bin/phase0_scan` - CPU reference
@@ -628,6 +1359,138 @@ the Poisson error).  Slice logs are appended across resume, so the event counts
 and the covered integers stay disjoint.  Prints the coefficient gate
 (`sum rho_g / (1/L)`), the per-length table and the mean decades closed.
 `--dark` also writes `*_dark.png`.
+
+`scripts/p0_rec_hl_compare.py` - the dev record campaign (x = 1e32) vs the same
+HL tables, asked one octave higher:
+
+```
+scripts/p0_rec_hl_compare.py [--log LOG] [--out PNG] [--dark]
+                             [--band-hi G] [--emin E]
+```
+Default log `data/p0_rec_1e32.log` (the `scripts/p0_rec_campaign.sh` campaign),
+default figure `data/p0_rec_1e32_vs_hl.png`; `--dark` also writes
+`*_dark.png`.  The campaign logs EVERY gap above a hard threshold, so one band
+of it is an exhaustive census just like the wall walk - but at
+`L = ln 1e32 = 73.68`, ~9 above the `L ~ 30..64` curve the tables were
+calibrated on, which makes the agreement an out-of-sample test.  Four panels:
+
+* **A/B census** - `N(g >= G)` measured vs `R * SUM_g rho_g(L)`, then the same
+  comparison bin by bin (`rho_g(L) R` vs the count of exactly `g`) with a
+  chi-square over the lengths that have `E >= 1`.
+* **C merit** - everything on ONE scale, `m = gap / ln x`: the record table for
+  every length in the band (`data/prime_gap_merits.txt`), **split into external
+  holders and our own wall campaign** (see below), the external bests this
+  campaign beat, our records (`m = gap/L`, fixed by the range) and the model's
+  merit at the predicted first occurrence (`gap/ln x_hl`, 39.5-45.1 here).
+  Merit units matter: drawn as `log10(x)` the external bests reach 1e40 and the
+  axis ticks (37.5, 40) read like merits the campaign never earned - the
+  highest merit actually found is 33.63, and the title says so.  The shaded top
+  is where a length would have to appear BEFORE its expected first occurrence.
+  It is empty: the model's first occurrence is far beyond anything either
+  campaign has produced (see "why the model's first occurrences are so high").
+* **D record yield** - cumulative `#winnable -> E[records] -> recorded`.  A
+  length is winnable iff `table_merit(g) < g/L` (deterministic at a fixed
+  range), but it only becomes a record if a gap of that exact length appears,
+  at `1 - exp(-rho_g R)`; `E[records]` is therefore a prediction the campaign
+  can be scored against.
+
+Coverage is read differently from the walk case: the driver appends segment
+after segment to ONE log/out pair, so `R = (frontier - first start) + off0` of
+the live state file (the `next start=` line of the driver's segment summary),
+not a sum over per-slice logs.  A segment killed by SIGTERM is re-run from its
+own state file, so its `engine=walk start=` line appears twice while the range
+is still scanned once - summing sessions would double-count.  Prints the
+density gate, the census ratio with its Poisson sigma, the chi-square, the
+yield funnel and the per-length record table (previous best, ours, gain,
+decades closed / still to go).
+
+Measured 2026-11-03 (183 completed segments + the live one, `R = 1.57e17`, 597
+events): census 597 vs 591 predicted (+1.0 %, +0.2 sigma), chi-square 90.5 over
+95 lengths, record lengths 63 vs 61.1 expected (+0.2 sigma), median 2.40 of
+11.47 decades closed.  Merits: highest found 33.63; the 63 bests it beat were
+all external and sat at 25.99-29.86; the model's first occurrence is 39.5-45.1,
+i.e. every record is still ~5.9 merit (9.1 decades of x) below where its length
+is expected to begin.
+`R` grows while the campaign runs, so the predicted count drifts by < 0.1 % per
+8.5e14 segment - a re-run never reproduces the exact digits, only the verdict.
+
+**Two campaigns, do not mix them.**  The WALL campaign runs - and keeps running
+- on the fleet host (`ssh gap20`, `/home/deki/git/Gap_miner_v2`): one walker per
+GPU under `scripts/p0_walk_chain.py`, start 7.9e28, gap_min 1664, one log per
+slice under `data/p0_walk_wall*`.  Its logs live there, so
+`scripts/p0_walk_hl_compare.py` is run there and that figure is produced there.
+The RECORD campaign is this box's (`scripts/p0_rec_campaign.sh`, start 1e32,
+gap_min 2002, ONE appended log/out pair, charted here).  Neither script will
+accept the other's logs any more - `p0_rec_hl_compare.py --log
+data/p0_walk_wall_c1_g1664.log` and `p0_walk_hl_compare.py --glob
+'data/p0_rec*.log'` both stop with a pointer to the right tool, because a wall
+slice has no campaign frontier and a record log has no slices.  They meet in exactly one place: the live record
+table already contains the wall campaign's own records, so in our band 22 of
+the 269 lengths are held by this account at x = 7.9e28.  Panel C draws those as
+separate diamonds and panel D splits the 53 seen-but-not-recorded lengths into
+`blocked by our own wall record: 20` / `blocked by an external record: 33`;
+treating them as third-party results would make the record campaign look like
+it competes with others on lengths where it is in fact competing with our own
+fleet.  The 63 records it did set were all against external holders.
+
+`scripts/hl_validate_tables.py` - out-of-sample test of titanV's tables, and
+the honest answer to "can our data improve them":
+
+```
+scripts/hl_validate_tables.py [--csv OUT.csv] [--plot [PNG]] [--first-occ-only]
+```
+Every one of our campaigns is an exhaustive census at ONE `L`, so the model's
+free content there is `rho_g(L)` and every measured count is a Poisson draw
+from `rho_g(L)*R`.  The script fits ONE parameter per campaign,
+`rho_true = rho_model * exp(-eps/L)` (a uniform shift of `c1`), which is far
+tighter than the median of the per-length ratios.  Three scans, all outside or
+at the edge of the tables' `L ~ 30..64` calibration band:
+
+| campaign | L | R | census | eps | +/- 1 sigma | eps/g (error of c1) |
+|---|---|---|---|---|---|---|
+| `p0_campaign_2e20` | 46.74 | 1.0e14 | 0.9982 (-0.2 %) | +0.08 | 0.11 | +0.012 % +/- 0.016 % |
+| wall (fleet) | 66.54 | 3.0e17 | 1.0101 (+1.0 %) | -0.67 | 0.64 | -0.040 % +/- 0.038 % |
+| record (dev) | 73.68 | 1.6e17 | 1.0127 (+1.3 %) | -0.93 | 3.01 | -0.046 % +/- 0.150 % |
+
+**Verdict: the tables need no correction here - they are validated, out of
+sample, to 0.05 % in `c1` and 1.5 % in the census count up to `L = 73.7`.**  That
+is the contribution worth handing over, not a refit.  Two details in the method
+are load-bearing and were both measured, not assumed:
+
+* the expected census must be summed over EVERY tabulated length above the
+  cut, not only the ones that were seen - otherwise the data chooses its own
+  support;
+* the cut must be the device threshold (`--gap-min`, or `merit_min*L`), rounded
+  up to an even number.  At 2e20 the single unloggable length `g = 700` alone
+  adds 24k of the 178k expected, and the census reads 0.949 instead of 0.998.
+
+Fitting the residual drift, `eps(L) = a + b/L` gives `delta_c2 = -118 +/- 98`
+(about -1.3 % of `c2`) - a 1.2 sigma hint, explicitly not a correction.
+
+The second block tests the **first-occurrence** column, which is defined as the
+root of `rho_g(L)*x = 1`, i.e. `E[count] = 1`.  Two different things can be
+wrong with that, and they have very different sizes:
+
+* the STATISTICS: the first occurrence of a Poisson process is a random
+  variable - conditional on it happening at `x`, `rho*x` is Exponential(1), so
+  a single observed first occurrence scatters by a factor `e`.  The root of
+  `E[count] = 1` is the MEAN; the MEDIAN is the root of `rho*x = ln 2`, a
+  fixed `-0.19` in `ln x` (= -0.083 decades) earlier for every length.  That is
+  a free, exact improvement to the table.
+* the PHYSICS: for `g <= 1476` the record in `data/prime_gap_merits.txt` IS the
+  true first occurrence (the searches below 4e18 are exhaustive), so
+  `E[count]` at it can be measured against Exp(1).  Over 693 such lengths the
+  model gives median 1.3-1.8 and mean ~2.0 against Exp(1)'s 0.69 / 1.0, i.e.
+  its `rho` is ~1.5-2x too large and `x*` ~20 % too small for `g <= 1400`;
+  above `g ~ 1400` the sign flips (2x too late, n = 7).  That last band is the
+  only genuinely wrong physics, and our campaigns do not reach it (their
+  thresholds sit above it), so we cannot fix it - the constant-gap-law data can.
+
+`--plot` writes `data/hl_validate_tables.png` (the `eps(L)` points with error
+bars, and the first-occurrence histogram vs Exp(1)); `--csv` writes the
+per-length measurements (`data/hl_validate_points.csv`, 514 points: campaign,
+`L`, `R`, gap, observed, expected, `rho_meas`, `c1_eff`, `c1_table`) as
+validation points the table's author can check directly.
 
 `scripts/p0_record_forecast.py` - which records are still available at a fixed
 scan scale (and how many the rest of a campaign will produce):
@@ -755,7 +1618,10 @@ the `--walk-primes` row in §2).
 | walk test-mode parity (wall band) | `--engine walk --start 79000000000010000000000000000 --length 1200000000000 --gap-min 1100 --walk-primes 150000 --walk-batch 96 --no-records --log L` with the default (mode 4) and with `P0_WALK_TESTMODE=0` (perig), and with `bin/phase0_scan_gpu_split`: **428 gaps and `tests=3671852807` in all three**, gap sets identical after stripping the session-id column (measured 2026-10-30; the fleet's two RTX 3060s give the same 428 gaps and `tests=3671852807` with the default and with `P0_WALK_TESTMODE=0`, and at `--walk-primes 85000` the same 428 gaps with `tests=3855397099`) |
 | `./bin/phase0_scan_gpu --length 500000000 --merit-min 10 --log L` | `204` rows, top-4 `724/690/684/682` (merits `15.4883/14.7610/14.6326/14.5898`), 0 unverified |
 | fast vs legacy equivalence | `--merit-min 10` on 1e10: 4439 rows, byte-identical between default and `--legacy-mr` (sorted, timestamp stripped) |
-| PSP fixture | `--start 18447233110000000000 --length 5000000000 --merit-min 15` contains `gap=710 merit=16.0049 verified=1` (the 2-PSP 18447233112263860537 must never appear), 0 unverified |
+| hard-composite fixture | `--start 18447233110000000000 --length 5000000000 --merit-min 15` contains `gap=710 merit=16.0049 verified=1`, 0 unverified, and the semiprime `18447233112263860537 = 4015729 x 4593744526153` never appears as a prime.  **Not** a pseudoprime despite the old label - see the correction in §2 (measured 2026-11-04: `2^(n-1) mod n != 1`).  Exercises "two factors above any sieve depth must not be prime", nothing about test strength.  CPU-side, no GPU: `scripts/psp_probe.py --fixtures` |
+| ground truth vs BrianK's published list | `scripts/psp_probe.py --brik` must print the misses as **61 / 37 / 26 / 0 / 0** for Fermat / Euler/Jacobi / strong base 2 / strong 2+3 / strong 2..37 over the 61 published `>= 800` pseudoprime gaps in `1e20..1e21`.  Any change to a discovery test or to `w_test_mode` that moves these numbers is a correctness event. |
+| pseudoprime fixtures (all three classes) | three small windows, no GPU needed for the first: `scripts/psp_probe.py --fixtures` prints the class of each interior number and whether each engine finds the gap.  Against the binary: **(a) gap 156, Fermat-but-not-Euler** `108081990803 = 42443 x 2546521` - `--engine walk --start 108081990600 --length 600 --gap-min 150 --walk-primes 30000 --walk-batch 8` must log `108081990733 156 6.1402 ... verified=1` (our Euler/Jacobi test DOES catch this class); **(b) gap 956, Euler/Jacobi** - `--engine sieve --start 160696461657079904863 --length 3000 --merit-min 20 --sieve-limit 30000` must log `160696461657079905863 956 20.5476 ... verified=1` while `--engine walk` (`--gap-min 900 --walk-primes 30000 --walk-batch 8`) prints **0 rows** (the documented limitation, pinned on purpose: if the walk starts reporting it, the test selection changed and §2 must be re-read); **(c) gap 710** is a hard composite, not a pseudoprime, and both engines find it. |
+| pseudoprime endpoint rejected at emission | the publish-side guard, and the only thing that stops a pseudoprime from becoming a *claim*.  `--engine walk --start 160696461657079904863 --length 3000 --gap-min 400 --walk-primes 30000 --walk-batch 8 --log L` must log **exactly two rows and both `verified=0`**: `160696461657079905863 410 8.8123 160696461657079906273` and `160696461657079906273 546 11.7354 160696461657079906819`.  The walk accepts the Euler/Jacobi pseudoprime `...906273` and splits the 956 gap there, so the *emission* happens - `verify_gap()` (`mpz_probab_prime_p(lower,25)` **and** `mpz_nextprime(lower) == upper`) is what turns the flag off, and `process_prime_gap()` counts it in `gaps_bad`.  A `verified=1` on either row means the guard is off and every published gap is suspect.  Reproducible (2026-11-05: two runs, data rows identical). |
 | walk engine regression | `--engine walk --start 200000000000000000000 --length 18119393280 --gap-min 702 --log L`: exactly 22 rows, identical to the standalone engine fixture `(lower mod 2^64, gap)` pairs, all `verified=1` |
 | engine cross-check | same range, `--merit-min 10.65` (sieve) vs `--engine walk --gap-min 500`: after filtering gap >= 500 the gap sets must be identical (measured 1696/1696 on 8 blocks); gaps 498..499 appear only in the sieve log |
 | walk resume | kill a `--state` run mid-flight, rerun the same command: checkpoint `off0` printed as `resumed from ... (X%)`, final log set identical to an uninterrupted run, no duplicates (measured 12969 = 12969 exact) |
@@ -963,6 +1829,9 @@ analysis simple); keep `--state` file names unique per campaign geometry.
 | `data/p0_campaign_2e20.log` | completed 1e14 m>=15 dataset (169,276 rows; 0 verification failures) |
 | `data/p0_campaign_2e20.out` | console transcript of the same campaign (bands, top-4, split) |
 | `data/p0_hl_compare.png`, `data/p0_hl_compare_dark.png` | merit-tail vs HL-1t / HL-4p figure |
+| `data/p0_rec_1e32_vs_hl.png`, `data/p0_rec_1e32_vs_hl_dark.png` | dev record campaign (x = 1e32) vs the HL tables: census, per-length census, first occurrence, record yield |
+| `data/hl_validate_tables.png` | out-of-sample test of the HL tables at L = 46.7 / 66.5 / 73.7, and the first-occurrence diagnostic |
+| `data/hl_validate_points.csv` | 514 per-length validation points (campaign, L, R, gap, observed, expected, rho_meas, c1_eff, c1_table) - hand-off for the table's author |
 | `data/prime_gap_merits.txt` | best-known gap-length merit table used by the record check (123,436 lengths) |
 | `records_to_submit_phase0.txt` | GENERATED submit batch (own records, `D.Benko`); see the harvest watcher in § 6 |
 | `data/p0_records_sent.txt` | rows already POSTed - excluded from the batch (written by `--mark-sent`) |

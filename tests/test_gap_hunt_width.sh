@@ -3,6 +3,8 @@
 set -euo pipefail
 
 cd "$(dirname "$0")/.."
+bin=${GAPMINER_BIN:-./bin/gapminer}
+verify=${TEST_GAP_HUNT_BIN:-./bin/test_gap_hunt}
 work=$(mktemp -d "${TMPDIR:-/tmp}/gap-hunt-width.XXXXXXXX")
 names=(w320_full w320_jump w320_jump2 w640_full w640_jump w640_jump2
        cross320 cross640 overflow_full overflow_serial overflow_prefetch
@@ -37,7 +39,7 @@ run_parity() {
         env "${gpu_env[@]}" GAP_HUNT_KMAX=1024 GAP_HUNT_BATCH=128 \
             GAP_HUNT_JUMP="$jump" GAP_HUNT_JUMP2="$jump2" \
             GAP_HUNT_PREFETCH="$prefetch" \
-            ./bin/gapminer --gap-hunt --crt-file "$width_cover" \
+            "$bin" --gap-hunt --crt-file "$width_cover" \
             --gap-hunt-min-merit "$merit" --gap-hunt-state "$work/$name.state" \
             --gap-hunt-out "$work/$name.gaps" >"$work/$name.log" 2>&1 ||
             fail "$name hunt failed" "$work/$name.log"
@@ -54,7 +56,7 @@ run_parity() {
                 <(LC_ALL=C sort "$work/w${width}_$mode.gaps") ||
             fail "$width-bit $mode output differs from full scan"
     done
-    ./bin/test_gap_hunt "$work/w${width}_jump2.gaps" bpsw
+    "$verify" "$work/w${width}_jump2.gaps" bpsw
     echo "PASS: full, jump and jump2 emit the same $width-bit gaps"
 }
 run_parity 320 "$cover" 7 'CGBN kernel active (AL=5, 320-bit, TPI=2)'
@@ -75,7 +77,7 @@ for width in 320 640; do
     fi
     env "${gpu_env[@]}" GAP_HUNT_KMAX=64 GAP_HUNT_BATCH=8 \
         GAP_HUNT_JUMP=0 GAP_HUNT_JUMP2=1 GAP_HUNT_PREFETCH=0 \
-        ./bin/gapminer --gap-hunt --crt-file "$width_cover" \
+        "$bin" --gap-hunt --crt-file "$width_cover" \
         --gap-hunt-start "$anchor" --gap-hunt-min-merit 7 \
         --gap-hunt-state "$work/cross$width.state" \
         --gap-hunt-out "$work/cross$width.gaps" >"$work/cross$width.log" 2>&1 ||
@@ -84,7 +86,7 @@ for width in 320 640; do
         fail "$width-bit boundary did not widen" "$work/cross$width.log"
     [[ -s $work/cross$width.gaps ]] ||
         fail "$width-bit boundary test emitted no gaps" "$work/cross$width.log"
-    ./bin/test_gap_hunt "$work/cross$width.gaps" bpsw
+    "$verify" "$work/cross$width.gaps" bpsw
 done
 echo "PASS: walks crossing 320/640 bits widen without truncation"
 
@@ -98,7 +100,7 @@ for mode in full serial prefetch; do
     name=overflow_$mode
     if env "${gpu_env[@]}" GAP_HUNT_KMAX=64 GAP_HUNT_BATCH=2 \
         GAP_HUNT_JUMP=0 GAP_HUNT_JUMP2="$jump2" GAP_HUNT_PREFETCH="$prefetch" \
-        ./bin/gapminer --gap-hunt --crt-file "$cover" \
+        "$bin" --gap-hunt --crt-file "$cover" \
         --gap-hunt-start "$anchor2048" --gap-hunt-min-merit 15 \
         --gap-hunt-state "$work/$name.state" >"$work/$name.log" 2>&1; then
         fail "$name unexpectedly succeeded" "$work/$name.log"
@@ -116,7 +118,7 @@ echo "PASS: 2048-bit overflow preserves safe flight watermarks"
 anchor_start=$(BC_LINE_LENGTH=0 bc <<< 'obase=16; 2^2048 + 2^64')
 if env "${gpu_env[@]}" GAP_HUNT_KMAX=64 GAP_HUNT_BATCH=2 \
     GAP_HUNT_JUMP=0 GAP_HUNT_JUMP2=1 GAP_HUNT_PREFETCH=0 \
-    ./bin/gapminer --gap-hunt --crt-file "$cover" --gap-hunt-start "$anchor_start" \
+    "$bin" --gap-hunt --crt-file "$cover" --gap-hunt-start "$anchor_start" \
     --gap-hunt-min-merit 15 --gap-hunt-state "$work/overflow_start.state" \
     >"$work/overflow_start.log" 2>&1; then
     fail "over-width start unexpectedly succeeded" "$work/overflow_start.log"
@@ -135,7 +137,7 @@ for mode in final periodic; do
     name=missing_$mode
     if env "${gpu_env[@]}" GAP_HUNT_KMAX="$max" GAP_HUNT_BATCH=128 \
         GAP_HUNT_JUMP=0 GAP_HUNT_JUMP2=1 GAP_HUNT_PREFETCH=0 \
-        ./bin/gapminer --gap-hunt --crt-file "$cover" --gap-hunt-min-merit 15 \
+        "$bin" --gap-hunt --crt-file "$cover" --gap-hunt-min-merit 15 \
         --gap-hunt-state "$work/nonexistent/state" >"$work/$name.log" 2>&1; then
         fail "$name unexpectedly succeeded" "$work/$name.log"
     else

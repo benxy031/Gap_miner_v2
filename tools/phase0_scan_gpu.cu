@@ -22,11 +22,36 @@
  *               mpz_probab_prime_p(lower, 25) >= 1  AND
  *               mpz_nextprime(lower) == upper.
  *
- * Test strength: the kernel is a base-2 strong probable prime test. Composite
- * verdicts are conclusive; "prime" verdicts carry the usual base-2 caveat
- * (base-2 strong pseudoprimes: density ~1.8e-15 near 2^64, none known near
- * 2e20). A pseudoprime could only SPLIT a real gap (making us miss it); it
- * cannot create a false gap, and every reported gap is GMP-re-verified below.
+ * Test strength: the sieve engine tests with a base-2 STRONG probable prime
+ * test (mr_base2, 3 x 32 CIOS).  The WALK engine does NOT: its production
+ * bands select the cheaper fused base-2 EULER/JACOBI test (w_test_mode: modes
+ * 0/3/4/5 = perig, p0lazy, p0u96, p0u108; only modes 1/2, at >= 2^120, are
+ * strong).  That distinction matters for the completeness claim, because an
+ * Euler/Jacobi test accepts most Carmichael numbers that a strong test
+ * rejects: of the first 51 Carmichael numbers, 41 pass Euler/Jacobi base-2 and
+ * only 5 pass the strong base-2 test (measured 2026-11-03).  So "prime" on the
+ * walk path means "no base-2 Euler/Jacobi witness", not "no strong witness".
+ *
+ * In either case the composite side is conclusive and only that side is
+ * conclusive: a prime always passes, so a FAILED test really is a proof of
+ * compositeness, while a PASSING test is a pseudoprime risk.  A pseudoprime
+ * can therefore only SPLIT a real gap (making us miss it), never create a
+ * false one, and every gap that IS reported is GMP-re-verified below
+ * (mpz_probab_prime_p(25) + mpz_nextprime) - but that check cannot recover a
+ * gap the walk never reported.  Measured risk at the production wall
+ * (x = 1e32, --walk-primes 150000): 0 base-2 Euler/Jacobi pseudoprimes among
+ * 54,536 Euler-passing numbers (95 % CL < 1.5e-6 per odd number), and the
+ * classical growth of the pseudoprime count (density falls ~4x per decade)
+ * puts the campaign-wide expectation far below 1.  No PSP sieve is in-tree;
+ * see README_PHASE0.md "Pseudoprimes and Carmichael numbers" for how PGS and
+ * PGN guard this and what a comprehensive claim would need.
+ *
+ * Do NOT read the strong test as a fix for completeness.  On BrianK's published
+ * complete list of gaps >= 800 in 1e20..1e21 whose interior holds a base-2
+ * pseudoprime with no factor < 1e7 (61 gaps), Euler/Jacobi misses 37 and a
+ * STRONG base-2 test still misses 26 - those are genuine strong pseudoprimes to
+ * base 2.  A second base (3) catches all 61.  scripts/psp_probe.py --brik
+ * scores any candidate test against that list.
  *
  * Limits: start > sieve-limit (primes in range must exceed the sieve), and
  * start + length <= 2^128 with --engine walk (its Fermat test is two 64-bit

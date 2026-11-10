@@ -166,6 +166,15 @@ def main(argv=None):
     logs = sorted(set(logs))
     if not logs:
         raise SystemExit("no walk logs matched %s" % pats)
+    # The record campaign appends to ONE log (data/p0_rec_1e32.log) and is
+    # charted by p0_rec_hl_compare.py; its coverage comes from the driver's
+    # frontier, not from slice summaries - refuse rather than mis-chart it.
+    rec = [l for l in logs if os.path.basename(l).startswith("p0_rec")]
+    if rec:
+        raise SystemExit(
+            "%s belongs to the RECORD campaign (one appended log, start 1e32).\n"
+            "Chart it with:  scripts/p0_rec_hl_compare.py --log %s"
+            % (os.path.basename(rec[0]), rec[0]))
 
     slices, gaps, records = [], [], {}
     for log in logs:

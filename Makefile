@@ -93,6 +93,7 @@ SOURCES = $(SRC_DIR)/sieve_core.c \
           $(SRC_DIR)/submission_pipeline.c \
           $(SRC_DIR)/merit_records.c \
           $(SRC_DIR)/record_log.c \
+          $(SRC_DIR)/gap_hunt_center.c \
           $(SRC_DIR)/gap_hunt.c \
           $(SRC_DIR)/stratum.c
 
@@ -125,6 +126,7 @@ GEN_CRT = $(BIN_DIR)/gen_crt
 TEST_CRT_RUNTIME = $(BIN_DIR)/test_crt_runtime
 TEST_CRT_SUBMISSION = $(BIN_DIR)/test_crt_submission
 TEST_GAP_HUNT = $(BIN_DIR)/test_gap_hunt
+TEST_GAP_HUNT_CENTER = $(BIN_DIR)/test_gap_hunt_center
 TEST_STRATUM = $(BIN_DIR)/test_stratum
 TEST_SMOOTH = $(BIN_DIR)/test_smooth_range
 SMOOTH_PATTERN = $(BIN_DIR)/smooth_pattern
@@ -143,10 +145,10 @@ BENCH_U96 = $(BIN_DIR)/bench_u96
 BENCH_U108 = $(BIN_DIR)/bench_u108
 
 # Phony targets
-.PHONY: all clean test test-gap-hunt-width test-phase0-sieve-counts help update-merits
+.PHONY: all clean test test-gap-hunt-width test-gap-hunt-center test-phase0-sieve-counts help update-merits
 
 # Default target
-all: $(BIN_DIR) $(BUILD_DIR) $(OBJECTS) $(MAIN_BINARY) $(TEST_GAP_DETECTION) $(TEST_PRIMALITY) $(TEST_WORKER_THREADS) $(TEST_GAPCOIN_RPC) $(TEST_BLOCK_SUBMISSION) $(TEST_SIEVE_CORE) $(TEST_GPU_FERMAT) $(TEST_GPU_SIEVE) $(TEST_GPU_RESOLVE) $(TEST_GAP_DIST) $(TEST_HALFCLASS) $(TEST_GAP_PRIORITY) $(TEST_CRT_SET) $(TEST_GAP_TARGET) $(TEST_POW_Q48) $(TEST_COVERING) $(TEST_CRT_RUNTIME) $(TEST_CRT_SUBMISSION) $(TEST_GAP_HUNT) $(TEST_STRATUM) $(TEST_SMOOTH) $(SMOOTH_PATTERN) $(CRT_GEN) $(GEN_CRT) $(COVER_MAX)
+all: $(BIN_DIR) $(BUILD_DIR) $(OBJECTS) $(MAIN_BINARY) $(TEST_GAP_DETECTION) $(TEST_PRIMALITY) $(TEST_WORKER_THREADS) $(TEST_GAPCOIN_RPC) $(TEST_BLOCK_SUBMISSION) $(TEST_SIEVE_CORE) $(TEST_GPU_FERMAT) $(TEST_GPU_SIEVE) $(TEST_GPU_RESOLVE) $(TEST_GAP_DIST) $(TEST_HALFCLASS) $(TEST_GAP_PRIORITY) $(TEST_CRT_SET) $(TEST_GAP_TARGET) $(TEST_POW_Q48) $(TEST_COVERING) $(TEST_CRT_RUNTIME) $(TEST_CRT_SUBMISSION) $(TEST_GAP_HUNT) $(TEST_GAP_HUNT_CENTER) $(TEST_STRATUM) $(TEST_SMOOTH) $(SMOOTH_PATTERN) $(CRT_GEN) $(GEN_CRT) $(COVER_MAX)
 
 # CUDA-only dev tool, not part of the default build: make bin/bench_mark WITH_CUDA=1
 
@@ -318,6 +320,19 @@ $(BUILD_DIR)/tools/%.o: tools/%.cu | $(BUILD_DIR)
 	@mkdir -p $(dir $@)
 	$(NVCC) -O3 $(CUDA_ARCH) -std=c++17 -MMD -MP -Xcompiler -O2 -I$(SRC_DIR)/gpu -c $< -o $@
 
+ifdef WITH_CUDA
+$(BIN_DIR)/libpsp_pairs_gpu.so: tools/psp_pairs_gpu.cu $(BUILD_FLAGS_STAMP) | $(BIN_DIR)
+	$(NVCC) -O3 $(CUDA_ARCH) -std=c++17 -shared -Xcompiler -fPIC $< -o $@
+else
+$(BIN_DIR)/libpsp_pairs_gpu.so:
+	@echo "PSP GPU filter requires WITH_CUDA=1 and nvcc" >&2
+	@exit 2
+endif
+
+.PHONY: test-psp-gpu
+test-psp-gpu: $(BIN_DIR)/libpsp_pairs_gpu.so
+	PSP_GPU_TEST=1 python3 -m unittest discover -s tests -p test_psp_gpu.py
+
 $(BUILD_DIR)/tools/mr68_gpu.o: tools/mr68_kernel.cuh
 $(BUILD_DIR)/tools/mr128_bench.o: tools/mr128_kernel.cuh tools/mr128_64_kernel.cuh \
     tools/perig.cuh
@@ -387,9 +402,20 @@ $(TEST_GAP_HUNT): $(BUILD_DIR)/$(SRC_DIR)/primality_bpsw.o $(BUILD_DIR)/$(TEST_D
 	$(CC) $(CFLAGS) $^ -lm -lgmp -o $@
 	@echo "✓ Built: $@"
 
+$(TEST_GAP_HUNT_CENTER): $(BUILD_DIR)/$(SRC_DIR)/gap_hunt_center.o $(BUILD_DIR)/$(TEST_DIR)/test_gap_hunt_center.o | $(BIN_DIR)
+	$(CC) $(CFLAGS) $^ -o $@
+	@echo "✓ Built: $@"
+
 # Requires a CUDA device, CGBN and the default GPU_BITS=2048.
 test-gap-hunt-width: $(MAIN_BINARY) $(TEST_GAP_HUNT)
-	@bash $(TEST_DIR)/test_gap_hunt_width.sh
+	@GAPMINER_BIN="$(MAIN_BINARY)" TEST_GAP_HUNT_BIN="$(TEST_GAP_HUNT)" \
+		bash $(TEST_DIR)/test_gap_hunt_width.sh
+
+# Also requires CUDA, CGBN and GPU_BITS=2048 for the wide-cover regression.
+test-gap-hunt-center: $(MAIN_BINARY) $(TEST_GAP_HUNT) $(TEST_GAP_HUNT_CENTER)
+	@$(TEST_GAP_HUNT_CENTER)
+	@GAPMINER_BIN="$(MAIN_BINARY)" TEST_GAP_HUNT_BIN="$(TEST_GAP_HUNT)" \
+		bash $(TEST_DIR)/test_gap_hunt_center.sh
 
 # Gapcoin legacy stratum client (mock pool server, no network needed)
 $(TEST_STRATUM): $(BUILD_DIR)/$(SRC_DIR)/stratum.o $(BUILD_DIR)/$(TEST_DIR)/test_stratum.o | $(BIN_DIR)
@@ -438,7 +464,7 @@ endif
 	$(NVCC) -O3 $(CUDA_ARCH) $(NVCC_FLAGS) -c $< -o $@
 
 # Run tests
-test: $(TEST_GAP_DETECTION) $(TEST_PRIMALITY) $(TEST_WORKER_THREADS) $(TEST_GAPCOIN_RPC) $(TEST_BLOCK_SUBMISSION) $(TEST_SIEVE_CORE) $(TEST_GPU_FERMAT) $(TEST_GPU_SIEVE) $(TEST_GPU_RESOLVE) $(TEST_GAP_DIST) $(TEST_HALFCLASS) $(TEST_GAP_PRIORITY) $(TEST_CRT_SET) $(TEST_GAP_TARGET) $(TEST_POW_Q48) $(TEST_COVERING) $(TEST_CRT_RUNTIME) $(TEST_CRT_SUBMISSION) $(TEST_STRATUM) $(TEST_SMOOTH)
+test: $(TEST_GAP_DETECTION) $(TEST_PRIMALITY) $(TEST_WORKER_THREADS) $(TEST_GAPCOIN_RPC) $(TEST_BLOCK_SUBMISSION) $(TEST_SIEVE_CORE) $(TEST_GPU_FERMAT) $(TEST_GPU_SIEVE) $(TEST_GPU_RESOLVE) $(TEST_GAP_DIST) $(TEST_HALFCLASS) $(TEST_GAP_PRIORITY) $(TEST_CRT_SET) $(TEST_GAP_TARGET) $(TEST_POW_Q48) $(TEST_COVERING) $(TEST_CRT_RUNTIME) $(TEST_CRT_SUBMISSION) $(TEST_GAP_HUNT_CENTER) $(TEST_STRATUM) $(TEST_SMOOTH)
 	@echo "\n========== Running Integration Tests =========="
 	@$(TEST_GAP_DETECTION)
 	@echo ""
@@ -475,6 +501,8 @@ test: $(TEST_GAP_DETECTION) $(TEST_PRIMALITY) $(TEST_WORKER_THREADS) $(TEST_GAPC
 	@$(TEST_CRT_RUNTIME)
 	@echo ""
 	@$(TEST_CRT_SUBMISSION)
+	@echo ""
+	@$(TEST_GAP_HUNT_CENTER)
 	@echo ""
 	@$(TEST_STRATUM)
 	@echo ""

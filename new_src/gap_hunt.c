@@ -32,6 +32,7 @@
 #include "gpu_adapter.h"
 #include "gpu/gpu_sieve.h"
 #include "gpu/gpu_fermat.h"
+#include "gap_hunt_center.h"
 #endif
 
 #ifdef WITH_CUDA
@@ -256,6 +257,7 @@ static int g_jump = 0;         /* GAP_HUNT_JUMP env: Kehrig-style walk */
                                           21->+0.25%, shift1017 m16 33->+0.5%,
                                           K=512 floor). */
 static int g_jump2 = 1;        /* GAP_HUNT_JUMP2=0 restores the full scan */
+static int g_center = 0;      /* experimental center-first chain */
 static int g_jump2_chunk = GAP_HUNT_JUMP2_CHUNK_DEFAULT;
 /* BEACON-style wave start (GAP_HUNT_JUMP2_WAVE): each window's scan tests
    chunks w0, 2*w0, 4*w0 ... capped at GAP_HUNT_JUMP2_CHUNK.  DEFAULT 8 =
@@ -339,6 +341,8 @@ struct gh_ctx {
     mpz_t P;
     int jump;                   /* GAP_HUNT_JUMP active */
     int jump2;                  /* GAP_HUNT_JUMP2 active (chunk-parallel) */
+    int center;                 /* center-first bidirectional chain */
+    uint64_t center_offset;
     int jump2_chunk;            /* per-window chunk size for jump2 rounds */
     double min_merit;           /* report threshold (jump thresholds) */
     uint64_t jump_thresh[GAP_HUNT_BATCH_MAX];
@@ -984,6 +988,60 @@ static int gh_prefetch_step(struct gh_prefetch *pf, struct gh_ctx *g) {
    hidden.  Fills b->jump_n/s/e for the existing jump-mode reporter. */
 enum { J2_FIND_FIRST = 0, J2_JUMP_BACK = 1, J2_FIND_END = 2, J2_DONE = 3 };
 
+static int gh_jump2_submit_ranges(struct gh_batch *b, int slot,
+                                  struct gh_ctx *g, uint8_t *flags,
+                                  struct gh_prefetch *pf, const uint32_t *lo,
+                                  const uint32_t *hi, const uint32_t *dcum,
+                                  uint32_t K, uint32_t total) {
+    uint32_t gathered = 0;
+    uint64_t rt0 = g_host_timing ? gh_now_us() : 0;
+    /* Gather and MR must use the same stream for staging-buffer ordering. */
+    if (gpu_fermat_gather_run(g->fermat, slot,
+            gpu_sieve_candidate_buffer(g->sieve, slot),
+            b->cum, lo, hi, dcum, K, g->fermat_limbs,
+            &gathered) != 0 || gathered != total) {
+        fprintf(stderr, "[GAP_HUNT] jump2 gather fail: total=%u "
+                        "gathered=%u K=%u\n", total, gathered, K);
+        return 0;
+    }
+    uint64_t rt1 = g_host_timing ? gh_now_us() : 0;
+    if (gpu_fermat_submit_device(g->fermat, slot,
+                                 gpu_fermat_gather_buffer(g->fermat),
+                                 (size_t)total) < 0) {
+        fprintf(stderr, "[GAP_HUNT] jump2 submit fail: total=%u\n", total);
+        return 0;
+    }
+    uint64_t rt2 = g_host_timing ? gh_now_us() : 0;
+    g_j2_tests += total;
+    g_j2_rounds++;
+    /* Fill the next flight while this round's MR kernel runs. */
+    if (pf && !pf->done && !pf->failed) {
+        uint64_t p0 = g_host_timing ? gh_now_us() : 0;
+        gh_prefetch_step(pf, g);
+        if (g_host_timing)
+            g_rt_prefetch_us += gh_now_us() - p0;
+    }
+    uint64_t rt2b = g_host_timing ? gh_now_us() : 0;
+    if (gpu_fermat_collect(g->fermat, slot, flags, (size_t)total) < 0) {
+        fprintf(stderr, "[GAP_HUNT] jump2 collect fail: total=%u\n", total);
+        return 0;
+    }
+    if (g_host_timing) {
+        uint64_t rt3 = gh_now_us();
+        g_rt_gather_us += rt1 - rt0;
+        g_rt_submit_us += rt2 - rt1;
+        g_rt_collect_us += rt3 - rt2b;
+    }
+    return 1;
+}
+
+static uint64_t gh_jump2_threshold(const struct gh_ctx *g,
+                                   const mpz_t win_base) {
+    uint64_t threshold =
+        (uint64_t)ceil(g->min_merit * gh_log_mpz(win_base));
+    return threshold < 1 ? 1 : threshold;
+}
+
 static int gh_jump2_scan(struct gh_batch *b, int slot, struct gh_ctx *g,
                          uint8_t *flags, struct gh_prefetch *pf) {
     const uint32_t C = (uint32_t)g->jump2_chunk;
@@ -1019,10 +1077,7 @@ static int gh_jump2_scan(struct gh_batch *b, int slot, struct gh_ctx *g,
            happened to be prime in a later window — false gaps whose length
            equals the original record's (the "identical gaps" bug). */
         b->jump_n[i] = 0;
-        double t = g->min_merit * gh_log_mpz(b->win_base[i]);
-        thr[i] = (uint64_t)ceil(t);
-        if (thr[i] < 1)
-            thr[i] = 1;
+        thr[i] = gh_jump2_threshold(g, b->win_base[i]);
         pidx[i] = UINT32_MAX;
         qidx[i] = UINT32_MAX;
         phase[i] = J2_FIND_FIRST;
@@ -1056,56 +1111,10 @@ static int gh_jump2_scan(struct gh_batch *b, int slot, struct gh_ctx *g,
                 }
             }
         }
-        if (total > 0) {
-            uint32_t gathered = 0;
-            uint64_t rt0 = g_host_timing ? gh_now_us() : 0;
-            /* slot must be the slot submitted below: the gather is async on
-               that slot's stream and relies on stream order, not a device
-               barrier, to make the staging buffer complete before MR reads
-               it (see gpu_fermat_gather_run). */
-            if (gpu_fermat_gather_run(g->fermat, slot,
-                    gpu_sieve_candidate_buffer(g->sieve, slot),
-                    b->cum, lo, hi, dcum, K, g->fermat_limbs,
-                    &gathered) != 0 || gathered != total) {
-                fprintf(stderr, "[GAP_HUNT] jump2 gather fail: total=%u "
-                        "gathered=%u K=%u\n", total, gathered, K);
-                return 0;
-            }
-            uint64_t rt1 = g_host_timing ? gh_now_us() : 0;
-            if (gpu_fermat_submit_device(g->fermat, slot,
-                    gpu_fermat_gather_buffer(g->fermat),
-                    (size_t)total) < 0) {
-                fprintf(stderr, "[GAP_HUNT] jump2 submit fail: total=%u\n",
-                        total);
-                return 0;
-            }
-            uint64_t rt2 = g_host_timing ? gh_now_us() : 0;
-            g_j2_tests += total;
-            g_j2_rounds++;
-            /* P1 (2026-10-02): fill the NEXT flight's mark/extract HERE --
-               between the MR submit and the blocking collect -- so the fill
-               overlaps this round's MR kernel instead of serializing with
-               the scan (measured: fill and scan SUMMED before). */
-            if (pf && !pf->done && !pf->failed) {
-                uint64_t p0 = g_host_timing ? gh_now_us() : 0;
-                gh_prefetch_step(pf, g);
-                if (g_host_timing)
-                    g_rt_prefetch_us += gh_now_us() - p0;
-            }
-            uint64_t rt2b = g_host_timing ? gh_now_us() : 0;
-            if (gpu_fermat_collect(g->fermat, slot, flags,
-                                   (size_t)total) < 0) {
-                fprintf(stderr, "[GAP_HUNT] jump2 collect fail: total=%u\n",
-                        total);
-                return 0;
-            }
-            if (g_host_timing) {
-                uint64_t rt3 = gh_now_us();
-                g_rt_gather_us += rt1 - rt0;
-                g_rt_submit_us += rt2 - rt1;
-                g_rt_collect_us += rt3 - rt2b;
-            }
-        }
+        if (total > 0 &&
+            !gh_jump2_submit_ranges(b, slot, g, flags, pf, lo, hi, dcum,
+                                    K, total))
+            return 0;
 
         any_active = 0;
         for (uint32_t i = 0; i < K; i++) {
@@ -1235,17 +1244,132 @@ static int gh_jump2_scan(struct gh_batch *b, int slot, struct gh_ctx *g,
     return 1;
 }
 
+static int gh_center_scan(struct gh_batch *b, int slot, struct gh_ctx *g,
+                          uint8_t *flags, struct gh_prefetch *pf) {
+    uint32_t K = b->n_windows;
+    struct gh_center_state state[GAP_HUNT_BATCH_MAX];
+    uint32_t lo[GAP_HUNT_BATCH_MAX], hi[GAP_HUNT_BATCH_MAX];
+    uint32_t dcum[GAP_HUNT_BATCH_MAX];
+    size_t cap = gpu_fermat_max_batch(g->fermat);
+    uint32_t rounds_flight = 0;
+    int C = g->jump2_chunk;
+    if (K == 0)
+        return 1;
+    if (K > GAP_HUNT_BATCH_MAX) {
+        fprintf(stderr, "[GAP_HUNT] center: too many windows in flight: %u\n", K);
+        return 0;
+    }
+    if (cap == 0) {
+        fprintf(stderr, "[GAP_HUNT] center: invalid MR batch capacity\n");
+        return 0;
+    }
+    if (cap > UINT32_MAX)
+        cap = UINT32_MAX;
+    if ((uint64_t)K * (uint64_t)C > cap) {
+        C = (int)(cap / K);
+        if (C < 1)
+            C = 1;
+    }
+    int w0 = (g_jump2_wave >= 2 && g_jump2_wave < C)
+                 ? g_jump2_wave : C;
+
+    for (uint32_t i = 0; i < K; i++) {
+        b->jump_n[i] = 0;
+        int rc = gh_center_init(&state[i], b->win_off[i], b->count[i],
+                                g->center_offset,
+                                gh_jump2_threshold(g, b->win_base[i]),
+                                (uint32_t)C, (uint32_t)w0,
+                                b->jump_s[i], b->jump_e[i],
+                                GAP_HUNT_JUMP_CAP);
+        if (rc != GH_CENTER_OK) {
+            fprintf(stderr, "[GAP_HUNT] center initialization failed: "
+                            "k=%llu result=%d\n",
+                    (unsigned long long)b->base_k[i], rc);
+            return 0;
+        }
+    }
+
+    for (;;) {
+        uint32_t total = 0;
+        int active = 0;
+        for (uint32_t i = 0; i < K; i++) {
+            dcum[i] = total;
+            lo[i] = hi[i] = 0;
+            if (state[i].phase == GH_CENTER_DONE)
+                continue;
+            active = 1;
+            lo[i] = state[i].lo;
+            hi[i] = state[i].hi;
+            if (lo[i] >= hi[i] || hi[i] > b->count[i] ||
+                (size_t)(hi[i] - lo[i]) > cap - total) {
+                fprintf(stderr, "[GAP_HUNT] center: invalid MR range or "
+                                "capacity at k=%llu range=[%u,%u) total=%u\n",
+                        (unsigned long long)b->base_k[i], lo[i], hi[i], total);
+                return 0;
+            }
+            uint32_t n = hi[i] - lo[i];
+            total += n;
+            if (state[i].phase == GH_CENTER_FIND_LEFT ||
+                state[i].phase == GH_CENTER_FIND_RIGHT) {
+                g_j2_t_ff += n;
+            } else if (state[i].phase == GH_CENTER_LEFT_JUMP ||
+                       state[i].phase == GH_CENTER_RIGHT_JUMP) {
+                g_j2_t_jb += n;
+                g_j2_jb_slices++;
+            } else {
+                g_j2_t_fe += n;
+            }
+        }
+        if (!active)
+            break;
+        rounds_flight++;
+        if (!gh_jump2_submit_ranges(b, slot, g, flags, pf, lo, hi, dcum,
+                                    K, total))
+            return 0;
+        for (uint32_t i = 0; i < K; i++) {
+            if (state[i].phase == GH_CENTER_DONE)
+                continue;
+            int rc = gh_center_accept(&state[i], flags + dcum[i],
+                                      hi[i] - lo[i]);
+            if (rc != GH_CENTER_OK) {
+                if (rc == GH_CENTER_CAPACITY)
+                    g_j2_cap_hits++;
+                fprintf(stderr, "[GAP_HUNT] center scan failed: k=%llu "
+                                "result=%d pair_capacity=%d\n",
+                        (unsigned long long)b->base_k[i], rc,
+                        GAP_HUNT_JUMP_CAP);
+                return 0;
+            }
+        }
+    }
+    for (uint32_t i = 0; i < K; i++) {
+        b->jump_n[i] = state[i].n_pairs;
+        if (state[i].n_pairs > g_j2_max_pairs)
+            g_j2_max_pairs = state[i].n_pairs;
+        g_j2_emits += state[i].n_pairs;
+        g_j2_hops += state[i].hops;
+        g_j2_jb_ext += state[i].extensions;
+    }
+    gh_prefetch_note_flight(rounds_flight);
+    return 1;
+}
+
 static int gh_batch_fill(struct gh_batch *b, int slot, uint64_t k0,
                          struct gh_ctx *g, uint8_t *flags) {
     if (!gh_fill_only(b, slot, k0, g))
         return 0;
     uint64_t ht_s = g_host_timing ? gh_now_us() : 0;
-    if (b->total == 0)
+    if (b->total == 0) {
+        if (g->center)
+            memset(b->jump_n, 0, b->n_windows * sizeof(b->jump_n[0]));
         return 1;               /* nothing to MR-test; process as empty */
+    }
     if (g->jump2) {
         /* Chunk-parallel backward search: exact Kehrig chain semantics but
            each step is one batched MR round across all windows. */
-        if (!gh_jump2_scan(b, slot, g, flags, NULL)) {
+        int ok = g->center ? gh_center_scan(b, slot, g, flags, NULL)
+                           : gh_jump2_scan(b, slot, g, flags, NULL);
+        if (!ok) {
             fprintf(stderr, "[GAP_HUNT] fill fail: jump2 scan (k0=%llu)\n",
                     (unsigned long long)k0);
             return 0;
@@ -1593,6 +1717,26 @@ int gap_hunt_run(const struct gap_hunt_config *cfg) {
             g_jump2 = 0;
         else
             g_jump2 = 1;
+        const char *cv = getenv("GAP_HUNT_CENTER");
+        g_center = 0;
+        if (cv) {
+            if (strcmp(cv, "1") == 0)
+                g_center = 1;
+            else if (strcmp(cv, "0") != 0) {
+                fprintf(stderr, "[GAP_HUNT] GAP_HUNT_CENTER must be 0 or 1\n");
+                return 1;
+            }
+        }
+        if (g_center &&
+            (!g_jump2 || g_jump || g_quarter ||
+             (j2v && j2v[0] && strcmp(j2v, "1") != 0) ||
+             (jv && jv[0] && strcmp(jv, "0") != 0) ||
+             (qv && qv[0] && strcmp(qv, "0") != 0))) {
+            fprintf(stderr, "[GAP_HUNT] GAP_HUNT_CENTER=1 requires "
+                            "GAP_HUNT_JUMP2=1, GAP_HUNT_JUMP=0, and "
+                            "GAP_HUNT_QUARTER=0\n");
+            return 1;
+        }
         const char *j2c = getenv("GAP_HUNT_JUMP2_CHUNK");
         if (j2c && j2c[0]) {
             int c = atoi(j2c);
@@ -2058,6 +2202,7 @@ int gap_hunt_run(const struct gap_hunt_config *cfg) {
             "sieve=%u batch=%d mrcap=%llu cumcap=%llu vram_est=%lluMB quarter=%d "
             "jump=%d "
             "jump2=%d "
+            "center=%d "
             "jump2_chunk=%d "
             "jump2_wave=%d "
             "prefetch=%d "
@@ -2080,7 +2225,7 @@ int gap_hunt_run(const struct gap_hunt_config *cfg) {
                                  (uint64_t)gpu_fermat_get_limbs(fermat) * 8U /
                                  1000000U),
             g_quarter,
-            g_jump, g_jump2, g_jump2_chunk, g_jump2_wave, g_pref_qty,
+            g_jump, g_jump2, g_center, g_jump2_chunk, g_jump2_wave, g_pref_qty,
             !g_pref_qty_env,
             residue_incr,
             (unsigned long long)g_kmax, cfg->min_merit,
@@ -2164,6 +2309,8 @@ int gap_hunt_run(const struct gap_hunt_config *cfg) {
     g.quarter = g_quarter;
     g.jump = g_jump;
     g.jump2 = g_jump2;
+    g.center = g_center;
+    g.center_offset = back_limit + rt.gap_target / 2U;
     g.jump2_chunk = g_jump2_chunk;
     g.min_merit = cfg->min_merit;
     g.residue_incr = residue_incr;
@@ -2325,8 +2472,14 @@ int gap_hunt_run(const struct gap_hunt_config *cfg) {
                 pf = &g_pref;
             }
             if (filled_now) {
-                if (fl->total > 0 &&
-                    !gh_jump2_scan(fl, turn, &g, flags, pf)) {
+                int ok = 1;
+                if (fl->total > 0)
+                    ok = g.center ? gh_center_scan(fl, turn, &g, flags, pf)
+                                  : gh_jump2_scan(fl, turn, &g, flags, pf);
+                else if (g.center)
+                    memset(fl->jump_n, 0,
+                           fl->n_windows * sizeof(fl->jump_n[0]));
+                if (!ok) {
                     fprintf(stderr,
                             "[GAP_HUNT] batch fill failed (k=%llu)\n",
                             (unsigned long long)fl->base_k[0]);

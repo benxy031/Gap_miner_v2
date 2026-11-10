@@ -27,29 +27,26 @@ What it reports (per file, then pooled):
     (an empty log is a measurement, not a missing measurement);
   * the merit distribution: min / median / max, the best gap, and the window
     size scale L = ln(start);
-  * whether the observed merit tail matches the geometric/Poisson expectation
-    (a fitted shifted exponential): a threshold table and a Kolmogorov-Smirnov
-    distance.  A tail that is shorter than the fit means candidates near the
-    threshold are being MISSED; a longer one means the threshold or the
-    reporting is wrong.  This is the "is it finding what it should" instrument,
-    not a record hunt;
-  * how that tail compares with NATURE: the same depths are also measured
+  * the observed merit-tail shape against a fitted shifted exponential and the
+    Hardy-Littlewood natural law.  When per-candidate template targets are
+    available, the fit is conditioned on the highest logged target rather than
+    on the sample minimum.  A shape mismatch is descriptive; it does not by
+    itself prove candidates were missed, because the log has no denominator
+    for all eligible work;
+  * how that tail compares with the NATURE reference: the same depths are measured
     against the Hardy-Littlewood natural law (no cover) at this run's own
     L = ln(start), read by scripts/hl_natural.py (exact c1,c2 from the
     distributed coefficient database, power-law c3/c4).  The exponential fit
-    above is SELF-REFERENTIAL - it
-    is fitted to the very data it is compared with - so it can only detect a
-    shape mismatch; the natural line is the external reference.  A tailed cover
-    should sit ABOVE that line by its covering gain (sigma_eff/sigma_nat,
-    printed as xG at merit 28/40).  A tail that MATCHES the natural law means
-    the cover is adding nothing at this size, which is a finding, not a pass.
+    above is SELF-REFERENTIAL - it is fitted to the very data it is compared
+    with - so it is only a shape diagnostic.  An observed tail above the
+    natural reference is consistent with enrichment, but this log alone is not
+    a controlled measurement of cover gain; matching the reference does not
+    prove that the cover adds nothing.
     TWO independent estimators of sigma_nat exist: the baseline in
     scripts/hl_natural.py (exact c1,c2 from the distributed database; the
     line and the dotted curves) and scripts/hl_model.py averaging the LOCAL
-    same-order slopes of the nearest table rows.  They now agree to ~1 % at
-    our sizes; the local reading is printed beside the line as a cross-check
-    and feeds no computed number (sigma_eff comes from the candidates, the
-    gain from the exact coefficients);
+    same-order slopes of the nearest table rows.  Their actual relative spread
+    is printed as a cross-check; the local reading feeds no computed number;
   * how the work source ruled on each candidate (accepted / rejected /
     unresolved / stale ...), PER HOUR — for a pool this is the plot that shows
     a stale-work outage (a run that stops being accepted keeps finding
@@ -490,10 +487,9 @@ def group_L(cands):
 def fit_sigma(merits, m0=None):
     """Mean-excess (maximum-likelihood) scale of a shifted exponential.
 
-    sigma_hat = mean(m - m0) over m >= m0.  With m0 = the sample minimum this
-    is the standard tail estimate (same convention as `gap_hunt_stats.py`); it
-    is biased low because the minimum is itself a sample statistic, so a second
-    estimate above the median is reported next to it as a stability check.
+    sigma_hat = mean(m - m0) over m >= m0.  A known censoring threshold should
+    be supplied as m0; a sample minimum is only a fallback when that threshold
+    is not recorded.
     """
     if not merits:
         return None, None
@@ -502,6 +498,54 @@ def fit_sigma(merits, m0=None):
     if len(tail) < 2:
         return None, m0
     return sum(m - m0 for m in tail) / len(tail), m0
+
+
+def tail_fit_anchor(cands, merits):
+    """Choose a conditional tail anchor from logged template targets.
+
+    A file may span changing network targets.  The sample minimum then is not
+    the censoring boundary for the whole file and fitting from it can inflate
+    sigma.  Use the highest per-candidate template target that was logged;
+    explicitly report incomplete target context because it cannot prove that
+    this anchor covers every candidate's actual threshold.
+    """
+    targets = sorted(
+        c.template_merit for c in cands
+        if c.merit is not None and c.template_merit is not None
+        and math.isfinite(c.template_merit) and c.template_merit > 0.0)
+    if not merits:
+        return None, {
+            "target_count": len(targets),
+            "target_min": targets[0] if targets else None,
+            "target_median": quantile(targets, 0.5) if targets else None,
+            "target_max": targets[-1] if targets else None,
+            "target_varies": False,
+            "missing_targets": 0,
+            "anchor_kind": "none",
+        }
+    if not targets:
+        return min(merits), {
+            "target_count": 0,
+            "target_min": None,
+            "target_median": None,
+            "target_max": None,
+            "target_varies": False,
+            "missing_targets": len(merits),
+            "anchor_kind": "sample minimum (no logged template targets)",
+        }
+    target_min, target_median, target_max = (
+        targets[0], quantile(targets, 0.5), targets[-1])
+    target_varies = (target_max - target_min
+                     > max(0.02, 0.02 * abs(target_median)))
+    return target_max, {
+        "target_count": len(targets),
+        "target_min": target_min,
+        "target_median": target_median,
+        "target_max": target_max,
+        "target_varies": target_varies,
+        "missing_targets": max(0, len(merits) - len(targets)),
+        "anchor_kind": "highest logged template target",
+    }
 
 
 def sigma_from_quantiles(merits):
@@ -658,6 +702,8 @@ def report_group(title, cands, table, args, out=sys.stdout, comparable=True):
     merits = sorted(c.merit for c in cands if c.merit is not None)
     best = cands[max(range(n), key=lambda i: (cands[i].merit or 0.0))] \
         if merits else cands[0]
+    m0, target_context = tail_fit_anchor(cands, merits)
+    fit_n = sum(1 for m in merits if m >= m0) if m0 is not None else 0
 
     print(f"   span           {cands[0].iso} .. {cands[-1].iso}  "
           f"({fmt_duration(hours)})", file=out)
@@ -685,6 +731,26 @@ def report_group(title, cands, table, args, out=sys.stdout, comparable=True):
             print(f"   window scale   L=ln(start) mean {L_nat:.1f}   "
                   f"mean bits {L_nat / math.log(2):.0f}   (n={len(starts)})",
                   file=out)
+        if target_context["target_count"]:
+            target_n = target_context["target_count"]
+            target_pct = 100.0 * target_n / len(merits)
+            print(f"   template target logged for {target_n}/{len(merits)} "
+                  f"candidates ({target_pct:.1f}%); merit range "
+                  f"{target_context['target_min']:.4f}.."
+                  f"{target_context['target_max']:.4f}, median "
+                  f"{target_context['target_median']:.4f}", file=out)
+            if target_context["target_varies"]:
+                print("   !! template target varied materially; tail fit is "
+                      f"conditional on merit >= {m0:.4f} (highest logged "
+                      "target), not on the sample minimum", file=out)
+            if target_context["missing_targets"]:
+                print(f"   !! {target_context['missing_targets']} candidate(s) "
+                      "lack template-target context; this fit cannot establish "
+                      "reporting completeness", file=out)
+        else:
+            print("   !! no per-candidate template targets logged; the tail "
+                  "anchor is the sample minimum and cannot establish the "
+                  "reporting threshold or completeness", file=out)
 
     # ── vs nature: the only non-self-referential reference we have ──────
     # Everything in the fit block below is measured against an exponential
@@ -698,49 +764,48 @@ def report_group(title, cands, table, args, out=sys.stdout, comparable=True):
         s_nat = nat.sigma(L_nat)
         # fit_sigma is called here as well as below: the natural block is
         # printed first, so it cannot rely on the tail block having run.
-        s_eff, _m0_eff = fit_sigma(merits)
+        s_eff, _m0_eff = fit_sigma(merits, m0)
         print(f"   natural tail   sigma_nat={s_nat:.3f} at L={L_nat:.1f} "
               "(HL, no cover; " + nat.source_note(L_nat) + ")", file=out)
         # Same natural sigma, read LOCALLY (hl_model: average of the
         # same-order c-slopes at the nearest table gaps) instead of through
-        # the exact-coefficient baseline above.  The two now agree to ~1 %;
-        # printed so any future divergence stays visible.  It feeds no
-        # computed number below: sigma_eff comes from these candidates and
-        # the gain from the exact coefficients, so no verdict can hinge on
-        # which reading is quoted.
+        # the exact-coefficient baseline above.  Print their actual relative
+        # spread; this cross-check does not feed any computed value below.
         if hl_model is not None:
             gaps = sorted(c.gap for c in cands if c.gap)
             g_t = quantile(gaps, 0.5) if gaps else 24.0 * L_nat
             sn = hl_model.natural_sigma_avg(L_nat, g_t)
             if sn:
+                spread_pct = 100.0 * abs(sn - s_nat) / s_nat
                 print(f"                  cross-check (local slopes, nearest "
-                      f"table gaps): sigma_nat={sn:.3f} -- the ~1 % method "
-                      f"spread changes none of the numbers below", file=out)
-        if s_eff:
-            print(f"                  sigma_eff={s_eff:.3f} -> cover gain "
+                      f"table gaps): sigma_nat={sn:.3f} "
+                      f"(relative spread {spread_pct:.1f}%; cross-check only)",
+                      file=out)
+        if s_eff and fit_n >= 2:
+            print(f"                  sigma_eff={s_eff:.3f} -> model ratio "
                   f"x{nat.gain(28.0, s_eff, L_nat):.1f} at merit 28, "
                   f"x{nat.gain(40.0, s_eff, L_nat):.0f} at merit 40"
-                  "   [MODEL: from the fitted sigma]", file=out)
-            # The countable version of the same statement.  The fitted sigma
-            # absorbs most of the cover effect, so the model number can sit an
-            # order of magnitude above what the observed counts support; when
-            # the two disagree, the counted one is the honest one to quote.
-            m0c = merits[0]
+                  f"   [MODEL vs HL reference; conditional fit at m>={m0:.4f}]",
+                  file=out)
+            # Compare with the same conditional anchor; this is descriptive,
+            # not a controlled measurement of cover gain.
+            m0c = m0
             e0c = nat.E(L_nat, m0c)
             parts = []
             for mm in (28.0, 40.0):
                 obs = sum(1 for m in merits if m >= mm)
-                en = len(merits) * math.exp(-(nat.E(L_nat, mm) - e0c))
+                en = fit_n * math.exp(-(nat.E(L_nat, mm) - e0c))
                 if obs < 5 or en < 5:
                     parts.append(f"m>={mm:.0f}: too thin (obs {obs}, "
                                  f"nat_exp {en:.1f})")
                 else:
                     parts.append(f"m>={mm:.0f}: x{obs / en:.2f} "
                                  f"(obs {obs} vs nat {en:.1f})")
-            print("                  cover gain COUNTED (external, QUOTE THIS): "
-                  + "; ".join(parts), file=out)
-        print("                  a tail that MATCHES this line means the cover "
-              "adds nothing at this size", file=out)
+            print("                  vs HL COUNTED (conditional reference): "
+                  + "; ".join(parts)
+                  + f"   [conditional on m>={m0:.4f}]", file=out)
+        print("                  observed-vs-HL ratios are descriptive, not a "
+              "controlled measurement of cover gain", file=out)
 
     # ── status accounting ────────────────────────────────────────────────────
     disc, verd = {}, {}
@@ -764,24 +829,27 @@ def report_group(title, cands, table, args, out=sys.stdout, comparable=True):
               file=out)
 
     # ── tail shape: is the merit distribution the one it must be? ────────────
-    sigma, m0 = fit_sigma(merits)
-    sigma_q = sigma_from_quantiles(merits)
+    sigma, _ = fit_sigma(merits, m0) if m0 is not None else (None, None)
+    fit_merits = [m for m in merits if m0 is not None and m >= m0]
+    sigma_q = sigma_from_quantiles(fit_merits)
     rows = []          # (threshold, observed, expected, ratio|None, sigma_ratio)
-    if sigma:
-        note = "" if len(merits) >= 30 else "   [n<30: NOISY]"
-        print(f"   tail scale     sigma(mean-excess over min)={sigma:.3f}"
+    if sigma and fit_n >= 2:
+        note = "" if fit_n >= 30 else "   [n<30: NOISY]"
+        print(f"   tail scale     sigma(mean-excess above anchor)={sigma:.3f}"
               + (f"   sigma(quartiles)={sigma_q:.3f}" if sigma_q else "")
               + note, file=out)
-        print(f"   tail table     m0={m0:.4f}  N(m>=m0)={len(merits)}"
-              + ("   [m0 is the sample minimum: the log itself is thresholded, "
-                 "so this is a reference, not the population]" if m0 else ""),
+        print(f"   tail table     m0={m0:.4f} ({target_context['anchor_kind']})  "
+              f"N(m>=m0)={fit_n}"
+              + ("   [sample minimum is not a known reporting threshold]"
+                 if target_context["anchor_kind"].startswith("sample minimum")
+                 else ""),
               file=out)
         print("                    m>=" + " " * 8 + "observed  expected  ratio",
               file=out)
         for k in range(1, 6):
             thr = m0 + k * sigma
             obs = sum(1 for m in merits if m >= thr)
-            exp = len(merits) * math.exp(-(thr - m0) / sigma)
+            exp = fit_n * math.exp(-(thr - m0) / sigma)
             ratio = obs / exp if exp >= 5 else None
             sd = 1.0 / math.sqrt(exp) if exp > 0 else float("inf")
             rows.append((thr, obs, exp, ratio, sd))
@@ -796,10 +864,8 @@ def report_group(title, cands, table, args, out=sys.stdout, comparable=True):
                 note = f"   [beyond noise: 2 sigma = {2.0 * sd:.2f}]"
             print(f"                    {thr:10.4f} {obs:8d} {exp:9.1f} {shown}"
                   f"{note}", file=out)
-        # The same depths against NATURE.  The expected column above comes from
-        # a fit to these very data, so only this comparison can say whether the
-        # cover is doing anything: a ratio above 1 means the observed tail is
-        # flatter than nature at that depth, which is what a cover is for.
+        # Compare with nature conditional on the same fit anchor.  This is a
+        # tail-shape comparison, not a census of candidates that were missed.
         if nat is not None and L_nat > 0:
             e0 = nat.E(L_nat, m0)
             print(f"                    vs nature (HL, no cover, L={L_nat:.1f}):",
@@ -807,15 +873,15 @@ def report_group(title, cands, table, args, out=sys.stdout, comparable=True):
             print("                    m>=" + " " * 8
                   + "observed    nat_exp  obs/nat", file=out)
             for thr, obs, _exp, _ratio, _sd in rows:
-                en = len(merits) * math.exp(-(nat.E(L_nat, thr) - e0))
+                en = fit_n * math.exp(-(nat.E(L_nat, thr) - e0))
                 if en < 5:
                     shown, note = "      -", "   [nat expected <5: ratio weak]"
                 else:
                     r = obs / en
                     shown = f"{r:7.2f}"
-                    note = ("   [flatter than nature = cover working]"
+                    note = ("   [observed tail above HL reference]"
                             if r > 1 else
-                            "   [steeper than nature = cover adds little]")
+                            "   [observed tail below HL reference]")
                 print(f"                    {thr:10.4f} {obs:8d} {en:9.1f} {shown}"
                       f"{note}", file=out)
         # ── deep-end scale: the estimate that survives extrapolation ─────
@@ -894,14 +960,16 @@ def report_group(title, cands, table, args, out=sys.stdout, comparable=True):
             print("                  Possible causes, in order of how often they "
                   "are the real one: the sample MIXES configurations or "
                   "thresholds (see the runs below), sigma really varies over "
-                  "the run, or the reported set is incomplete. It is not by "
-                  "itself evidence of missed candidates.", file=out)
+                  "the run, or the reported set is incomplete. This is a tail-"
+                  "shape diagnostic, not proof that candidates were missed.",
+                  file=out)
         elif not informative:
             print("                  (every threshold is too deep to carry a "
                   "usable count: raise --top or collect more candidates)",
                   file=out)
     else:
-        print("   tail scale     too few candidates for a tail fit", file=out)
+        print(f"   tail scale     too few candidates above anchor "
+              f"m0={m0:.4f} for a tail fit", file=out)
 
     # Contiguous runs: one log file normally holds several sessions, and each
     # may sit at a different threshold.  Report them so a mixture is visible.
@@ -1098,7 +1166,8 @@ def make_plot(all_cands, groups, table, args, outpath):
     ax[1].legend(fontsize=8)
     ax[1].grid(alpha=0.3)
 
-    # (2) merit histogram vs the exponential it must follow
+    # (2) merit histogram with the model curves conditioned on the logged
+    # target anchor where available.
     for name, (cands, _) in groups.items():
         merits = sorted(c.merit for c in cands if c.merit is not None)
         if len(merits) < 3:
@@ -1107,26 +1176,27 @@ def make_plot(all_cands, groups, table, args, outpath):
         ax[2].hist(merits, bins=max(8, min(40, len(merits) // 2)),
                    alpha=0.5, label=f"{os.path.basename(name)} (n={len(merits)})",
                    color=color)
-        sigma, m0 = fit_sigma(merits)
-        if sigma:
+        m0, _target_context = tail_fit_anchor(cands, merits)
+        fit_n = sum(1 for m in merits if m >= m0)
+        sigma, _ = fit_sigma(merits, m0)
+        if sigma and fit_n >= 2:
             xs = [m0 + i * (merits[-1] - m0) / 200.0 for i in range(201)]
-            width = max(1e-9, (merits[-1] - m0) / max(8, min(40, len(merits) // 2)))
-            pdf = [len(merits) * width / sigma * math.exp(-(x - m0) / sigma)
+            width = max(1e-9, (merits[-1] - m0)
+                        / max(8, min(40, len(merits) // 2)))
+            pdf = [fit_n * width / sigma * math.exp(-(x - m0) / sigma)
                    for x in xs]
             ax[2].plot(xs, pdf, color=color, ls="--", lw=1.5,
-                       label=f"exp fit sigma={sigma:.2f}")
-        # Dotted: the SAME axes against nature instead of against the data.
-        # The dashed curve is fitted to these candidates, so it can only reveal
-        # a shape mismatch; this one shows how far the run sits above what NO
-        # cover would give, i.e. the covering gain at this size.
+                       label=f"conditional exp sigma={sigma:.2f}")
+        # Dotted: the HL reference on the same conditional scale.  This is a
+        # descriptive comparison, not a controlled estimate of cover gain.
         nat = natural_law()
         Lg = group_L(cands)
-        if nat is not None and Lg > 0 and merits[0] > 0:
-            m0n = merits[0]
+        if nat is not None and Lg > 0 and m0 > 0 and fit_n >= 2:
+            m0n = m0
             width_n = max(1e-9, (merits[-1] - m0n)
                           / max(8, min(40, len(merits) // 2)))
             xs_n = [m0n + i * (merits[-1] - m0n) / 200.0 for i in range(201)]
-            pdf_n = [len(merits) * width_n * nat.slope(Lg, m0n)
+            pdf_n = [fit_n * width_n * nat.slope(Lg, m0n)
                      * math.exp(-(nat.E(Lg, x) - nat.E(Lg, m0n)))
                      for x in xs_n]
             ax[2].plot(xs_n, pdf_n, color=color, ls=":", lw=1.6,
@@ -1136,43 +1206,48 @@ def make_plot(all_cands, groups, table, args, outpath):
         ax[2].axvline(args.share_target, color="k", ls=":", lw=1)
         ax[2].text(args.share_target, 0, " share target", rotation=90, fontsize=7)
     ax[2].set_yscale("log")
-    ax[2].set_title("merit distribution: fit to these data (dashed)\n"
+    ax[2].set_title("merit distribution: conditional fit (dashed)\n"
                     "vs HL natural, no cover (dotted)")
     ax[2].set_xlabel("merit")
     ax[2].set_ylabel("candidates (log)")
     ax[2].legend(fontsize=8)
     ax[2].grid(alpha=0.3)
 
-    # (3) tail survival: observed P(merit >= m) against the fit
+    # (3) conditional tail survival above the same logged-target anchor.
     for name, (cands, _) in groups.items():
-        merits = sorted((c.merit for c in cands if c.merit is not None),
-                        reverse=True)
+        merits = sorted(c.merit for c in cands if c.merit is not None)
         if len(merits) < 3:
             continue
         color = colors.get(guess_source(name), colors["other"])
-        n = len(merits)
-        ys = [(i + 1) / n for i in range(n)]
-        ax[3].step(merits, ys, where="post", color=color,
+        m0, _target_context = tail_fit_anchor(cands, merits)
+        tail_merits = [m for m in merits if m >= m0]
+        n = len(tail_merits)
+        if n < 3:
+            continue
+        ys = [(n - i) / n for i in range(n)]
+        ax[3].step(tail_merits, ys, where="post", color=color,
                    label=os.path.basename(name))
-        sigma, m0 = fit_sigma(merits)
+        sigma, _ = fit_sigma(merits, m0)
         if sigma:
-            xs = [m0 + i * (merits[0] - m0) / 200.0 for i in range(201)]
+            xs = [m0 + i * (tail_merits[-1] - m0) / 200.0
+                  for i in range(201)]
             ax[3].plot(xs, [math.exp(-(max(x - m0, 0.0)) / sigma) for x in xs],
                        color=color, ls="--", lw=1.2)
         # Dotted: nature at this run's L.  The dashed fit comes from the same
         # data it is compared with; this line is the external reference.
         nat = natural_law()
         Lg = group_L(cands)
-        if nat is not None and Lg > 0 and merits[-1] > 0:
-            m0n = merits[-1]
-            xs_n = [m0n + i * (merits[0] - m0n) / 200.0 for i in range(201)]
+        if nat is not None and Lg > 0 and m0 > 0:
+            m0n = m0
+            xs_n = [m0n + i * (tail_merits[-1] - m0n) / 200.0
+                    for i in range(201)]
             ax[3].plot(xs_n, [math.exp(-(nat.E(Lg, x) - nat.E(Lg, m0n)))
                               for x in xs_n],
                        color=color, ls=":", lw=1.6)
     ax[3].set_yscale("log")
-    ax[3].set_title("tail: observed P(merit >= m)\n"
-                    "dashed = fit to these data, dotted = HL natural\n"
-                    "(falling faster than the DASH = missing candidates)")
+    ax[3].set_title("conditional tail above logged-target anchor\n"
+                    "dashed = fit, dotted = HL natural\n"
+                    "(shape comparison only; not a completeness test)")
     ax[3].set_xlabel("merit")
     ax[3].set_ylabel("P(merit >= m)")
     ax[3].legend(fontsize=8)
@@ -1537,6 +1612,17 @@ def selftest() -> int:
     starts_missing = sum(1 for c in cands if c.start is None)
     rate, lo, hi = poisson_rate(n, 10.0 / 60.0)
 
+    target_demo = [
+        Candidate(t=float(i), iso="2026-09-19T12:00:00Z", source="node",
+                  path="demo.log", shift=720, gap=2000 + i, merit=merit,
+                  start=None, header_nonce=str(i), nadd=str(i),
+                  template_merit=target)
+        for i, (merit, target) in enumerate(
+            ((21.0, 20.6), (24.5, 23.8), (29.0, 24.0), (26.0, None)))
+    ]
+    target_anchor, target_info = tail_fit_anchor(
+        target_demo, [c.merit for c in target_demo])
+
     checks = [
         ("parsed every line", f"{lines} lines, {bad} bad",
          lines == n + half + 3 * n_inv and bad == 0),
@@ -1557,6 +1643,11 @@ def selftest() -> int:
          f"D={ks_exponential(merits, m0, sigma)[0]:.3f}",
          ks_exponential(merits, m0, sigma)[0] <=
          ks_exponential(merits, m0, sigma)[2]),
+        ("changing target uses highest logged target as anchor",
+         f"anchor={target_anchor:.2f}, variable={target_info['target_varies']}, "
+         f"missing={target_info['missing_targets']}",
+         target_anchor == 24.0 and target_info["target_varies"]
+         and target_info["missing_targets"] == 1),
         ("empty log gives a rate bound", "3.0/1h = 3.0/h",
          abs(poisson_rate(0, 1.0)[2] - 3.0) < 1e-9 and lo < rate < hi),
     ]

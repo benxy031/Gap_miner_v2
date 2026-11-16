@@ -190,6 +190,21 @@ class PredicateTests(unittest.TestCase):
             strong += hit["strong_base2"]
         self.assertEqual((euler, strong), (37, 26))
 
+    def test_gap_interior_small_factor_sieve_preserves_prime_detection(self):
+        for lower, upper, interior_prime in ((3, 7, 5), (89, 101, 97),
+                                             (97, 107, 101)):
+            with self.subTest(interior_prime=interior_prime), \
+                    patch.object(hunt, "gap_neighbors", return_value=(lower, upper)):
+                with self.assertRaisesRegex(RuntimeError, f"prime {interior_prime} "):
+                    hunt.gap_context(lower + 1)
+
+        with patch.object(hunt, "gap_neighbors", return_value=(113, 127)), \
+                patch.object(hunt, "proven_prime_mr12", wraps=hunt.proven_prime_mr12) as mr:
+            gap = hunt.gap_context(121)
+            self.assertEqual(gap["size"], 14)
+            self.assertEqual(gap["status"], "proven_mr12")
+            self.assertNotIn(121, [call.args[0] for call in mr.call_args_list])
+
     def test_gap_filter_proof_failure_and_short_gap_fast_path(self):
         for n, p, q, gap in BRIAN_SMALL_GAPS:
             self.assertEqual(hunt.confirmed_hit(n, "pairs", 10**7, [p, q])["gap"]["size"], gap)

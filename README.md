@@ -122,6 +122,26 @@ Euler/Jacobi or strong tests are recorded, **not** used to discard Fermat PSPs.
 This is a semiprime hunter, not a Phase-0 scanner or a change to gapminer's
 mining code.
 
+For gaps below the deterministic MR12 bound, interior composites with a
+factor through 97 are proved by that factor before remaining candidates are
+checked with MR12. This is always enabled and preserves the full gap proof,
+output records and checkpoint compatibility; the ordinary `pairs` examples
+below use it automatically.
+
+On the dev RTX 3070 with an ext4 SSD (2026-11-16), two interleaved runs per
+variant on each of two factor slices measured mean end-to-end times of
+2.63 -> 2.07 s and 0.86 -> 0.70 s, respectively, compared with checking
+every interior candidate by MR12. Both slices had byte-identical result
+payloads and identical checkpoint stats. These short measurements do not
+predict performance on another host or a mechanical disk. The first slice
+can be reproduced with a free GPU and a new database:
+
+```bash
+python3 scripts/psp_hunt.py pairs --backend cuda --start 1e21 --end 1e22 \
+  --p-start 10284000001 --p-end 10284300001 --batch-size 1048576 \
+  --db data/psp_gap_sieve_bench.sqlite3
+```
+
 `pairs --min-gap G` (default `0`, retain every hit) keeps and prints only
 PSPs in gaps of size **at least** G, on either CPU or CUDA. Before constructing
 a full record, the CPU proves a prime on each side of the PSP: if their

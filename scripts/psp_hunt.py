@@ -23,6 +23,9 @@ from psp_math import proven_prime_mr12, strong_base2
 VERSION = 1
 MAX_PRIME_TABLE = 25_000_000
 STOP_SIGNAL = 0
+GAP_SMALL_PRIMES = (3, 5, 7, 11, 13, 17, 19, 23, 29, 31, 37,
+                    41, 43, 47, 53, 59, 61, 67, 71, 73, 79, 83, 89, 97)
+GAP_SMALL_PRIME_PRODUCT = math.prod(GAP_SMALL_PRIMES)
 
 
 def exact_int(text):
@@ -178,6 +181,9 @@ def gap_context(n):
         if first % 2 == 0:
             first += 1
         for candidate in range(first, upper, 2):
+            if candidate > GAP_SMALL_PRIMES[-1] and math.gcd(
+                    candidate, GAP_SMALL_PRIME_PRODUCT) > 1:
+                continue
             if proven_prime_mr12(candidate):
                 raise RuntimeError(f"prime {candidate} inside claimed gap for {n}")
         status = "proven_mr12"

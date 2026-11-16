@@ -608,9 +608,12 @@ factor ranges outside the exclusive deterministic MR12 bound
 ([Sorenson and Webster](https://arxiv.org/abs/1509.00864)).
 `scan` retains unresolved Fermat passers at or above that bound as `pending`.
 Gaps entirely below it are checked across the interior and labelled
-`proven_mr12`; those beyond it are labelled `probable_gmp`. Confirmed JSON
-records include the test outcomes, proven factors or a compositeness witness,
-and the surrounding gap.
+`proven_mr12`; interior composites with a factor through 97 are proved by that
+factor and the remaining candidates are checked with MR12. This always-on
+optimization preserves results and checkpoint compatibility; the `pairs`
+examples above use it automatically. Gaps beyond the bound are labelled
+`probable_gmp`. Confirmed JSON records include the test outcomes, proven
+factors or a compositeness witness, and the surrounding gap.
 
 Each checkpoint atomically commits progress and results; Ctrl-C or SIGTERM
 stops safely, and the same search settings resume from the checkpoint. Batch

@@ -63,6 +63,8 @@ int crt_runtime_load(struct crt_runtime *rt, const char *path) {
     if (rt->window < 10000)
         rt->window = 10000;
 
+    mpz_inits(rt->primorial, rt->crt_residue, NULL);
+
     rt->primes = (uint64_t *)calloc((size_t)n_primes, sizeof(uint64_t));
     rt->offsets = (uint64_t *)calloc((size_t)n_primes, sizeof(uint64_t));
     if (!rt->primes || !rt->offsets) {
@@ -89,13 +91,22 @@ int crt_runtime_load(struct crt_runtime *rt, const char *path) {
         return 0;
     }
 
-    mpz_init_set_ui(rt->primorial, 1);
+    mpz_set_ui(rt->primorial, 1);
     for (uint32_t i = 0; i < rt->n_primes; i++) {
         if (rt->offsets[i] != 0)
             mpz_mul_ui(rt->primorial, rt->primorial, rt->primes[i]);
     }
 
-    return crt_runtime_build_template(rt);
+    mpz_t zero;
+    mpz_init_set_ui(zero, 0);
+    align_base(rt->crt_residue, zero, rt);
+    mpz_clear(zero);
+
+    if (!crt_runtime_build_template(rt)) {
+        crt_runtime_free(rt);
+        return 0;
+    }
+    return 1;
 }
 
 void crt_runtime_free(struct crt_runtime *rt) {
@@ -105,6 +116,7 @@ void crt_runtime_free(struct crt_runtime *rt) {
     free(rt->offsets);
     free(rt->template);
     mpz_clear(rt->primorial);
+    mpz_clear(rt->crt_residue);
     rt->primes = NULL;
     rt->offsets = NULL;
     rt->template = NULL;
@@ -213,19 +225,16 @@ int crt_runtime_align(mpz_t nadd0, const uint8_t h256[32], uint32_t shift,
     if (!rt || !h256 || !nadd0)
         return -1;
 
-    /* base0 = h256 << shift (256-bit big-endian into mpz). */
+    /* The loaded cover fixes one residue X modulo P. For H = h256 << shift,
+       nadd0 = (X - H) mod P satisfies every cover congruence. */
     mpz_t base0;
     mpz_init(base0);
-    mpz_set_ui(base0, 0);
-    for (size_t i = 0; i < 32; i++) {
-        mpz_mul_2exp(base0, base0, 8);
-        mpz_add_ui(base0, base0, h256[i]);
-    }
+    mpz_import(base0, 32, 1, 1, 0, 0, h256);
     mpz_mul_2exp(base0, base0, shift);
-
-    int rc = align_base(nadd0, base0, rt);
+    mpz_sub(nadd0, rt->crt_residue, base0);
+    mpz_mod(nadd0, nadd0, rt->primorial);
     mpz_clear(base0);
-    return rc;
+    return 0;
 }
 
 uint64_t crt_runtime_survivors(const struct crt_runtime *rt,

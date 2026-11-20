@@ -29,6 +29,7 @@ struct crt_runtime {
     uint64_t n_candidates;   /* survivors declared in the file */
 
     mpz_t primorial;         /* product of primes with offset != 0 */
+    mpz_t crt_residue;       /* fixed nAdd residue for the loaded cover */
     uint32_t adj;            /* base parity: candidate = base0 + nadd0 - adj */
 
     uint8_t *template;       /* odd-slot composite bitmap over [1, window) */

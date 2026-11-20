@@ -131,28 +131,35 @@ int main(int argc, char **argv) {
         }
     }
 
-    /* Align a synthetic header and verify the alignment property. */
+    /* Check many headers so the cached cover residue is validated across
+       different H values, including all-zero and all-one-bit patterns. */
     uint8_t h256[32];
-    for (int i = 0; i < 32; i++)
-        h256[i] = (uint8_t)(i * 37 + 11);
-
     mpz_t nadd0, base0, cand;
     mpz_inits(nadd0, base0, cand, NULL);
-    if (crt_runtime_align(nadd0, h256, (uint32_t)shift, &rt) != 0) {
-        printf("FAIL: crt_runtime_align\n");
-        failures++;
-    } else {
-        mpz_set_ui(base0, 0);
+    int aligned = 1;
+    for (int sample = 0; sample < 128 && aligned; sample++) {
         for (int i = 0; i < 32; i++) {
-            mpz_mul_2exp(base0, base0, 8);
-            mpz_add_ui(base0, base0, h256[i]);
+            if (sample == 0)
+                h256[i] = 0;
+            else if (sample == 1)
+                h256[i] = 0xff;
+            else
+                h256[i] = (uint8_t)(sample * 37 + i * 53);
         }
+        if (crt_runtime_align(nadd0, h256, (uint32_t)shift, &rt) != 0) {
+            aligned = 0;
+            break;
+        }
+        mpz_import(base0, 32, 1, 1, 0, 0, h256);
         mpz_mul_2exp(base0, base0, (unsigned long)shift);
         mpz_add(cand, base0, nadd0);
         if (mpz_odd_p(cand))
             mpz_sub_ui(cand, cand, 1);   /* parity adjustment (rt.adj) */
 
-        int aligned = 1;
+        if (mpz_sgn(nadd0) < 0 || mpz_cmp(nadd0, rt.primorial) >= 0) {
+            aligned = 0;
+            break;
+        }
         for (uint32_t i = 0; i < rt.n_primes; i++) {
             if (rt.offsets[i] == 0)
                 continue;
@@ -163,15 +170,23 @@ int main(int argc, char **argv) {
                 break;
             }
         }
-        if (!aligned) {
-            printf("FAIL: alignment property violated\n");
-            failures++;
-        } else {
-            printf("OK: CRT alignment correct (cand ≡ -(offset+adj) mod p)\n");
-        }
+    }
+    if (!aligned) {
+        printf("FAIL: CRT alignment violated across header samples\n");
+        failures++;
+    } else {
+        printf("OK: CRT alignment correct across 128 headers\n");
     }
 
     /* Count primes in the aligned window (odd offsets) vs natural density. */
+    for (int i = 0; i < 32; i++)
+        h256[i] = (uint8_t)(i * 37 + 11);
+    if (crt_runtime_align(nadd0, h256, (uint32_t)shift, &rt) != 0) {
+        printf("FAIL: crt_runtime_align for prime-count sample\n");
+        failures++;
+    }
+    mpz_import(base0, 32, 1, 1, 0, 0, h256);
+    mpz_mul_2exp(base0, base0, (unsigned long)shift);
     uint64_t *surv = (uint64_t *)malloc((rt.window + 1) * sizeof(uint64_t));
     uint64_t ns = crt_runtime_survivors(&rt, surv);
     uint64_t prime_count_window = 0;

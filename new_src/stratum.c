@@ -234,7 +234,8 @@ size_t stratum_pow_hex(const uint8_t hdr80[STRATUM_HDR80_SIZE], uint32_t nonce,
     size_t n = nadd_len;
     size_t need;
 
-    if (!hdr80 || !out)
+    if (!hdr80 || !out || (nadd_len > 0 && !nadd) ||
+        nadd_len > STRATUM_NADD_MAX)
         return 0;
     if (n == 0)
         n = 1;                     /* nAdd is at least one byte */

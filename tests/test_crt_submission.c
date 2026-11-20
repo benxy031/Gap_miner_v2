@@ -9,6 +9,7 @@
 
 #include "../new_src/gapcoin_work.h"
 #include "../new_src/gapcoin_rpc.h"
+#include "../new_src/worker_gpu.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -33,6 +34,78 @@ static size_t decode_hex_bytes(const char *hex, uint8_t *out, size_t cap) {
     return n;
 }
 
+static int test_nadd_bounds(const uint8_t nadd[90]) {
+    struct gap_queue_entry entry;
+    mpz_t value;
+    int failures = 0;
+    memset(&entry, 0, sizeof(entry));
+    mpz_init(value);
+    entry.shift = 720;
+
+    if (!worker_gap_set_nadd(&entry, value) ||
+        entry.nadd_len != 1 || entry.nadd_bytes[0] != 0) {
+        printf("FAIL: zero nAdd encoding\n");
+        failures++;
+    }
+
+    mpz_import(value, 90, -1, 1, 0, 0, nadd);
+    if (!worker_gap_set_nadd(&entry, value) || entry.nadd_len != 90 ||
+        memcmp(entry.nadd_bytes, nadd, 90) != 0) {
+        printf("FAIL: 90-byte nAdd encoding\n");
+        failures++;
+    }
+
+    mpz_set_ui(value, 0);
+    mpz_setbit(value, 720);
+    mpz_sub_ui(value, value, 1);
+    if (!worker_gap_set_nadd(&entry, value) || entry.nadd_len != 90 ||
+        entry.nadd_bytes[89] != 0xff) {
+        printf("FAIL: nAdd just below 2^shift\n");
+        failures++;
+    }
+    mpz_add_ui(value, value, 1);
+    if (worker_gap_set_nadd(&entry, value)) {
+        printf("FAIL: nAdd equal to 2^shift accepted\n");
+        failures++;
+    }
+    mpz_set_si(value, -1);
+    if (worker_gap_set_nadd(&entry, value)) {
+        printf("FAIL: negative nAdd accepted\n");
+        failures++;
+    }
+
+    entry.shift = 2048;
+    mpz_set_ui(value, 0);
+    mpz_setbit(value, 2048);
+    mpz_sub_ui(value, value, 1);
+    if (!worker_gap_set_nadd(&entry, value) ||
+        entry.nadd_len != GAP_NADD_MAX_BYTES ||
+        entry.nadd_bytes[GAP_NADD_MAX_BYTES - 1] != 0xff) {
+        printf("FAIL: maximum-width nAdd encoding\n");
+        failures++;
+    }
+    entry.shift = 2049;
+    mpz_add_ui(value, value, 1);
+    entry.q48_difficulty = UINT64_C(0x5a5a5a5a5a5a5a5a);
+    if (worker_gap_set_nadd(&entry, value) ||
+        entry.nadd_len != GAP_NADD_MAX_BYTES ||
+        entry.q48_difficulty != UINT64_C(0x5a5a5a5a5a5a5a5a)) {
+        printf("FAIL: oversized nAdd accepted or entry overwritten\n");
+        failures++;
+    }
+    entry.shift = 13;
+    mpz_set_ui(value, 1);
+    if (worker_gap_set_nadd(&entry, value)) {
+        printf("FAIL: invalid shift accepted\n");
+        failures++;
+    }
+
+    mpz_clear(value);
+    if (!failures)
+        printf("PASS: nAdd sign, range, encoding, and capacity boundaries\n");
+    return failures;
+}
+
 int main(void) {
     int failures = 0;
 
@@ -54,6 +127,7 @@ int main(void) {
     uint8_t nadd[90];
     for (int i = 0; i < 90; i++) nadd[i] = (uint8_t)((i * 13 + 5) & 0xff);
     nadd[89] = 0x01;  /* most-significant byte nonzero */
+    failures += test_nadd_bounds(nadd);
 
     char hex[GAPCOIN_SUBMIT_HEX_CAP];
     int rc = gapcoin_gbt_work_build_submission_bytes(
@@ -125,6 +199,28 @@ int main(void) {
 
     printf("nAdd round-trip: %zu bytes, block %zu bytes\n", nadd_len, block_len);
     free(block);
+
+    /* A 256-byte nAdd needs CompactSize 0xfd 0x00 0x01. */
+    {
+        uint8_t wide[GAP_NADD_MAX_BYTES];
+        uint8_t encoded[2048];
+        for (size_t i = 0; i < sizeof(wide); i++)
+            wide[i] = (uint8_t)(i | 1U);
+        rc = gapcoin_gbt_work_build_submission_bytes(
+            header_prefix, header_nonce, &tmpl, 2048, wide, sizeof(wide),
+            hex, sizeof(hex));
+        size_t encoded_len = rc == 0
+            ? decode_hex_bytes(hex, encoded, sizeof(encoded)) : 0;
+        if (encoded_len < 89U + sizeof(wide) ||
+            encoded[86] != 0xfd || encoded[87] != 0x00 ||
+            encoded[88] != 0x01 ||
+            memcmp(encoded + 89, wide, sizeof(wide)) != 0) {
+            printf("FAIL: 256-byte block nAdd CompactSize/round-trip\n");
+            failures++;
+        } else {
+            printf("PASS: 256-byte block nAdd CompactSize/round-trip\n");
+        }
+    }
 
     /* ---- Large-template case (2026-09-18 incident) -------------------------
        A node whose mempool holds large transactions hands out a template far

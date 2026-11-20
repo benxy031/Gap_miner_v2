@@ -377,6 +377,100 @@ static int run_one_row_batch(gpu_sieve_ctx *ctx, const mpz_t base,
     return pass;
 }
 
+static int run_selected_rows(gpu_sieve_ctx *ctx, gpu_sieve_ctx *early_ctx,
+                             const mpz_t base, const mpz_t step,
+                             const uint64_t *primes, const uint64_t *inv_p,
+                             size_t prime_count, size_t early_count,
+                             uint32_t rows, uint64_t selected,
+                             const char *label) {
+    const uint64_t odd_count = 8192;
+    const size_t words = (size_t)((odd_count + 63U) >> 6);
+    uint64_t base_limbs[32], step_limbs[32];
+    mpz_to_limbs(base, base_limbs, 32);
+    mpz_to_limbs(step, step_limbs, 32);
+    uint64_t first = mpz_tstbit(base, 0) ? 0U : 1U;
+    uint64_t *early = calloc((size_t)rows * words, sizeof(uint64_t));
+    uint64_t *actual = calloc(words, sizeof(uint64_t));
+    uint64_t *expected = calloc(words, sizeof(uint64_t));
+    uint64_t *mods = malloc(prime_count * sizeof(uint64_t));
+    if (!early || !actual || !expected || !mods) {
+        fprintf(stderr, "  FAIL: selected rows allocation (%s)\n", label);
+        free(early); free(actual); free(expected); free(mods);
+        return 0;
+    }
+
+    int pass = gpu_sieve_mark_rows_from_base(
+        early_ctx, odd_count, first, base_limbs, step_limbs, 5, rows,
+        primes, inv_p, early_count);
+    if (pass)
+        pass = gpu_sieve_copy_row_bitmaps(early_ctx, rows, odd_count, early,
+                                          (size_t)rows * words);
+    if (pass && (gpu_sieve_copy_row_bitmaps(
+                     early_ctx, rows, odd_count, early,
+                     (size_t)rows * words - 1U) ||
+                 gpu_sieve_mark_selected_rows_from_base(
+                     ctx, early_ctx, odd_count, first, base_limbs, step_limbs,
+                     5, rows, primes, inv_p, prime_count, early_count, 0) ||
+                 gpu_sieve_mark_selected_rows_from_base(
+                     ctx, early_ctx, odd_count, first, base_limbs, step_limbs,
+                     5, rows, primes, inv_p, prime_count, early_count - 1U,
+                     selected) ||
+                 (rows < 64 && gpu_sieve_mark_selected_rows_from_base(
+                     ctx, early_ctx, odd_count, first, base_limbs, step_limbs,
+                     5, rows, primes, inv_p, prime_count, early_count,
+                     selected | (1ULL << rows))))) {
+        fprintf(stderr, "  FAIL: selected rows accepted invalid inputs\n");
+        pass = 0;
+    }
+    uint64_t bad_base[32];
+    memcpy(bad_base, base_limbs, sizeof(bad_base));
+    bad_base[0] ^= 2U;
+    if (pass && gpu_sieve_mark_selected_rows_from_base(
+            ctx, early_ctx, odd_count, first, bad_base, step_limbs, 5, rows,
+            primes, inv_p, prime_count, early_count, selected)) {
+        fprintf(stderr, "  FAIL: selected rows accepted a different base\n");
+        pass = 0;
+    }
+    if (pass)
+        pass = gpu_sieve_mark_selected_rows_from_base(
+            ctx, early_ctx, odd_count, first, base_limbs, step_limbs, 5, rows,
+            primes, inv_p, prime_count, early_count, selected);
+
+    mpz_t row_base;
+    mpz_init(row_base);
+    for (uint32_t m = 0; m < rows && pass; m++) {
+        mpz_set(row_base, base);
+        if (m) mpz_addmul_ui(row_base, step, m);
+        uint64_t row_first = mpz_tstbit(row_base, 0) ? 0U : 1U;
+        size_t active = (selected & (1ULL << m)) ? prime_count : early_count;
+        for (size_t i = 0; i < prime_count; i++)
+            mods[i] = mpz_fdiv_ui(row_base, primes[i]);
+        memset(expected, 0, words * sizeof(uint64_t));
+        cpu_mark_odd(primes, early_count, mods, odd_count, row_first, expected);
+        if (memcmp(expected, early + (size_t)m * words,
+                   words * sizeof(uint64_t)) != 0) {
+            fprintf(stderr, "  FAIL: early bitmap row %u (%s)\n", m, label);
+            pass = 0;
+            break;
+        }
+        memset(expected, 0, words * sizeof(uint64_t));
+        cpu_mark_odd(primes, active, mods, odd_count, row_first, expected);
+        uint64_t *device_bitmap = gpu_sieve_row_bitmap(ctx, m);
+        if (!device_bitmap ||
+            cudaMemcpy(actual, device_bitmap, words * sizeof(uint64_t),
+                       cudaMemcpyDeviceToHost) != cudaSuccess ||
+            memcmp(actual, expected, words * sizeof(uint64_t)) != 0) {
+            fprintf(stderr, "  FAIL: continued bitmap row %u (%s)\n", m, label);
+            pass = 0;
+        }
+    }
+    mpz_clear(row_base);
+    free(early); free(actual); free(expected); free(mods);
+    if (pass) printf("  OK  selected rows and early bitmap reuse (%s)\n", label);
+    else fprintf(stderr, "  FAIL: selected row API (%s)\n", label);
+    return pass;
+}
+
 /* Pair-batch parity (the rows == 1 path): gpu_sieve_mark_batch_from_bases
    marks TWO windows (bases of the SAME parity, so both share one
    odd_interval_size) into the two ping-pong device bitmaps.  Verified per
@@ -1025,6 +1119,51 @@ static int run_gpu_sieve_parity_test(void) {
             }
             unsetenv("GPU_MARK_SPLIT_SLOTS");
             unsetenv("GPU_MARK_SPLIT");
+
+            size_t early_count = 0;
+            while (early_count < prime_count2 && primes2[early_count] <= 1000U)
+                early_count++;
+            gpu_sieve_ctx *early_ctx =
+                gpu_sieve_init(device_id, early_count, 1U << 16);
+            if (!early_ctx) {
+                fprintf(stderr, "  FAIL: selected rows early context\n");
+                pass = 0;
+            }
+            static const uint64_t selections[] = {
+                0x8000000000000001ULL, 0xaaaaaaaa55555555ULL, UINT64_MAX
+            };
+            for (int split = 0; split < 2 && pass; split++) {
+                setenv("GPU_MARK_SPLIT", split ? "1" : "0", 1);
+                for (int odd = 0; odd < 2 && pass; odd++) {
+                    mpz_set_ui(step, odd ? 255255U : 30030U);
+                    for (int parity = 0; parity < 2 && pass; parity++) {
+                        mpz_urandomb(base, rng, 64UL * 5UL - 32UL);
+                        if (parity) mpz_setbit(base, 0); else mpz_clrbit(base, 0);
+                        for (size_t si = 0;
+                             si < sizeof(selections) / sizeof(selections[0]) && pass;
+                             si++) {
+                            snprintf(label, sizeof(label),
+                                     "split=%d step=%s base=%s selection=%zu",
+                                     split, odd ? "odd" : "even",
+                                     parity ? "odd" : "even", si);
+                            pass = run_selected_rows(
+                                ctx, early_ctx, base, step, primes2, inv_p2,
+                                prime_count2, early_count, 64, selections[si],
+                                label);
+                        }
+                        snprintf(label, sizeof(label),
+                                 "split=%d step=%s base=%s 7 rows",
+                                 split, odd ? "odd" : "even",
+                                 parity ? "odd" : "even");
+                        if (pass)
+                            pass = run_selected_rows(
+                                ctx, early_ctx, base, step, primes2, inv_p2,
+                                prime_count2, early_count, 7, 0x55U, label);
+                    }
+                }
+            }
+            unsetenv("GPU_MARK_SPLIT");
+            gpu_sieve_destroy(early_ctx);
             mpz_clear(step);
             free(primes2);
             free(inv_p2);

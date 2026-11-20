@@ -175,6 +175,24 @@ int gpu_sieve_mark_rows_from_base(gpu_sieve_ctx *ctx,
                                   const uint64_t *inv_p,
                                   size_t prime_count);
 
+/* Copy a completed, unselected row batch into a packed host bitmap array. */
+int gpu_sieve_copy_row_bitmaps(gpu_sieve_ctx *ctx, uint32_t row_count,
+                               uint64_t odd_interval_size,
+                               uint64_t *host_bitmaps, size_t host_words);
+
+/* Continue a previously marked prefix of the same prime table, base, stride,
+   geometry and row batch in another context on the same GPU.  Only the set
+   bits in selected_rows receive suffix marks; other rows retain the early
+   bitmap and must not be used as fully sieved rows.  The early and full calls
+   must use the same host prime and inverse arrays.  Up to 64 rows. */
+int gpu_sieve_mark_selected_rows_from_base(
+    gpu_sieve_ctx *ctx, const gpu_sieve_ctx *early_ctx,
+    uint64_t odd_interval_size, uint64_t first_odd_offset,
+    const uint64_t *base_limbs, const uint64_t *step_limbs,
+    int base_limb_count, uint32_t row_count, const uint64_t *primes,
+    const uint64_t *inv_p, size_t prime_count, size_t early_prime_count,
+    uint64_t selected_rows);
+
 /* HALF_CLASS extraction filter: offsets with value (base + offset) mod 60
    whose bit is set in class_mask60 are extracted.  Offsets BELOW
    region_start are never filtered (the CRT back-lookahead must be scanned

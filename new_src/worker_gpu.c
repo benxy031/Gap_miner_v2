@@ -25,6 +25,7 @@
 #include "primality_limbs.h"
 #include "gpu_adapter.h"
 #include "crt_runtime.h"
+#include "crt_row_select.h"
 #include "gapcoin_work.h"
 #include "pow_q48.h"
 #ifdef WITH_CUDA
@@ -79,6 +80,19 @@ static int worker_env_enabled(const char *value) {
         return 0;
     }
     return 1;
+}
+
+static int crt_row_select_mode(void) {
+    const char *value = getenv("CRT_ROW_SELECT");
+    if (value && strcmp(value, "observe") == 0) return 1;
+    if (value && strcmp(value, "select") == 0) return 2;
+    return 0;
+}
+
+static void crt_row_select_fail(uint32_t worker_id, const char *reason) {
+    fprintf(stderr, "[Worker %u] CRT_ROW_SELECT fatal: %s\n", worker_id, reason);
+    fflush(stderr);
+    exit(EXIT_FAILURE);
 }
 
 /* GAPMINER_CPU_LIMBS=1 switches the CPU Euler filter from GMP mpz_powm to the
@@ -170,6 +184,12 @@ struct worker_counter_state {
     _Atomic uint64_t smart_tail_skipped;
     _Atomic uint64_t q48_certified_skips;
     _Atomic uint64_t gpu_accounted_us;
+    _Atomic uint64_t row_screen_groups;
+    _Atomic uint64_t row_screen_us;
+    _Atomic uint64_t row_selected_processed;
+    _Atomic uint64_t row_other_processed;
+    _Atomic uint64_t row_selected_gaps;
+    _Atomic uint64_t row_other_gaps;
     /* Stage split (FUSED_STAGE_TIMING=1).  Host wall time per fused stage,
        accumulated in microseconds.  The defaults cost one atomic load per
        call site and nothing else; with the env unset every value stays 0. */
@@ -290,6 +310,25 @@ static _Atomic int g_gpu_fermat_enabled = 0;
 
 void worker_set_gpu_fermat_enabled(int enabled) {
     atomic_store_explicit(&g_gpu_fermat_enabled, enabled ? 1 : 0, memory_order_release);
+}
+
+int worker_gap_set_nadd(struct gap_queue_entry *entry, const mpz_t nadd) {
+    if (!entry || !nadd || entry->shift < 14 || mpz_sgn(nadd) < 0)
+        return 0;
+    size_t bits = mpz_sgn(nadd) ? mpz_sizeinbase(nadd, 2) : 0U;
+    if (bits > entry->shift || bits > sizeof(entry->nadd_bytes) * 8U)
+        return 0;
+
+    size_t count = 0;
+    entry->nadd = mpz_get_ui(nadd);
+    if (bits)
+        mpz_export(entry->nadd_bytes, &count, -1, 1, 0, 0, nadd);
+    else {
+        entry->nadd_bytes[0] = 0;
+        count = 1;
+    }
+    entry->nadd_len = (uint32_t)count;
+    return 1;
 }
 
 static int worker_queue_push(const struct gap_queue_entry *entry) {
@@ -1785,6 +1824,9 @@ static int g_mj2_wave = MINING_JUMP2_WAVE_DEFAULT;
 struct fused_flight_window {
     uint32_t nonce;
     uint32_t count;             /* head candidates MR-tested in the batch */
+    int row_class;              /* -1 off, 0 other half, 1 selected half */
+    uint32_t row_index;
+    uint64_t row_group;
     int split;
     uint32_t base_mod60;
     uint64_t base_limbs[GPU_NLIMBS];  /* snapshot: tail re-mark needs it */
@@ -1827,7 +1869,8 @@ static void crt_scan_gaps(uint32_t worker_id, uint32_t height, uint32_t nonce,
                           uint32_t tested_count, uint64_t owned_limit,
                           int half_class,
                           struct gpu_fermat_ctx *resolve_fermat,
-                          int resolve_slot);
+                          int resolve_slot, int row_class,
+                          uint32_t row_index, uint64_t row_group);
 
 /* Stage 1 (launch side): mark all primes on-device into bitmap buf, extract
    the head (or the full window when the closing range is empty) in ascending
@@ -2126,7 +2169,8 @@ static int crt_fused_collect_batch(struct gpu_sieve_ctx *gpu_sieve,
                       fl->merit_threshold, rt, wv->window_base, wv->nadd0,
                       fl->back_limit, p1, p2, nadd_full,
                       win_ip_ptr, win_off_ptr, tested, owned_limit,
-                      fl->half_class, fermat, fl->slot);
+                      fl->half_class, fermat, fl->slot, wv->row_class,
+                      wv->row_index, wv->row_group);
         head_cum += head_count;
     }
     free(tail_off);
@@ -2230,7 +2274,9 @@ static int crt_fused_fullscan_flight(struct gpu_sieve_ctx *gpu_sieve,
                       fl->wins[i].window_base, fl->wins[i].nadd0,
                       fl->back_limit, p1, p2, nadd_full,
                       is_prime + cum, offsets + cum, cnt, owned_limit,
-                      fl->half_class, fermat, fl->slot);
+                      fl->half_class, fermat, fl->slot,
+                      fl->wins[i].row_class, fl->wins[i].row_index,
+                      fl->wins[i].row_group);
         cum += cnt;
     }
     atomic_store(&g_worker_stats[worker_id].gpu_accounted_us,
@@ -2497,7 +2543,9 @@ static int crt_fused_chain_flight(struct gpu_sieve_ctx *gpu_sieve,
                       fl->wins[i].window_base, fl->wins[i].nadd0,
                       fl->back_limit, p1, p2, nadd_full,
                       is_prime + cs->cum[i], offsets + cs->cum[i], cnt,
-                      owned_limit, fl->half_class, fermat, fl->slot);
+                      owned_limit, fl->half_class, fermat, fl->slot,
+                      fl->wins[i].row_class, fl->wins[i].row_index,
+                      fl->wins[i].row_group);
     }
     atomic_store(&g_worker_stats[worker_id].gpu_accounted_us,
                  gpu_fermat_accounted_us(fermat));
@@ -2523,10 +2571,13 @@ static int crt_fused_drain_partial(struct gpu_sieve_ctx *gpu_sieve,
         STAGE_T0(chain);
         if (!crt_fused_chain_flight(gpu_sieve, fermat, worker_id, rt, fl,
                                     offsets, is_prime, chain_cs, chain_chunk,
-                                    p1, p2, nadd_full) &&
-            !crt_fused_fullscan_flight(gpu_sieve, fermat, worker_id, rt, fl,
-                                       offsets, is_prime, p1, p2, nadd_full))
-            return 0;
+                                    p1, p2, nadd_full)) {
+            if (crt_row_select_mode())
+                crt_row_select_fail(worker_id, "partial-flight chain failed");
+            if (!crt_fused_fullscan_flight(gpu_sieve, fermat, worker_id, rt, fl,
+                                           offsets, is_prime, p1, p2, nadd_full))
+                return 0;
+        }
         STAGE_ADD(chain, worker_id);
         fl->n_windows = 0;
         fl->total_count = 0;
@@ -2766,7 +2817,8 @@ static void crt_scan_gaps(uint32_t worker_id, uint32_t height, uint32_t nonce,
                           uint32_t tested_count, uint64_t owned_limit,
                           int half_class,
                           struct gpu_fermat_ctx *resolve_fermat,
-                          int resolve_slot)
+                          int resolve_slot, int row_class,
+                          uint32_t row_index, uint64_t row_group)
 {
     struct gap_result *gaps = NULL;
     uint32_t gap_count = 0;
@@ -2790,6 +2842,12 @@ static void crt_scan_gaps(uint32_t worker_id, uint32_t height, uint32_t nonce,
     int gap_result = gap_detection_find(
         vis_ip, vis_off, vis_count, rt->shift, window_base,
         merit_threshold, owned_limit, &gap_stats, &gaps, &gap_count);
+    if (!gap_result && row_class >= 0)
+        crt_row_select_fail(worker_id, "gap detection failed");
+    if (row_class == 1)
+        atomic_fetch_add(&g_worker_stats[worker_id].row_selected_processed, 1);
+    else if (row_class == 0)
+        atomic_fetch_add(&g_worker_stats[worker_id].row_other_processed, 1);
 
     /* HALF_CLASS two-pass: visible-class gaps are candidates; verify their
        interiors against the hidden classes (the CRT covering template is a
@@ -3064,6 +3122,17 @@ static void crt_scan_gaps(uint32_t worker_id, uint32_t height, uint32_t nonce,
             atomic_fetch_add(&g_worker_stats[worker_id].bpsw_attempts, 1);
             if (baillie_psw_verify_gap_boundaries(p1, p2)) {
                 atomic_fetch_add(&g_worker_stats[worker_id].gaps_found, 1);
+                if (row_class >= 0) {
+                    if (row_class)
+                        atomic_fetch_add(&g_worker_stats[worker_id].row_selected_gaps, 1);
+                    else
+                        atomic_fetch_add(&g_worker_stats[worker_id].row_other_gaps, 1);
+                    fprintf(stderr,
+                            "[CRT_ROW_SELECT] candidate worker=%u group=%" PRIu64
+                            " row=%u selected=%d gap=%u merit=%.8f\n",
+                            worker_id, row_group, row_index, row_class,
+                            gaps[i].gap_length, gaps[i].merit);
+                }
 
                 /* Full-width adder = nadd0 - adj + position. */
                 mpz_set(nadd_full, nadd0);
@@ -3080,17 +3149,18 @@ static void crt_scan_gaps(uint32_t worker_id, uint32_t height, uint32_t nonce,
                     entry.merit = gaps[i].merit;
                     entry.generation = generation;
                     entry.header_nonce = nonce;
-                    entry.nadd = mpz_get_ui(nadd_full); /* legacy */
-                    size_t nb = 0;
-                    mpz_export(entry.nadd_bytes, &nb, -1, 1, 0, 0, nadd_full);
-                    if (nb == 0) {
-                        entry.nadd_bytes[0] = 0;
-                        nb = 1;
+                    if (!worker_gap_set_nadd(&entry, nadd_full)) {
+                        fprintf(stderr,
+                                "[Worker %u] CRT candidate NOT queued: nAdd=%s "
+                                "is negative, outside 2^%u, or exceeds %u bytes\n",
+                                worker_id, nadd_dec ? nadd_dec : "?",
+                                rt->shift, (unsigned)GAP_NADD_MAX_BYTES);
+                        record_log_write_big(height, rt->shift, nonce, nadd_dec,
+                                             p1, gaps[i].gap_length,
+                                             gaps[i].merit, "invalid-nadd");
+                        free(nadd_dec);
+                        continue;
                     }
-                    if (nb > sizeof(entry.nadd_bytes)) {
-                        nb = sizeof(entry.nadd_bytes);
-                    }
-                    entry.nadd_len = (uint32_t)nb;
                     /* The node's own verdict input: difficulty(p1,p2) in Q48
                        (see the non-CRT site). */
                     entry.q48_difficulty = pow_q48_difficulty(p1, p2);
@@ -3129,6 +3199,9 @@ static void crt_scan_gaps(uint32_t worker_id, uint32_t height, uint32_t nonce,
     }
 
     gap_detection_free_results(gaps);
+    if (row_class >= 0 && crt_row_select_mode() == 1 && row_index == 63)
+        fprintf(stderr, "[CRT_ROW_SELECT] complete worker=%u group=%" PRIu64 "\n",
+                worker_id, row_group);
 }
 
 /* CRT-mode worker: many aligned windows in parallel (one per header nonce).
@@ -3149,6 +3222,10 @@ void *worker_thread_run_crt(void *arg) {
     if (!config || !config->crt_rt) return NULL;
     struct crt_runtime *rt = config->crt_rt;
     uint32_t worker_id = config->worker_id;
+    int row_select = crt_row_select_mode();
+#ifndef WITH_CUDA
+    if (row_select) crt_row_select_fail(worker_id, "CUDA/CGBN build required");
+#endif
 
     mpz_t base, nadd0, candidate, p1, p2, nadd_full, window_base;
     mpz_t nadd0_row, rowP, rowLimit, rowCount;
@@ -3185,6 +3262,12 @@ void *worker_thread_run_crt(void *arg) {
     atomic_store(&g_worker_stats[worker_id].smart_tail_skipped, 0);
     atomic_store(&g_worker_stats[worker_id].q48_certified_skips, 0);
     atomic_store(&g_worker_stats[worker_id].gpu_accounted_us, 0);
+    atomic_store(&g_worker_stats[worker_id].row_screen_groups, 0);
+    atomic_store(&g_worker_stats[worker_id].row_screen_us, 0);
+    atomic_store(&g_worker_stats[worker_id].row_selected_processed, 0);
+    atomic_store(&g_worker_stats[worker_id].row_other_processed, 0);
+    atomic_store(&g_worker_stats[worker_id].row_selected_gaps, 0);
+    atomic_store(&g_worker_stats[worker_id].row_other_gaps, 0);
 
     double logbase = (256.0 + (double)rt->shift) * log(2.0);
 
@@ -3215,6 +3298,7 @@ void *worker_thread_run_crt(void *arg) {
 
     struct sieve_core sieve = {0};
     if (!sieve_core_init_window(&sieve, max_interval, sieve_limit)) {
+        if (row_select) crt_row_select_fail(worker_id, "CPU prime-table initialization failed");
         fprintf(stderr, "[Worker %u] Failed to initialize CRT sieve\n", worker_id);
         mpz_clears(base, nadd0, candidate, p1, p2, nadd_full, window_base,
                nadd0_row, rowP, rowLimit, rowCount, NULL);
@@ -3223,6 +3307,7 @@ void *worker_thread_run_crt(void *arg) {
     }
     uint8_t *is_prime = (uint8_t *)malloc(sieve.candidate_capacity * sizeof(*is_prime));
     if (!is_prime) {
+        if (row_select) crt_row_select_fail(worker_id, "host candidate allocation failed");
         sieve_core_free(&sieve);
         mpz_clears(base, nadd0, candidate, p1, p2, nadd_full, window_base,
                    nadd0_row, rowP, rowLimit, rowCount, NULL);
@@ -3339,6 +3424,7 @@ void *worker_thread_run_crt(void *arg) {
     uint8_t *fused_is_prime[2] = { NULL, NULL };
     uint64_t *fused_offsets[2] = { NULL, NULL };
     if (!fused_fl) {
+        if (row_select) crt_row_select_fail(worker_id, "flight allocation failed");
         fprintf(stderr, "[Worker %u] fused flight state alloc failed\n",
                 worker_id);
         return NULL;
@@ -3649,10 +3735,58 @@ void *worker_thread_run_crt(void *arg) {
         !gpu_sieve_set_residue_step(gpu_sieve, rowP_limbs, gpu_limbs,
                                     sieve.small_primes, sieve.inv_p,
                                     sieve.small_primes_count)) {
+        if (row_select) crt_row_select_fail(worker_id, "full-sieve step cache failed");
         fprintf(stderr,
                 "[worker %u] row step cache disabled "
                 "(gpu_sieve_set_residue_step failed)\n",
                 (unsigned)worker_id);
+    }
+
+    struct gpu_sieve_ctx *row_early = NULL;
+    uint64_t *row_bitmaps = NULL;
+    uint32_t *row_prefix = NULL;
+    double *row_powers = NULL;
+    size_t row_early_count = 0;
+    size_t row_max_words = 0;
+    size_t row_max_odd = 0;
+    double row_rate = 0.0;
+    uint64_t row_group_counter = 0;
+    if (row_select) {
+        if (!gpu || !gpu_sieve || !fused_enabled || !fused_fermat ||
+            !chain_on || !rowP_limbs_valid || mpz_odd_p(rowP) ||
+            !gpu_fermat_cgbn_supports_limbs(gpu_limbs))
+            crt_row_select_fail(worker_id, "CUDA/CGBN fused chain unavailable");
+        while (row_early_count < sieve.small_primes_count &&
+               sieve.small_primes[row_early_count] <= 10000U)
+            row_early_count++;
+        if (row_early_count == 0 || row_early_count >= sieve.small_primes_count)
+            crt_row_select_fail(worker_id, "invalid early/full prime tables");
+
+        double survival = 1.0;
+        for (size_t i = 0; i < row_early_count; i++)
+            survival *= 1.0 - 1.0 / (double)sieve.small_primes[i];
+        row_rate = 1.0 / (logbase * survival);
+        row_max_odd = (size_t)((max_interval + 1U) >> 1);
+        row_max_words = (row_max_odd + 63U) >> 6;
+        if (row_max_odd == 0 || row_max_odd > UINT32_MAX ||
+            row_max_words > SIZE_MAX / (64U * sizeof(uint64_t)) ||
+            row_max_odd >= SIZE_MAX / sizeof(double))
+            crt_row_select_fail(worker_id, "row geometry exceeds scoring capacity");
+        row_bitmaps = (uint64_t *)malloc(64U * row_max_words * sizeof(uint64_t));
+        row_prefix = (uint32_t *)malloc((row_max_words + 1U) * sizeof(uint32_t));
+        row_powers = (double *)malloc((row_max_odd + 1U) * sizeof(double));
+        row_early = gpu_sieve_init((int)config->gpu_device, row_early_count,
+                                   (uint64_t)row_max_odd);
+        if (!row_bitmaps || !row_prefix || !row_powers || !row_early ||
+            !crt_row_score_prepare(row_powers, row_max_odd + 1U, row_rate) ||
+            !gpu_sieve_set_residue_step(row_early, rowP_limbs, gpu_limbs,
+                                        sieve.small_primes, sieve.inv_p,
+                                        row_early_count))
+            crt_row_select_fail(worker_id, "early sieve or score initialization failed");
+        fprintf(stderr,
+                "[Worker %u] CRT_ROW_SELECT=%s early_primes=%zu conditional_rate=%.12g\n",
+                worker_id, row_select == 1 ? "observe" : "select",
+                row_early_count, row_rate);
     }
 #endif
 
@@ -3755,8 +3889,19 @@ void *worker_thread_run_crt(void *arg) {
                         if (rows > crt_rows_batch) rows = crt_rows_batch;
                         if (rows < 1) rows = 1;
                     }
+#ifdef WITH_CUDA
                     int row_batch_marked = 0;
+                    uint64_t row_selected = UINT64_MAX;
+                    uint64_t row_group = 0;
+#endif
+                    if (row_select && rows != 64)
+                        crt_row_select_fail(worker_id, "aligned header has fewer than 64 rows");
                     for (uint64_t row_m = 0; row_m < rows; row_m++) {
+#ifdef WITH_CUDA
+                        if (row_select == 2 && row_m > 0 &&
+                            !(row_selected & (1ULL << row_m)))
+                            continue;
+#endif
                         mpz_set(nadd0_row, nadd0);
                         if (row_m)
                             mpz_addmul_ui(nadd0_row, rowP, row_m);
@@ -3785,6 +3930,8 @@ void *worker_thread_run_crt(void *arg) {
                     int gpu_window_fits = gpu && gpu_limbs > 0 &&
                         gpu_adapter_window_fits(window_base, interval,
                                                 gpu_limbs);
+                    if (row_select && !gpu_window_fits)
+                        crt_row_select_fail(worker_id, "CRT window does not fit GPU width");
                     if (gpu && !gpu_window_fits) {
                         fused_pending_clear(&fused_pending);
                         if (!gpu_width_failure_reported) {
@@ -3882,8 +4029,51 @@ void *worker_thread_run_crt(void *arg) {
                                        until the NEXT nonce's batch). */
                                     fused_pending_clear(&fused_pending);
                                     if (row_m == 0) {
-                                        mark_ok =
-                                            gpu_sieve_mark_rows_from_base(
+                                        if (row_select) {
+                                            uint64_t screen_t0 = worker_stage_now_us();
+                                            size_t words = (size_t)((odd_interval_size + 63U) >> 6);
+                                            double scores[64];
+                                            if (words > row_max_words ||
+                                                odd_interval_size > row_max_odd ||
+                                                !gpu_sieve_mark_rows_from_base(
+                                                    row_early, odd_interval_size,
+                                                    first_odd_offset, gpu_base_limbs,
+                                                    rowP_limbs, gpu_limbs, 64,
+                                                    sieve.small_primes, sieve.inv_p,
+                                                    row_early_count) ||
+                                                !gpu_sieve_copy_row_bitmaps(
+                                                    row_early, 64, odd_interval_size,
+                                                    row_bitmaps, 64U * row_max_words))
+                                                crt_row_select_fail(worker_id, "early GPU sieve/readback failed");
+                                            for (uint32_t r = 0; r < 64; r++) {
+                                                if (!crt_row_score_bitmap(
+                                                        row_bitmaps + (size_t)r * words,
+                                                        odd_interval_size, first_odd_offset,
+                                                        needed_gap, back_limit + needed_gap,
+                                                        row_rate, row_powers, row_max_odd + 1U,
+                                                        row_prefix, row_max_words + 1U,
+                                                        &scores[r]))
+                                                    crt_row_select_fail(worker_id, "row scoring failed");
+                                            }
+                                            if (!crt_row_select_best(scores, 64, 32, &row_selected))
+                                                crt_row_select_fail(worker_id, "row ranking failed");
+                                            row_group = ++row_group_counter;
+                                            atomic_fetch_add(
+                                                &g_worker_stats[worker_id].row_screen_groups, 1);
+                                            atomic_fetch_add(
+                                                &g_worker_stats[worker_id].row_screen_us,
+                                                worker_stage_now_us() - screen_t0);
+                                        }
+                                        if (row_select == 2) {
+                                            mark_ok = gpu_sieve_mark_selected_rows_from_base(
+                                                gpu_sieve, row_early, odd_interval_size,
+                                                first_odd_offset, gpu_base_limbs,
+                                                rowP_limbs, gpu_limbs, (uint32_t)rows,
+                                                sieve.small_primes, sieve.inv_p,
+                                                sieve.small_primes_count, row_early_count,
+                                                row_selected);
+                                        } else {
+                                            mark_ok = gpu_sieve_mark_rows_from_base(
                                                 gpu_sieve,
                                                 odd_interval_size,
                                                 first_odd_offset,
@@ -3894,13 +4084,14 @@ void *worker_thread_run_crt(void *arg) {
                                                 sieve.small_primes,
                                                 sieve.inv_p,
                                                 sieve.small_primes_count);
+                                        }
                                         row_batch_marked = mark_ok;
                                         if (mark_ok) {
                                             atomic_fetch_add(
                                                 &g_worker_stats[worker_id].gpu_sieve_calls, 1);
                                             atomic_fetch_add(
                                                 &g_worker_stats[worker_id].gpu_sieve_windows,
-                                                (uint64_t)rows);
+                                                row_select == 2 ? 32U : (uint64_t)rows);
                                         }
                                     } else {
                                         mark_ok = row_batch_marked;
@@ -3946,6 +4137,11 @@ void *worker_thread_run_crt(void *arg) {
                                 }
                             }
                             STAGE_ADD(mark, worker_id);
+                            if (row_select && !mark_ok)
+                                crt_row_select_fail(worker_id, "GPU row mark failed");
+                            if (row_select == 2 &&
+                                !(row_selected & (1ULL << row_m)))
+                                continue;
 
                             uint32_t head_count = 0;
                             if (mark_ok) {
@@ -4002,6 +4198,10 @@ void *worker_thread_run_crt(void *arg) {
                                     &fl->wins[w_in];
                                 wv->nonce = nonce;
                                 wv->count = head_count;
+                                wv->row_class = row_select
+                                    ? !!(row_selected & (1ULL << row_m)) : -1;
+                                wv->row_index = (uint32_t)row_m;
+                                wv->row_group = row_group;
                                 wv->split = split_v;
                                 wv->base_mod60 = base_mod60;
                                 memcpy(wv->base_limbs, gpu_base_limbs,
@@ -4029,6 +4229,8 @@ void *worker_thread_run_crt(void *arg) {
                                                 fused_is_prime[slot],
                                                 chain_cs, mining_jump2_chunk,
                                                 p1, p2, nadd_full)) {
+                                            if (row_select)
+                                                crt_row_select_fail(worker_id, "GPU chain failed");
                                             if (!crt_fused_fullscan_flight(
                                                     gpu_sieve, fused_fermat,
                                                     worker_id, rt, fl,
@@ -4100,6 +4302,8 @@ void *worker_thread_run_crt(void *arg) {
                                 } else {
                                     fused_pending_clear(&fused_pending);
                                 }
+                            } else if (row_select) {
+                                crt_row_select_fail(worker_id, "GPU extraction failed");
                             } else if (!gpu_sieve_failure_reported) {
                                 fused_pending_clear(&fused_pending);
                                 gpu_sieve_failure_reported = 1;
@@ -4114,6 +4318,8 @@ void *worker_thread_run_crt(void *arg) {
                         }
                     }
 
+                    if (row_select && !sieve_ok)
+                        crt_row_select_fail(worker_id, "fused GPU pipeline did not process row");
                     if (!sieve_ok && gpu_window_fits &&
                         gpu_sieve_enabled && gpu_sieve &&
                         gpu_base_limbs && gpu_host_bitmap) {
@@ -4302,7 +4508,7 @@ void *worker_thread_run_crt(void *arg) {
                                       merit_threshold, rt, window_base, nadd0_row,
                                       back_limit, p1, p2, nadd_full,
                                       is_prime, candidate_offsets, tested_count,
-                                      owned_limit, half_class, NULL, 0);
+                                      owned_limit, half_class, NULL, 0, -1, 0, 0);
                     }
                     } /* row_m */
                 }
@@ -4334,9 +4540,27 @@ void *worker_thread_run_crt(void *arg) {
     }
 #endif
 
+    if (row_select) {
+        fprintf(stderr,
+                "[CRT_ROW_SELECT] summary worker=%u groups=%" PRIu64
+                " screen_us=%" PRIu64 " selected_rows=%" PRIu64
+                " other_rows=%" PRIu64 " selected_gaps=%" PRIu64
+                " other_gaps=%" PRIu64 "\n",
+                worker_id,
+                atomic_load(&g_worker_stats[worker_id].row_screen_groups),
+                atomic_load(&g_worker_stats[worker_id].row_screen_us),
+                atomic_load(&g_worker_stats[worker_id].row_selected_processed),
+                atomic_load(&g_worker_stats[worker_id].row_other_processed),
+                atomic_load(&g_worker_stats[worker_id].row_selected_gaps),
+                atomic_load(&g_worker_stats[worker_id].row_other_gaps));
+    }
     free(is_prime);
     sieve_core_free(&sieve);
 #ifdef WITH_CUDA
+    if (row_early) gpu_sieve_destroy(row_early);
+    free(row_bitmaps);
+    free(row_prefix);
+    free(row_powers);
     if (gpu_sieve) gpu_sieve_destroy(gpu_sieve);
     free(gpu_host_bitmap);
     free(gpu_base_limbs);

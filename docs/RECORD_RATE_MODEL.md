@@ -671,14 +671,17 @@ held the geometry fixed and moved ONLY the optimizer budget.
 * The first two rows differ ONLY in optimizer strength (same n, shift, bits,
   gap_target, `--sieve-primes 2000000`, `--gap-hunt-min-merit 10`, same binary,
   same machine, win/s 617 both) and differ by **2.06x** in the reported
-  merit-10 rate.  Survivor count cannot explain it (5.83% vs 6.33%).
+  merit-10 rate.  The original claim that the survivor counts (5.83% vs
+  6.33%) could not explain this is unsupported: survivors in the relevant
+  gap-scale interval act through the exponent `exp(-rho*D)`, not linearly.
+  The original weak file is gone, so that explanation remains a hypothesis;
+  see [COVER_EFFECTIVE_DENSITY.md](COVER_EFFECTIVE_DENSITY.md) §3.
 * `cover_max --file ... --seconds 120` improved the weak file by 66 survivors
-  (93.60% -> 93.84% coverage) and would not close a 2x gap, so the driving
-  property is structural and longer-evolution-only, not the min-survivor count.
-  This is consistent with the older run-objective measurement (rate@m10
-  1.17/s vs 0.28/s between cover structures) and it means the historical
-  "density drives the tail, run length does not" conclusion needs a controlled
-  re-test too.
+  (93.60% -> 93.84% coverage).  Those counts alone do not establish its effect
+  on the gap rate or prove that longer evolution is required.  The older
+  run-objective measurement (rate@m10 1.17/s vs 0.28/s between cover
+  structures) and the historical "density drives the tail, run length does
+  not" conclusion both need a controlled re-test.
 * **Process rule (learned the hard way):** the per-window merit-10 rate is
   cover-dominated, so a shift-to-shift comparison of it is worthless unless both
   files come from the SAME optimizer budget.  Reading the weak 1786 file's

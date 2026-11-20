@@ -84,6 +84,7 @@ SOURCES = $(SRC_DIR)/sieve_core.c \
           $(SRC_DIR)/pow_q48.c \
           $(SRC_DIR)/covering.c \
           $(SRC_DIR)/crt_runtime.c \
+          $(SRC_DIR)/crt_row_select.c \
           $(SRC_DIR)/worker_gpu.c \
           $(SRC_DIR)/miner_farm.c \
           $(SRC_DIR)/gpu_adapter.c \
@@ -124,6 +125,7 @@ TEST_POW_Q48 = $(BIN_DIR)/test_pow_q48
 TEST_COVERING = $(BIN_DIR)/test_covering
 GEN_CRT = $(BIN_DIR)/gen_crt
 TEST_CRT_RUNTIME = $(BIN_DIR)/test_crt_runtime
+TEST_CRT_ROW_SELECT = $(BIN_DIR)/test_crt_row_select
 TEST_CRT_SUBMISSION = $(BIN_DIR)/test_crt_submission
 TEST_GAP_HUNT = $(BIN_DIR)/test_gap_hunt
 TEST_GAP_HUNT_CENTER = $(BIN_DIR)/test_gap_hunt_center
@@ -148,7 +150,7 @@ BENCH_U108 = $(BIN_DIR)/bench_u108
 .PHONY: all clean test test-gap-hunt-width test-gap-hunt-center test-phase0-sieve-counts help update-merits
 
 # Default target
-all: $(BIN_DIR) $(BUILD_DIR) $(OBJECTS) $(MAIN_BINARY) $(TEST_GAP_DETECTION) $(TEST_PRIMALITY) $(TEST_WORKER_THREADS) $(TEST_GAPCOIN_RPC) $(TEST_BLOCK_SUBMISSION) $(TEST_SIEVE_CORE) $(TEST_GPU_FERMAT) $(TEST_GPU_SIEVE) $(TEST_GPU_RESOLVE) $(TEST_GAP_DIST) $(TEST_HALFCLASS) $(TEST_GAP_PRIORITY) $(TEST_CRT_SET) $(TEST_GAP_TARGET) $(TEST_POW_Q48) $(TEST_COVERING) $(TEST_CRT_RUNTIME) $(TEST_CRT_SUBMISSION) $(TEST_GAP_HUNT) $(TEST_GAP_HUNT_CENTER) $(TEST_STRATUM) $(TEST_SMOOTH) $(SMOOTH_PATTERN) $(CRT_GEN) $(GEN_CRT) $(COVER_MAX)
+all: $(BIN_DIR) $(BUILD_DIR) $(OBJECTS) $(MAIN_BINARY) $(TEST_GAP_DETECTION) $(TEST_PRIMALITY) $(TEST_WORKER_THREADS) $(TEST_GAPCOIN_RPC) $(TEST_BLOCK_SUBMISSION) $(TEST_SIEVE_CORE) $(TEST_GPU_FERMAT) $(TEST_GPU_SIEVE) $(TEST_GPU_RESOLVE) $(TEST_GAP_DIST) $(TEST_HALFCLASS) $(TEST_GAP_PRIORITY) $(TEST_CRT_SET) $(TEST_GAP_TARGET) $(TEST_POW_Q48) $(TEST_COVERING) $(TEST_CRT_RUNTIME) $(TEST_CRT_ROW_SELECT) $(TEST_CRT_SUBMISSION) $(TEST_GAP_HUNT) $(TEST_GAP_HUNT_CENTER) $(TEST_STRATUM) $(TEST_SMOOTH) $(SMOOTH_PATTERN) $(CRT_GEN) $(GEN_CRT) $(COVER_MAX)
 
 # CUDA-only dev tool, not part of the default build: make bin/bench_mark WITH_CUDA=1
 
@@ -379,6 +381,10 @@ $(TEST_CRT_RUNTIME): $(BUILD_DIR)/$(SRC_DIR)/covering.o $(BUILD_DIR)/$(SRC_DIR)/
 	$(CC) $(CFLAGS) $^ -lm -lgmp -o $@
 	@echo "✓ Built: $@"
 
+$(TEST_CRT_ROW_SELECT): $(BUILD_DIR)/$(SRC_DIR)/crt_row_select.o $(BUILD_DIR)/$(TEST_DIR)/test_crt_row_select.o | $(BIN_DIR)
+	$(CC) $(CFLAGS) $^ -lm -o $@
+	@echo "✓ Built: $@"
+
 # CRT big-nAdd submission assembly (links the full object set like the other
 # integration tests; CPU-only in `make test`).
 $(TEST_CRT_SUBMISSION): $(OBJECTS) $(BUILD_DIR)/$(TEST_DIR)/test_crt_submission.o | $(BIN_DIR)
@@ -464,7 +470,7 @@ endif
 	$(NVCC) -O3 $(CUDA_ARCH) $(NVCC_FLAGS) -c $< -o $@
 
 # Run tests
-test: $(TEST_GAP_DETECTION) $(TEST_PRIMALITY) $(TEST_WORKER_THREADS) $(TEST_GAPCOIN_RPC) $(TEST_BLOCK_SUBMISSION) $(TEST_SIEVE_CORE) $(TEST_GPU_FERMAT) $(TEST_GPU_SIEVE) $(TEST_GPU_RESOLVE) $(TEST_GAP_DIST) $(TEST_HALFCLASS) $(TEST_GAP_PRIORITY) $(TEST_CRT_SET) $(TEST_GAP_TARGET) $(TEST_POW_Q48) $(TEST_COVERING) $(TEST_CRT_RUNTIME) $(TEST_CRT_SUBMISSION) $(TEST_GAP_HUNT_CENTER) $(TEST_STRATUM) $(TEST_SMOOTH)
+test: $(TEST_GAP_DETECTION) $(TEST_PRIMALITY) $(TEST_WORKER_THREADS) $(TEST_GAPCOIN_RPC) $(TEST_BLOCK_SUBMISSION) $(TEST_SIEVE_CORE) $(TEST_GPU_FERMAT) $(TEST_GPU_SIEVE) $(TEST_GPU_RESOLVE) $(TEST_GAP_DIST) $(TEST_HALFCLASS) $(TEST_GAP_PRIORITY) $(TEST_CRT_SET) $(TEST_GAP_TARGET) $(TEST_POW_Q48) $(TEST_COVERING) $(TEST_CRT_RUNTIME) $(TEST_CRT_ROW_SELECT) $(TEST_CRT_SUBMISSION) $(TEST_GAP_HUNT_CENTER) $(TEST_STRATUM) $(TEST_SMOOTH)
 	@echo "\n========== Running Integration Tests =========="
 	@$(TEST_GAP_DETECTION)
 	@echo ""
@@ -499,6 +505,8 @@ test: $(TEST_GAP_DETECTION) $(TEST_PRIMALITY) $(TEST_WORKER_THREADS) $(TEST_GAPC
 	@$(TEST_COVERING)
 	@echo ""
 	@$(TEST_CRT_RUNTIME)
+	@echo ""
+	@$(TEST_CRT_ROW_SELECT)
 	@echo ""
 	@$(TEST_CRT_SUBMISSION)
 	@echo ""

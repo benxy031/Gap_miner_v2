@@ -20,8 +20,9 @@ sieve → probable-prime filter → gap/merit filter → BPSW verify → submit
 1. **Sieve** — a segmented sieve removes numbers with small prime factors
    (64-bit bitmap, AVX2-marking/extraction on x86-64).
 2. **Probable-prime filter** — the CPU Euler test by default, or — with
-   `--enable-gpu-fermat` — a CUDA base-2 Miller-Rabin test that *replaces* it
-   (a real prime never fails, so no gap is missed).
+   `--enable-gpu-fermat` — a CUDA base-2 Miller-Rabin test that *replaces* it.
+   Real primes pass, but a composite pseudoprime can split a gap before
+   endpoint verification and cause it to be missed.
 3. **Gap/merit filter** — among probable primes, find consecutive pairs whose
    gap merit clears the **template's own `nDifficulty`** (the Q48 value the node
    will check the submitted header against; `--merit` overrides it, and in pool
@@ -43,10 +44,10 @@ merit). Two consequences are handled explicitly:
 
 - **Threshold source.** `nDifficulty` belongs to the *template* being mined,
   while `getmininginfo`'s `difficulty` describes the **tip**. When a template
-  raises the target, mining on the tip's value queues gaps the node answers with
-  `high-hash`; when it lowers it, the scan window is sized for a gap too small
-  to qualify. The default threshold therefore tracks the template
-  (`[Main] Active merit threshold … from template nDifficulty`) and falls back to
+  raises the target, mining on the tip's lower value admits extra candidates
+  that fail the submit gate; when it lowers the target, the tip's higher value
+  can cause qualifying gaps to be missed. The default threshold tracks the
+  template (`[Main] Active merit threshold … from template nDifficulty`) and falls back to
   `getmininginfo` only before the first template is materialized.
 - **Exact gate.** Every gap reaching the submit stage carries the difficulty the
   **worker** computed from its two endpoints (log line: `node_diff=…`), and
@@ -334,6 +335,168 @@ not claim that a hit is new.
   instead of Cramér `exp(-m)`). This is the fast path for finding
   merit-qualified gaps. Prebuilt merit-23 files ship in `data/crt/m23/`; batch
   generate your own with `scripts/gen_crt_batch.sh` (see `gen_crt.md`).
+
+The research tool `tools/cover_yield_model.py` (requires NumPy) estimates CRT
+gap yield rather than measuring it. It requires `--merit` and one or more cover
+files; `--geometry` defaults to `miner` (`hunt` is also available), `--cost-exp`
+defaults to `2`, `--ref` defaults to the highest estimated yield, and `--top`
+defaults to `0` (show all). The reported `rho@m` covers the complete design
+interval even when the target-merit scan window is shorter. Expected gaps have
+both endpoints in the scanned interval; `hunt` geometry includes its additional
+24×ln(N) scan extension. This model and the correlated/row-selection tools
+below require an active residue for prime 2; covers without one are rejected
+rather than assuming a fixed row parity. Malformed cover data or an unknown
+`--ref` is reported as an error. For example:
+
+```bash
+python3 tools/cover_yield_model.py --merit 24 \
+  --ref shift720_p98_lex_m30.txt \
+  data/crt/m23/shift720_p98_lex_m30.txt data/crt/m23/shift1017_p130_covermax_m30.txt
+```
+
+Its independence and cost assumptions require empirical validation; see
+[`docs/COVER_EFFECTIVE_DENSITY.md`](docs/COVER_EFFECTIVE_DENSITY.md).
+
+`tools/cover_correlated_model.py` is a separate NumPy research model for the
+**miner** geometry. It samples one shared residue per additional sieve prime
+and estimates expected gaps per window; it does not change mining or measure
+speed. Supply cover files and `--merit` (one or comma-separated values).
+Defaults are `--max-prime 10000`, `--samples 512`, and `--seed 1`;
+`--max-prime 0` disables additional random sieving. The displayed uncertainty
+is Monte Carlo uncertainty only, not a bound on model error. At least two
+samples and a non-negative seed are required; the first file is the reference
+for paired ratios. For example:
+
+```bash
+python3 tools/cover_correlated_model.py --merit 10,18,24 --max-prime 50000 \
+  --samples 2048 --seed 731 \
+  data/crt/m23/shift720_p98_lex_m30.txt \
+  data/crt/m23/shift1017_p130_covermax_m30.txt
+```
+
+The cutoff, independence between different sampled primes, and conditional
+prime probability are modeling assumptions; this is not a prediction of
+candidates per hour or an independently validated replacement cover.
+The model and its tests are described in
+[`docs/COVER_EFFECTIVE_DENSITY.md`](docs/COVER_EFFECTIVE_DENSITY.md).
+
+`tools/cover_row_selection_model.py` is an offline experiment that simulates
+P-spaced CRT miner rows, ranks them after an early sieve, and evaluates the
+selection with additional random sieve primes. It changes no mining behavior.
+It requires one cover and `--merit`; defaults are `--early-prime 10000`,
+`--late-prime 50000`, `--groups 128`, `--rows 64` and `--seed 1`. The late
+cutoff must be at least the early cutoff; use at least two groups and a
+multiple of eight rows that fits the cover's adder budget. Its ideal
+break-even cost ignores selection overhead and must be measured on the actual
+GPU. For example:
+
+```bash
+python3 tools/cover_row_selection_model.py --merit 24 --groups 256 --seed 4858 \
+  data/crt/m23/shift720_p98_lex_m30.txt
+```
+
+`tools/cover_row_prime_control.py` checks the row-selection idea using actual
+GMP probable-prime tests on a **small 256-bit, merit-5** CRT construction. It
+requires NumPy and gmpy2, uses no GPU, and does not change mining behavior.
+It defaults to `--groups 16` and `--seed 7831`; at least two groups and a
+non-negative seed are required. The independent 512-group holdout below may
+take several minutes on a CPU:
+
+```bash
+python3 tools/cover_row_prime_control.py --groups 512 --seed 32147
+```
+
+Its results are not primality proofs or measurements of live-merit miner
+throughput; see [`docs/COVER_EFFECTIVE_DENSITY.md`](docs/COVER_EFFECTIVE_DENSITY.md).
+
+### Experimental CRT row selection
+
+`CRT_ROW_SELECT` is an **experimental** miner option and is off by default.
+`observe` scores all 64 P-spaced CRT rows after a GPU
+sieve through 10,000 but still mines every row, recording the BPSW candidates
+in the best and remaining halves. `select` mines only the best 32 rows and
+reuses the early bitmap when sieving the selected rows to `--sieve-primes`.
+Each worker prints screened/processed counts and screening wall time on exit;
+`observe` also logs completed groups and labels BPSW candidates so the two
+halves can be compared on the same groups.
+This intentionally skips eligible rows in `select` mode and is not a
+production recommendation.
+
+On the dev RTX 3070 with the shift720 cover, the selected half produced
+1.141× and 1.154× the candidate rate **per row** at control merits 12 and
+16. At merit 27 an ABBA test measured 0.913× the baseline windows/s but found
+no candidates in either arm, so a merit-27 hourly gain is unverified. Full
+method, uncertainty and limitations:
+[`docs/COVER_EFFECTIVE_DENSITY.md` §12](docs/COVER_EFFECTIVE_DENSITY.md#12-real-cudacgbn-miner-test-of-staged-rows-2026-11-12).
+
+Both modes require a CUDA/CGBN kernel for the complete candidate width
+(not `GPU_FERMAT_NO_CGBN` or a CIOS kernel), `FUSED_GPU=1`,
+the enabled-by-default `MINING_JUMP2` chain, 64-row batches,
+an active cover prime 2 with all active cover primes at most 10,000, no
+half/quarter-class filtering, `--sieve-primes` at least 10,007 (the first prime
+above the early cutoff). Unsupported configurations and GPU errors are
+reported rather than quietly treated as successful selection. For a local dry
+run:
+
+```bash
+CRT_ROW_SELECT=observe FUSED_GPU=1 MINING_JUMP2=1 \
+  ./bin/gapminer --crt-file data/crt/m23/shift720_p98_lex_m30.txt \
+  --threads 4 --enable-gpu-fermat --sieve-primes 17000000 --merit 12 \
+  --record-log /tmp/row-selection-observe.log
+```
+
+For real node or pool submissions, `CRT_ROW_SELECT_ALLOW_SUBMIT=1` **and**
+`--enable-submission` are both required; the environment variable defaults to
+`0` (off). A node submission also requires an explicit
+`--coinbase-script-hex` for your wallet; without it the experimental mode
+refuses to start. For example, replace the placeholder with your own
+scriptPubKey hex:
+
+```bash
+PAYOUT_SCRIPT_HEX='YOUR_WALLET_SCRIPT_PUBKEY_HEX'
+CRT_ROW_SELECT=select CRT_ROW_SELECT_ALLOW_SUBMIT=1 FUSED_GPU=1 \
+  ./bin/gapminer --crt-file data/crt/m23/shift720_p98_lex_m30.txt \
+  --threads 4 --enable-gpu-fermat --sieve-primes 17000000 \
+  --coinbase-script-hex "$PAYOUT_SCRIPT_HEX" --enable-submission
+```
+
+For a pool, use the same two opt-ins with `--stratum` and
+`--stratum-auth-file` instead of `--coinbase-script-hex`; the pool controls the
+payout. This example uses the legacy Suprnova endpoint:
+
+```bash
+CRT_ROW_SELECT=select CRT_ROW_SELECT_ALLOW_SUBMIT=1 FUSED_GPU=1 \
+  ./bin/gapminer --stratum stratum+tcp://gap.suprnova.cc:2434 \
+  --stratum-auth-file ~/.gapminer-pool \
+  --crt-file data/crt/m23/shift720_p98_lex_m30.txt --threads 4 \
+  --enable-gpu-fermat --sieve-primes 17000000 --enable-submission
+```
+
+Without `--merit`, the miner follows the node's template from the first work
+item, even when `getmininginfo` reports a different tip difficulty, or the
+pool's share target. A higher explicit `--merit` intentionally misses
+lower-merit work that might otherwise qualify. The selected half also skips
+eligible work, and its profitability at live difficulty is unproven. GPU and
+chain failures stop the experimental run instead of silently switching paths.
+Both submission paths support nAdd values of up to 256 bytes and reject
+negative or out-of-range adders. That is a miner encoding limit, not a
+consensus guarantee: the current Gapcoin Core limits `shift` to 1024, while the
+example uses 720. Pool
+compatibility with wider nAdd payloads is not established by the local mock
+alone; watch the pool's actual share verdicts. The existing miner's
+merit-threshold discovery can also miss a borderline gap whose node Q48
+difficulty qualifies only after the node's random refinement.
+
+The local integration test uses a CUDA/CGBN GPU and `gmpy2`, starts mock RPC
+and pool servers on loopback with ephemeral ports, and never contacts the
+real network. It is skipped unless explicitly enabled (default: off):
+
+```bash
+GAPMINER_TEST_CRT_GPU_SUBMIT=1 python3 -m unittest -v tests/test_crt_live_submission.py
+```
+
+Mock acceptance verifies the miner's serialization and local handling, not
+acceptance by a real node or pool.
 
 ## Quick start
 
@@ -1276,6 +1439,8 @@ Environment variables:
 | `GPU_FERMAT_NO_CGBN` | off | Measurement hook: forces the **scalar** Montgomery path (all AL limbs in one thread's registers) even where CGBN is available, so both arithmetic backends can be A/B'd at the same size from the same binary. They are not comparable by limb count alone -- CGBN runs TPI threads per candidate (1-3 limbs per thread plus inter-thread carries), the scalar path keeps everything in registers -- so this is how the "is CGBN the right backend" question gets a number instead of an assumption. Prints one `CGBN DISABLED` line to stderr when active. **Measured 2026-09-21** (devbox 3070, the same 45 s hunt arms as the `GPU_FERMAT_TPI` row, `scalar-path` confirmed by that DISABLED line): **768-bit 3020 vs 730 win/s (CGBN 4.2x faster), 1024-bit 1765 vs 239 (7.4x), 1280-bit 771 vs 110 (7.0x)**. So a straightforward register-resident 64-bit-limb kernel is far *worse* than CGBN, and the ~80% gap between the MR stream and the raw IMAD/issue bound is intrinsic to 64-bit-limb Montgomery on this GPU, not a CGBN tuning miss. Keep the hook for future backend questions |
 | `GPU_MR_BATCH` | `8` | Windows per accumulated MR batch on the fused path (`1..8`; `1` = per-window, the old behavior). One `gpu_fermat_submit_device` per K windows instead of K small-batch launches. Measured on the dev host (RTX 3070, 8 workers, 20s runs, 0 failures): shift258 K=1 3047 → K=8 **5715 (+88%)**; shift509 K=1 1971 → K=8 **3211 (+63%)**. K=8 vs K=4 (all wins, no regressions): +6.5% (258), +2.7% (450), +4.5% (509), +1.4% (657), +0.7% (720), +1.9% (1008). Candidate counts per window are identical across K (verified per shift). Memory note: K=8 sizes the device candidate buffers at 8 windows; on ≤4 GB cards with 8 workers at shifts ≥ 1008 this may OOM and fail-closed to the CPU path |
 | `GPU_MR_KERNEL` | `cgbn` (unset) | Measurement hook: `cios` selects the **32-bit-limb CIOS** MR kernel instead of CGBN — one thread per candidate, all limbs in registers, no shuffles and no barriers, so a warp carries 32 independent candidates in lockstep instead of CGBN TPI=8's 4. Instantiated for AL 5/6/12/16/32 (320/384/768/1024/2048-bit; 16 and 32 are the `--gap-hunt` widths at shift 720 and 1784); every other width stays on CGBN, so setting this never regresses a shift whose width has no instantiation. The wide instantiations need `cios_mr_base2`'s slim live set (n, y and the accumulator only — Mont(1) is recomputed after the squaring loop and the exponent bits are read out of n); the previous 6-array shape is what capped it at 24 limbs. **Do not "optimize" the outer multiply loop back to a full unroll: nvcc 12.4 (V12.4.131) segfaults on the 64-limb instantiation ("cicc: Segmentation fault", no diagnostic) and needs minutes on the smaller ones — `#pragma unroll 1` on that one loop keeps every width compiling in seconds.** **Any other value (unset, `cgbn`, a typo) keeps the CGBN/scalar default, so rollback is unsetting the variable.** Correctness: `tests/test_gpu_fermat` passes in both modes (0 mismatches, 0 false negatives vs GMP, AoS + SoA, AL=5/12/16/32 on CIOS, including partial-top-limb and half-width candidates). **Measured 2026-09-22 — the standalone win does NOT transfer to the chain:** in a pure large-batch MR stream (`tools/bench_cios_mr.cu`, GMP-validated, 8 streams x batch 2048) CIOS does **1,734,623 cand/s vs CGBN TPI=8's 1,387,762 (+25%)**, but end-to-end on the devbox 3070 (shift507 lex_m31, fused chain, `scripts/ab_mr_kernel.sh`) it is **slower**: 8 workers (VRAM-clamped to K=256-512) 7,260/7,007 vs CGBN 11,160/10,779 win/s = **-35%**; 4 workers (K=1024) 13,722 vs 14,924 = **-8%**; 2 workers (K=2048) 11,232 vs 12,393 = **-9%**. Reason: 1 thread per candidate needs ~16-24k threads in flight to fill 48 SMs, while the chain submits only a few hundred to ~2k candidates per MR launch; CGBN's 8-lanes-per-candidate shape fills the machine at any batch size. CIOS shows a *higher* `acc/wall` (more GPU-busy time per unit work) at *lower* win/s, i.e. it is more GPU-expensive in this regime, not less. **That is why the 2026-09-26 reopen targeted `--gap-hunt` instead** — the walk's jump2 rounds batch ~11.7k candidates per MR launch (33 windows x ~355 tests) — **and it still loses, at both large-shift widths**: devbox 3070, quiet GPU, fixed covers, fresh state file per arm, 25 s arms, 2 reps (win/s; µs per MR test in brackets): **shift 720 / 1024-bit (AL=16) CGBN 2095.5 / 2077.6 (1.25) vs CIOS 1359.8 / 1347.1 (2.18) = -35%**; **shift 1784 / 2048-bit (AL=32) CGBN 299.2 / 298.4 (8.50) vs CIOS 136.8 / 136.4 (18.95) = -54%**; tests per window are identical within the arms (268.3 vs 267.9 and 354.7 vs 353.5), so the whole delta is MR time (MR = 71/81% of the window at 720, 91/96% at 1784). Mechanism (`cuobjdump -res-usage` on the shipped binary): one thread per candidate hits the register ceiling as the width grows — 126 regs/192 B stack at 24 limbs, 172/256 at 32, **255 regs/576 B stack at 64** — while CGBN TPI=8 runs 86 regs/0 spill at 2048-bit, i.e. CIOS pays local-memory spill traffic for the arithmetic CGBN keeps in registers. Keep the instantiations (opt-in, zero production risk) for future backends: a 28-SM card needs far fewer threads in flight than this 46-SM devbox, so the shape is not universally ruled out. Example: `GPU_MR_KERNEL=cios FUSED_GPU=1 ./bin/gapminer --crt-file data/crt/m23/shift507_p74_lex_m31.txt --threads 2 --enable-gpu-fermat` |
+| `CRT_ROW_SELECT` | off | Experimental CRT miner option: `observe` ranks all 64 rows and mines both halves; `select` mines only the best 32. See the [usage, restrictions and measured results](#experimental-crt-row-selection). |
+| `CRT_ROW_SELECT_ALLOW_SUBMIT` | `0` | Set to `1` to permit real node or pool submission in `CRT_ROW_SELECT` mode; `--enable-submission` is still required. See the [live mining examples](#experimental-crt-row-selection). |
 | `GPU_SIEVE_PAIR` | off | Experimental 2-window pair-batched fused mark (one kernel writes both ping-pong bitmaps). Measured **-58%** win/s on the dev host (8 workers / 1 GPU, shift258: 1262 vs 3022); the monolithic kernel starves extract/MR kernels at the GPU scheduler. Benchmark-gated — do not enable in production |
 | `CRT_ROWS_BATCH` | `64` | CRT row-walk (Horizon-style): one header nonce yields several aligned bases `base + m·P` (P = the cover primorial), amortizing the per-window SHA256 + CRT alignment over a batch of rows (`0` disables, `1..1024`; the remaining nonce space `(2^shift − nadd0)/P` also bounds the rows — ~64 rows at shift507 with the p74 cover (log2 P = 500.5), only ~8 at shift512 with the p75 cover (log2 P = 509.0)). That starvation is measurable and matters: at shift512, ctr_bits=3 (7 rows) costs ~9% of win/s versus a ctr_bits≥6 cover at the same shift (measured 2026-09-17, quiet GPU, K=128 chain, identical 120.3 MR tests/window: 4809/5047 win/s for `shift512_p75_lex_m30` vs 5288 for `shift509_p74_strong_m32` and 5229/5464 for a freshly generated 73-prime `--ctr-bits 20` file, so **any shift512 benchmark number taken with the p75 file is ~9% low**). Rule of thumb: keep `ctr_bits ≥ 6` (≥ 64 rows, the measured saturation point); the shipped m23 table uses 8, and the production fleet configs are all in that regime. On the fused GPU path (`FUSED_GPU=1`) rows > 1 additionally switch to the **row-batch mark**: one residue sweep computes `base mod p` AND `P mod p` on-device, then one kernel marks all row bitmaps (rank-major: thread = prime, rows in the inner loop). The per-row first-odd-offset flips with the row parity only when P is odd (some covers have an even primorial P — the even-P grid bug was caught by a false-gap flood and fixed; `test_gpu_sieve` covers both step parities). Measured at shift507 with kernel accounting (`GPU_SIEVE_TIMING=1`, fused chain, chunk 32, 1 thread, 120 s): **rows=64 → 2861 win/s vs 2428 with the row walk off (+17.8%)**; mark cost only drops 0.138 → 0.121 ms/window while the per-window SHA256/alignment/launch bucket drops 0.077 → 0.032 ms/window (this supersedes the older "statistically neutral at 4 threads" note). Correctness: parity-verified per row vs the CPU sieve. With `GPU_MARK_SPLIT` (default on) the dense part (`p ≤ window`) of that marking is chunked over (prime, row, chunk) work items instead of one thread per prime — see `GPU_MARK_SPLIT` below (that is where the row batch's mark cost went: 32% → 3.5% of wall). Example: `FUSED_GPU=1 CRT_ROWS_BATCH=64 ./bin/gapminer --crt-file data/crt/m23/shift507_p74_lex_m30.txt --threads 4 --enable-gpu-fermat` |
 | `GPU_MARK_SPLIT` | on | Dense marking for primes `p ≤ window` is done by **chunked work items** — one per (prime, row, odd-slot chunk) — instead of the per-prime walk (rows in the inner loop), on **all three** fused marking shapes: the CRT row batch, the single-window mark (`rows == 1`, e.g. `CRT_ROWS_BATCH=0`) and the 2-window pair batch (`GPU_SIEVE_PAIR=1`). Same slots marked (bit-exact: `test_gpu_sieve` `split-rows` + `pair rows1` cases cover both stride parities, the split+sparse mixed table, forced chunk sizes and both ping-pong windows) at **~9–14× less mark kernel time**: **+47–55%** windows/s on the row batch (shift512 and shift507), **+43%** single-window (`CRT_ROWS_BATCH=0`: 2399 → 3439 win/s, mark 33.7% → 5.3% of wall), **+40%** pair batch (2400 → 3354, mark 33.7% → 5.2%), and **+16%** on the standalone `--gap-hunt` walk used by the fleet (shift507, min-merit 19, default 10M hunt depth: 724/726 → 839/845 win/s, order swapped — smaller because the walk is CGBN-MR-bound). Cost model behind it (`tools/bench_mark.cu`, `make bin/bench_mark WITH_CUDA=1`): the old walk's time is set by the warp with the longest trip count (the `p = 3..131` warp walks `W/3` slots per row) and 73% of it is the marking loop, **not** the atomic store — which is why cutting atomics by 4.5× was a −15% regression and why the 100k→2M sieve-depth sweep was flat. `0` disables (falls back to the per-prime walks, byte-for-byte the old behavior); it also fails closed to them if the prime table is not ascending (the split domain is the `p ≤ window` prefix of the table). Expensive MR tests per window unchanged in all A/Bs and `MINING_JUMP2_VERIFY` parity clean (1173 flights at rows=64, 1138 at rows=1). Example: `GPU_MARK_SPLIT=0 FUSED_GPU=1 ./bin/gapminer --crt-file data/crt/m23/shift512_p75_lex_m30.txt --threads 1 --enable-gpu-fermat` |

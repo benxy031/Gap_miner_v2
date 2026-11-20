@@ -20,6 +20,7 @@
 #include <stdatomic.h>
 #include <gmp.h>
 #include "atomic_nonce.h"
+#include "gap_nadd.h"
 #include "gap_detection.h"   /* struct gap_result */
 #include "halfclass.h"       /* struct halfclass_tpl */
 
@@ -127,13 +128,16 @@ struct gap_queue_entry {
     double merit;
     uint64_t generation;           /* Work generation active when this gap was found */
     uint32_t header_nonce;         /* GBT header nonce active when this gap was found */
-    uint64_t nadd;                 /* Full-width adder offset within the header's shift range */
-    uint8_t nadd_bytes[128];       /* Little-endian nAdd bytes (CRT: >64-bit offsets) */
+    uint64_t nadd;                 /* Legacy adder, or low bits of CRT nAdd */
+    uint8_t nadd_bytes[GAP_NADD_MAX_BYTES]; /* Little-endian CRT nAdd */
     uint32_t nadd_len;             /* 0 => use legacy `nadd`; >0 => use nadd_bytes */
     uint64_t q48_difficulty;       /* The node's own difficulty() for this gap (Q48 fixed
                                       point, rand() refinement included).  0 means
                                       "not computed" and the submit gate fails open. */
 };
+
+/* Encode a nonnegative nAdd less than 2^entry->shift without truncation. */
+int worker_gap_set_nadd(struct gap_queue_entry *entry, const mpz_t nadd);
 
 /* Get pending gap from queue (thread-safe) */
 int worker_get_pending_gap(struct gap_queue_entry *gap_out);

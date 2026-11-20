@@ -50,6 +50,7 @@
 
 #include <stddef.h>
 #include <stdint.h>
+#include "gap_nadd.h"
 
 /* 80-byte header prefix, 160 hex chars + NUL. */
 #define STRATUM_HDR80_SIZE 80U
@@ -58,9 +59,8 @@
 /* Smallest payload the pool/node accepts (gapcoind: total must be > 86 B). */
 #define STRATUM_POW_MIN_BYTES 87U
 
-/* Longest nAdd the pool payload carries (a CRT alignment offset is well
-   inside this; the legacy uint64 path uses 8). */
-#define STRATUM_NADD_MAX 64U
+/* Share metadata and the worker queue must represent the same nAdd range. */
+#define STRATUM_NADD_MAX GAP_NADD_MAX_BYTES
 
 typedef struct stratum_ctx stratum_ctx;
 

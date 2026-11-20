@@ -75,6 +75,7 @@ struct mock_pool {
     int submits_accepted;
     int submits_rejected;
     int payload_bad;
+    char last_nadd_hex[2 * STRATUM_NADD_MAX + 1];
     int silent_submits;   /* shares whose verdict is deliberately withheld */
     int allow_push;       /* gate: test releases the push updates when ready */
     int push_pending;
@@ -144,7 +145,8 @@ static void validate_submit(struct mock_pool *m, json_t *params)
     hex_encode(m->hdr2, 80, expect_hdr2);
     hex_encode(m->hdr3, 80, expect_hdr3);
 
-    if (hexlen < STRATUM_POW_MIN_BYTES * 2) {
+    if (hexlen < STRATUM_POW_MIN_BYTES * 2 || (hexlen & 1U) ||
+        hexlen > 2U * (STRATUM_HDR80_SIZE + 4U + 2U + STRATUM_NADD_MAX)) {
         m->payload_bad++;
         fprintf(stderr, "  [mock] payload only %zu hex chars (needs > %u)\n",
                 hexlen, STRATUM_POW_MIN_BYTES * 2U);
@@ -165,6 +167,7 @@ static void validate_submit(struct mock_pool *m, json_t *params)
             return;
         }
     }
+    snprintf(m->last_nadd_hex, sizeof(m->last_nadd_hex), "%s", hex + 172);
 }
 
 static void mock_handle_line(struct mock_pool *m, int fd, const char *line)
@@ -206,8 +209,8 @@ static void mock_handle_line(struct mock_pool *m, int fd, const char *line)
         } else if (method && strcmp(method, "mining.submit") == 0) {
             json_t *params = json_object_get(root, "params");
             const char *hex = NULL;
-            m->submits_seen++;
             validate_submit(m, params);
+            m->submits_seen++;
             if (json_is_array(params) && json_array_size(params) == 3 &&
                 json_is_string(json_array_get(params, 2)))
                 hex = json_string_value(json_array_get(params, 2));
@@ -416,18 +419,18 @@ static void verdict_cb(void *user, int accepted,
                        const char *message)
 {
     struct cb_capture *c = (struct cb_capture *)user;
-    c->calls++;
     c->last_accepted = accepted;
     snprintf(c->last_message, sizeof(c->last_message), "%s",
              message ? message : "");
     if (meta)
         c->last_meta = *meta;
+    c->calls++;
 }
 
 static void test_pow_hex(void){
     uint8_t hdr[80];
     uint8_t nadd[2] = { 0x34, 0x12 };
-    char out[512];
+    char out[2 * (STRATUM_HDR80_SIZE + 4U + 2U + STRATUM_NADD_MAX) + 1];
     size_t len;
 
     printf("\n[pure] stratum_pow_hex layout\n");
@@ -458,6 +461,8 @@ static void test_pow_hex(void){
 
     len = stratum_pow_hex(hdr, 0U, 0U, nadd, 2, out, 10);
     CHECK(len == 0, "undersized buffer is refused");
+    len = stratum_pow_hex(hdr, 0U, 0U, NULL, 2, out, sizeof(out));
+    CHECK(len == 0, "nonzero nAdd length requires bytes");
 
     len = stratum_pow_hex(hdr, 0U, 0U, nadd, 2, out, sizeof(out));
     {
@@ -717,7 +722,42 @@ int main(void)
         }
     }
 
-    printf("\n[7] shutdown\n");
+    if (mock.running) {
+        uint8_t wide[STRATUM_NADD_MAX + 1U];
+        char expected[2 * STRATUM_NADD_MAX + 1];
+        size_t lengths[] = {90U, STRATUM_NADD_MAX};
+        for (size_t i = 0; i < sizeof(wide); i++)
+            wide[i] = (uint8_t)(i | 1U);
+
+        printf("\n[7] wide nAdd pool payloads and verdict metadata\n");
+        WAIT_FOR(cap.calls >= 4, 3000, "post-reconnect verdict arrived");
+        for (size_t i = 0; i < sizeof(lengths) / sizeof(lengths[0]); i++) {
+            size_t n = lengths[i];
+            int seen = mock.submits_seen;
+            int calls = cap.calls;
+            hex_encode(wide, n, expected);
+            CHECK(stratum_submit_pow(ctx, mock.hdr2, 0x01020300U + (uint32_t)i,
+                                     n == 90U ? 720U : 2048U, wide, n) == 1,
+                  "queue %zu-byte nAdd", n);
+            WAIT_FOR(mock.submits_seen > seen, 3000, "wide share arrived");
+            WAIT_FOR(cap.calls > calls, 3000, "wide share verdict arrived");
+            CHECK(strcmp(mock.last_nadd_hex, expected) == 0,
+                  "mock received all %zu nAdd bytes in order", n);
+            CHECK(cap.last_meta.nadd_len == n &&
+                  memcmp(cap.last_meta.nadd, wide, n) == 0,
+                  "verdict retains all %zu nAdd bytes", n);
+        }
+        int seen_before_oversized = mock.submits_seen;
+        CHECK(stratum_submit_pow(ctx, mock.hdr2, 0x01020400U, 2049U,
+                                 wide, sizeof(wide)) == 0,
+              "nAdd larger than the pool buffer is rejected");
+        sleep_ms(50);
+        CHECK(mock.submits_seen == seen_before_oversized,
+              "oversized nAdd was not sent to the pool");
+        CHECK(mock.payload_bad == 0, "mock rejected no payload layouts");
+    }
+
+    printf("\n[8] shutdown\n");
     stratum_disconnect(ctx);
     printf("  ok   : stratum_disconnect returned\n");
     if (mock.running)

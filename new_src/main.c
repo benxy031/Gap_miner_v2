@@ -349,7 +349,7 @@ static void pool_verdict_cb(void *user, int accepted,
                             const struct stratum_share_meta *meta,
                             const char *message)
 {
-    char nadd_dec[192];
+    char nadd_dec[3U * GAP_NADD_MAX_BYTES + 1U];
     (void)user;
 
     if (!meta)
@@ -608,6 +608,54 @@ int main(int argc, char *argv[]) {
     }
 #endif
 
+    const char *row_select_env = getenv("CRT_ROW_SELECT");
+    int row_select_enabled = row_select_env && row_select_env[0] &&
+                             strcmp(row_select_env, "0") != 0;
+    if (row_select_enabled) {
+        if (strcmp(row_select_env, "observe") != 0 &&
+            strcmp(row_select_env, "select") != 0) {
+            fprintf(stderr, "[Main] CRT_ROW_SELECT must be observe, select, or 0\n");
+            return 1;
+        }
+#if !defined(WITH_CUDA) || !defined(WITH_CGBN_FERMAT)
+        fprintf(stderr, "[Main] CRT_ROW_SELECT requires a CUDA/CGBN build\n");
+        return 1;
+#endif
+        const char *batch = getenv("CRT_ROWS_BATCH");
+        const char *jump = getenv("MINING_JUMP2");
+        const char *allow_submit = getenv("CRT_ROW_SELECT_ALLOW_SUBMIT");
+        if (allow_submit && allow_submit[0] &&
+            strcmp(allow_submit, "0") != 0 &&
+            strcmp(allow_submit, "1") != 0) {
+            fprintf(stderr, "[Main] CRT_ROW_SELECT_ALLOW_SUBMIT must be 0 or 1\n");
+            return 1;
+        }
+        if (enable_submission &&
+            (!allow_submit || strcmp(allow_submit, "1") != 0)) {
+            fprintf(stderr, "[Main] CRT_ROW_SELECT real submissions require "
+                            "CRT_ROW_SELECT_ALLOW_SUBMIT=1\n");
+            return 1;
+        }
+        if (enable_submission && !stratum_endpoint && !coinbase_script_hex) {
+            fprintf(stderr, "[Main] CRT_ROW_SELECT real node submissions require "
+                            "--coinbase-script-hex for the payout\n");
+            return 1;
+        }
+        if (gap_hunt_enabled || !crt_file || !enable_gpu_fermat ||
+            !main_env_enabled("FUSED_GPU") ||
+            main_env_enabled("GPU_FERMAT_NO_CGBN") ||
+            (jump && jump[0] == '0') ||
+            main_env_enabled("HALF_CLASS") ||
+            main_env_enabled("QUARTER_CLASS") ||
+            (batch && batch[0] && strcmp(batch, "64") != 0)) {
+            fprintf(stderr,
+                    "[Main] CRT_ROW_SELECT requires CRT mining, CUDA/CGBN "
+                    "with --enable-gpu-fermat, FUSED_GPU=1, active MINING_JUMP2, "
+                    "64 rows, and no class filtering\n");
+            return 1;
+        }
+    }
+
     if (gap_hunt_enabled) {
         if (!crt_file) {
             fprintf(stderr, "[Main] --gap-hunt requires --crt-file\n");
@@ -771,6 +819,43 @@ int main(int argc, char *argv[]) {
                "2^50 adders per block (effectively unlimited)\n", user_shift);
     }
     
+    if (row_select_enabled) {
+        int active_two = 0;
+        for (uint32_t i = 0; i < crt_rt.n_primes; i++) {
+            if (crt_rt.offsets[i] % crt_rt.primes[i] == 0) continue;
+            if (crt_rt.primes[i] > 10000U) {
+                fprintf(stderr, "[Main] CRT_ROW_SELECT requires all active cover "
+                                "primes <= 10000\n");
+                crt_runtime_free(&crt_rt);
+                return 1;
+            }
+            if (crt_rt.primes[i] == 2U) active_two = 1;
+        }
+        mpz_t space, required;
+        mpz_inits(space, required, NULL);
+        mpz_set_ui(space, 1);
+        mpz_mul_2exp(space, space, crt_rt.shift);
+        mpz_mul_ui(required, crt_rt.primorial, 65U);
+        mpz_sub_ui(required, required, 1U);
+        int enough_rows = mpz_cmp(space, required) >= 0;
+        mpz_clears(space, required, NULL);
+        if (!active_two || !enough_rows || sieve_primes < 10007U) {
+            fprintf(stderr, "[Main] CRT_ROW_SELECT requires active prime 2, "
+                            "64 rows for every alignment, and sieve depth >= 10007\n");
+            crt_runtime_free(&crt_rt);
+            return 1;
+        }
+        printf("[Main] CRT_ROW_SELECT=%s: %s screening enabled\n",
+               row_select_env, enable_submission ? "LIVE" : "dry-run");
+        if (enable_submission) {
+            fprintf(stderr, "[Main] WARNING: experimental CRT_ROW_SELECT "
+                            "live submission enabled; %s\n",
+                    strcmp(row_select_env, "select") == 0
+                        ? "half the eligible rows are skipped and hourly yield is unproven"
+                        : "screening adds overhead and GPU errors stop the run");
+        }
+    }
+
     printf("[Main] Configuration:\n");
     if (stratum_endpoint) {
         /* Pool mode contacts no node, and the pool's share target (read after
@@ -827,6 +912,13 @@ int main(int argc, char *argv[]) {
            that the candidate limbs no longer fit and every batch would fall
            back to the CPU, so disable it up front with a clear warning. */
         if ((256ULL + user_shift) > (uint64_t)GPU_NLIMBS * 64ULL) {
+            if (row_select_enabled) {
+                fprintf(stderr, "[Main] CRT_ROW_SELECT candidate width exceeds "
+                                "the GPU Fermat build limit of %u bits\n",
+                        GPU_NLIMBS * 64U);
+                crt_runtime_free(&crt_rt);
+                return 1;
+            }
             fprintf(stderr,
                     "[Main] WARN: --shift %u produces %llu-bit candidates but "
                     "this build's GPU Fermat is limited to %u bits; "
@@ -846,6 +938,16 @@ int main(int argc, char *argv[]) {
                     crt_rt.window + back_limit + 2);
             }
             int limbs = gpu_fermat_limbs_for_bits(candidate_bits);
+            const char *kernel = gpu_fermat_kernel_label(limbs);
+            if (row_select_enabled &&
+                (candidate_bits > GPU_NLIMBS * 64U ||
+                 strncmp(kernel, "CGBN ", 5) != 0)) {
+                fprintf(stderr, "[Main] CRT_ROW_SELECT requires a CGBN kernel "
+                                "covering %u candidate bits; got %s\n",
+                        candidate_bits, kernel);
+                crt_runtime_free(&crt_rt);
+                return 1;
+            }
             printf("[Main] GPU Fermat pre-filter enabled (CUDA, compiled for "
                    "%u-bit candidates / %u limbs)\n",
                    GPU_NLIMBS * 64U, (unsigned)GPU_NLIMBS);
@@ -853,8 +955,7 @@ int main(int argc, char *argv[]) {
                    "(%u-bit conservative bound) -> %d active limb%s "
                    "-> kernel: %s\n",
                    user_shift, 256ULL + (uint64_t)user_shift, candidate_bits,
-                   limbs, limbs == 1 ? "" : "s",
-                   gpu_fermat_kernel_label(limbs));
+                   limbs, limbs == 1 ? "" : "s", kernel);
         }
         printf("[Main] GPU bitmap sieve: %s (GPU_SIEVE=1 to enable, multi-GPU only)\n",
                getenv("GPU_SIEVE") ? getenv("GPU_SIEVE") : "off");
@@ -1040,6 +1141,21 @@ int main(int argc, char *argv[]) {
             gapcoin_rpc_free(g_rpc);
             return 1;
         }
+        if (!merit_threshold_overridden) {
+            double tmpl_merit = pow_q48_readable(tmpl->difficulty);
+            if (tmpl_merit != merit_threshold) {
+                if (miner_farm_set_merit_threshold(g_farm, tmpl_merit) != 0) {
+                    fprintf(stderr, "[Main] Cannot set initial template merit threshold\n");
+                    block_template_free(tmpl);
+                    miner_farm_free(g_farm);
+                    gapcoin_rpc_free(g_rpc);
+                    return 1;
+                }
+                merit_threshold = tmpl_merit;
+                printf("[Main] Active merit threshold %.4f from template nDifficulty\n",
+                       merit_threshold);
+            }
+        }
         work_difficulty = (uint32_t)tmpl->difficulty;
         work_height = tmpl->height;
         g_rpc_prev_height = tmpl->height;
@@ -1128,10 +1244,10 @@ int main(int argc, char *argv[]) {
             /* The template's own nDifficulty (Q48) is the authority for the
                merit threshold: it is exactly what the node compares the
                submitted header against, while getmininginfo's "difficulty"
-               describes the TIP.  When a template raises the target, mining
-               against the tip's value makes every queued gap come back as
-               "high-hash" (and mining against a too-SMALL window misses the
-               gaps that would qualify). */
+               describes the TIP. A higher template target makes some gaps
+               that clear the tip value fail the submit gate; a lower target
+               can cause qualifying gaps to be missed if the threshold
+               remains at the tip's higher value. */
             if (!merit_threshold_overridden && tmpl->difficulty != 0) {
                 double tmpl_merit = pow_q48_readable(tmpl->difficulty);
                 if (tmpl_merit > 0.0 && tmpl_merit != merit_threshold) {

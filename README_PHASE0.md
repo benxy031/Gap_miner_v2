@@ -590,6 +590,7 @@ python3 scripts/psp_hunt.py scan --start 160696461657079906273 \
 | `--batch-size N` | `10000` (`pairs`, `chernick`); `100000` (`scan`) | work per committed checkpoint |
 | `--max-batches N` | `0` | no extra limit; a positive N pauses after N committed batches |
 | `--min-gap G` (`pairs`) | `0` | retain/print only PSPs in gaps >= G; positive G is part of the database identity |
+| `--backend`, `--device`, `--gpu-library` (`pairs`, `scan`) | `cpu`, `0`, `bin/libpsp_pairs_gpu.so` | CPU or CUDA filter, CUDA device and shared library |
 | `--min-gap G`, `--limit N`, `--status S` | `0`, `20`, `confirmed` (`show`) | filter displayed gaps, row limit (`0` = all), and `confirmed`, `pending` or `all` |
 
 `pairs` exhausts only semiprimes (including squares) in its factor slice and
@@ -599,7 +600,17 @@ smaller-factor slices covering `[10000001, 44721359550)`. `--p-start` must
 exceed `--factor-floor`, and each new slice uses a new database. `chernick`
 covers only the specified family. Neither covers all composites above `1e21`,
 where three or more factors above the floor are possible. The generic `scan`
-checks all eligible odd integers in its interval but is much slower.
+checks all eligible odd integers in its interval. Its opt-in CUDA backend
+supports `[2^95, 2^96 - 2^79)`, uses the same checkpoint format as CPU,
+and still leaves MR12 passers above the proven bound as `pending`. It does
+not support `--min-gap`. For example:
+
+```
+make bin/libpsp_pairs_gpu.so WITH_CUDA=1
+python3 scripts/psp_hunt.py scan --backend cuda --device 0 \
+    --start 79000098242502245419955565689 --end 79000098242502245419956565689 \
+    --factor-floor 85000 --batch-size 1048576 --db data/psp_scan_gpu_example.sqlite3
+```
 
 The prime-factor table is capped at `25000000`, limiting `scan`'s factor floor
 and the table needed for `pairs`. The `pairs` and `chernick` modes reject
@@ -608,8 +619,8 @@ factor ranges outside the exclusive deterministic MR12 bound
 ([Sorenson and Webster](https://arxiv.org/abs/1509.00864)).
 `scan` retains unresolved Fermat passers at or above that bound as `pending`.
 Gaps entirely below it are checked across the interior and labelled
-`proven_mr12`; interior composites with a factor through 97 are proved by that
-factor and the remaining candidates are checked with MR12. This always-on
+`proven_mr12`; GMP first rejects definitely composite interior candidates,
+and the remaining candidates are checked with MR12. This always-on
 optimization preserves results and checkpoint compatibility; the `pairs`
 examples above use it automatically. Gaps beyond the bound are labelled
 `probable_gmp`. Confirmed JSON records include the test outcomes, proven

@@ -19,7 +19,7 @@ from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "scripts"))
-from scripts import psp_hunt as hunt, psp_gpu as gpu, psp_probe
+from scripts import psp_hunt as hunt, psp_gpu as gpu, psp_probe, psp_math
 from test_psp_hunt import BRIAN_SMALL_GAPS, run_cli
 
 
@@ -243,6 +243,170 @@ class CudaTests(unittest.TestCase):
     @classmethod
     def tearDownClass(cls):
         cls.filter.close()
+
+    def test_scan_fermat_filter_matches_gmp_in_wall_domain(self):
+        import gmpy2
+        import numpy as np
+
+        fixture = 79000098242502245419956065689
+        for first in (gpu.SCAN_MIN + 1,
+                      (1 << 95) + (1 << 64) - 2001,
+                      fixture - 10000,
+                      gpu.SCAN_LIMIT - 20001):
+            offsets = np.arange(10000, dtype=np.uint32)
+            actual, _ = self.filter.scan(first, offsets)
+            expected = [i for i in range(len(offsets))
+                        if gmpy2.powmod(2, first + 2 * i - 1, first + 2 * i) == 1]
+            self.assertEqual([i for i, _, _ in actual], expected, first)
+            for i, witness, euler in actual:
+                n = first + 2 * i
+                cpu = hunt.mr12_witness(n)
+                self.assertEqual(witness == 0, cpu is None, n)
+                self.assertEqual(bool(euler), bool(psp_math.euler_base2(n)), n)
+                if cpu is not None:
+                    self.assertEqual(psp_math.MR12_BASES[witness - 1],
+                                     cpu.get("base", cpu.get("value")))
+            if first == fixture - 10000:
+                self.assertIn(5000, [i for i, _, _ in actual])
+                self.assertEqual(
+                    (2361341467 * 4722682933 * 7084024399), fixture)
+        with self.assertRaisesRegex(RuntimeError, "u96 domain"):
+            self.filter.scan(gpu.SCAN_LIMIT - 1, np.array([0, 1], dtype=np.uint32))
+        with self.assertRaisesRegex(RuntimeError, "increasing"):
+            self.filter.scan(gpu.SCAN_MIN + 1, np.array([1, 1], dtype=np.uint32))
+        with self.assertRaisesRegex(ValueError, "uint32"):
+            self.filter.scan(gpu.SCAN_MIN + 1, np.array([1], dtype=np.uint64))
+        with self.assertRaisesRegex(ValueError, "inside the u96 domain"):
+            self.filter.scan(gpu.SCAN_MIN - 1, np.array([0], dtype=np.uint32))
+
+    def test_scan_batch_and_mixed_resume_match_cpu(self):
+        n = 79000098242502245419956065689
+        config = {"mode": "scan", "start": n - 10001, "end": n + 10002,
+                  "factor_floor": 85000}
+        primes = hunt.prime_table(config["factor_floor"])
+        cursor = hunt.initial_cursor(config)
+        expected = hunt.scan_batch(config, cursor, 20003, primes)
+        actual = gpu.scan_batch(hunt, config, cursor, 20003, primes, self.filter)
+        self.assertEqual(actual, expected)
+        self.assertIn(str(n), [record["n"] for record in actual[2]])
+        common = ("scan", "--start", str(config["start"]), "--end", str(config["end"]),
+                  "--factor-floor", "85000", "--batch-size", "5000")
+        with tempfile.TemporaryDirectory() as directory:
+            reference = Path(directory) / "cpu.sqlite3"
+            cpu = run_cli(*common, "--db", str(reference))
+            self.assertEqual(cpu.returncode, 4, cpu.stderr)
+            for first, second in (("cpu", "cuda"), ("cuda", "cpu")):
+                db = Path(directory) / (first + ".sqlite3")
+                paused = run_cli(*common, "--db", str(db), "--backend", first,
+                                 "--max-batches", "1")
+                self.assertEqual(paused.returncode, 4, paused.stderr)
+                resumed = run_cli(*common, "--db", str(db), "--backend", second)
+                self.assertEqual(resumed.returncode, 4, resumed.stderr)
+                with contextlib.closing(sqlite3.connect(db)) as a, \
+                        contextlib.closing(sqlite3.connect(reference)) as b:
+                    self.assertEqual(a.execute("select n,payload from results order by n").fetchall(),
+                                     b.execute("select n,payload from results order by n").fetchall())
+                    self.assertEqual(a.execute("select cursor,stats,complete from progress").fetchone(),
+                                     b.execute("select cursor,stats,complete from progress").fetchone())
+                    self.assertEqual(a.execute("pragma integrity_check").fetchone()[0], "ok")
+            invalid = run_cli("scan", "--start", "3", "--end", "100", "--backend", "cuda",
+                              "--db", str(Path(directory) / "invalid.sqlite3"))
+            self.assertEqual(invalid.returncode, 2, invalid.stderr)
+            self.assertIn("requires the interval", invalid.stderr)
+
+    def test_scan_three_factor_fermat_witnesses(self):
+        import gmpy2
+        import numpy as np
+
+        for k, expected_base in ((393556911, 2), (393580466, 3), (393570610, 5)):
+            factors = (6 * k + 1, 12 * k + 1, 18 * k + 1)
+            self.assertTrue(all(psp_math.proven_prime_mr12(p) for p in factors))
+            n = math.prod(factors)
+            self.assertEqual(gmpy2.powmod(2, n - 1, n), 1)
+            self.assertEqual(hunt.mr12_witness(n)["base"], expected_base)
+            hits, _ = self.filter.scan(n, np.array([0], dtype=np.uint32))
+            self.assertEqual(hits, [(0, psp_math.MR12_BASES.index(expected_base) + 1,
+                                    int(psp_math.euler_base2(n)))])
+
+    def test_scan_finds_four_factor_fermat_psp(self):
+        factors = (6832237, 13664473, 20496709, 40993417)
+        self.assertTrue(all(psp_math.proven_prime_mr12(p) for p in factors))
+        n = math.prod(factors)
+        config = {"mode": "scan", "start": n - 100, "end": n + 101,
+                  "factor_floor": 85000}
+        primes = hunt.prime_table(85000)
+        expected = hunt.scan_batch(config, hunt.initial_cursor(config), 201, primes)
+        actual = gpu.scan_batch(hunt, config, hunt.initial_cursor(config),
+                                201, primes, self.filter)
+        self.assertEqual(actual, expected)
+        self.assertIn(str(n), [record["n"] for record in actual[2]])
+
+    def test_scan_rejects_gpu_false_positives(self):
+        n = 79000098242502245419956065689
+        config = {"mode": "scan", "start": n - 100, "end": n + 100,
+                  "factor_floor": 85000}
+        class InvalidFilter:
+            def scan(self, first, offsets):
+                return [(i, 0, 0) for i in range(len(offsets))], 0.0
+        with self.assertRaisesRegex(RuntimeError, "false Fermat passer"):
+            gpu.scan_batch(hunt, config, hunt.initial_cursor(config), 200,
+                           hunt.prime_table(85000), InvalidFilter())
+        with tempfile.TemporaryDirectory() as directory:
+            config["version"] = hunt.VERSION
+            with hunt.Store(Path(directory) / "failed.sqlite3", config) as store:
+                before = store.db.execute("select cursor,stats,complete from progress").fetchone()
+                with patch.object(self.filter, "scan", side_effect=RuntimeError("CUDA failure")):
+                    with self.assertRaisesRegex(RuntimeError, "CUDA failure"):
+                        gpu.scan_batch(hunt, config, store.cursor, 200,
+                                       hunt.prime_table(85000), self.filter)
+                self.assertEqual(store.db.execute(
+                    "select cursor,stats,complete from progress").fetchone(), before)
+                self.assertEqual(store.db.execute("select count(*) from results").fetchone()[0], 0)
+
+    def test_scan_sigterm_resumes_on_cpu(self):
+        n = 79000098242502245419956065689
+        common = ("scan", "--start", str(n - 150000), "--end", str(n + 150000),
+                  "--factor-floor", "85000", "--batch-size", "10000")
+        with tempfile.TemporaryDirectory() as directory:
+            db = Path(directory) / "signal.sqlite3"
+            reference = Path(directory) / "cpu.sqlite3"
+            output = Path(directory) / "signal.out"
+            with output.open("w") as stream:
+                process = subprocess.Popen(
+                    [sys.executable, str(ROOT / "scripts/psp_hunt.py"),
+                     *common, "--backend", "cuda", "--db", str(db)],
+                    cwd=ROOT, stdout=stream, stderr=stream)
+                try:
+                    deadline = time.monotonic() + 10
+                    checkpointed = False
+                    while time.monotonic() < deadline and process.poll() is None:
+                        if db.exists():
+                            with contextlib.closing(sqlite3.connect(db)) as connection:
+                                table = connection.execute(
+                                    "select name from sqlite_master where name='progress'").fetchone()
+                                if table:
+                                    row = connection.execute("select stats from progress").fetchone()
+                                    if row and json.loads(row[0])["batches"] > 0:
+                                        checkpointed = True
+                                        break
+                        time.sleep(0.01)
+                    self.assertTrue(checkpointed, output.read_text())
+                    process.send_signal(signal.SIGTERM)
+                    self.assertEqual(process.wait(timeout=20), 143, output.read_text())
+                finally:
+                    if process.poll() is None:
+                        process.terminate()
+                        process.wait(timeout=20)
+            for path in (db, reference):
+                result = run_cli(*common, "--backend", "cpu", "--db", str(path))
+                self.assertEqual(result.returncode, 4, result.stderr)
+            with contextlib.closing(sqlite3.connect(db)) as a, \
+                    contextlib.closing(sqlite3.connect(reference)) as b:
+                self.assertEqual(a.execute("select n,payload from results order by n").fetchall(),
+                                 b.execute("select n,payload from results order by n").fetchall())
+                self.assertEqual(a.execute("select cursor,stats,complete from progress").fetchone(),
+                                 b.execute("select cursor,stats,complete from progress").fetchone())
+                self.assertEqual(a.execute("pragma integrity_check").fetchone()[0], "ok")
 
     def test_smallest_factor_with_empty_prime_table(self):
         config = {"mode": "pairs", "start": 3, "end": 100,

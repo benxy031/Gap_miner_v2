@@ -1,4 +1,4 @@
-"""CUDA progression filter for the standalone semiprime hunter."""
+"""CUDA filters for the standalone pseudoprime hunter."""
 
 import bisect
 import ctypes
@@ -12,6 +12,8 @@ import gmpy2
 FACTOR_LIMIT = 1 << 63
 MAX_BATCH = 1 << 24
 MAX_RANGES = 1 << 20
+SCAN_MIN = 1 << 95
+SCAN_LIMIT = (1 << 96) - (1 << 79)
 # p-interval per prime_orders sieve segment.
 SEGMENT = 1 << 21
 DEFAULT_LIBRARY = Path(__file__).resolve().parents[1] / "bin/libpsp_pairs_gpu.so"
@@ -103,6 +105,44 @@ class Filter:
             raise RuntimeError("CUDA returned invalid or duplicate hit indices")
         return indices, milliseconds.value
 
+    def scan(self, first, offsets):
+        import numpy as np
+
+        if not self.ctx:
+            raise RuntimeError("CUDA filter is closed")
+        if not SCAN_MIN <= first < SCAN_LIMIT or not first & 1:
+            raise ValueError("CUDA scan first candidate must be odd and inside the u96 domain")
+        if (not isinstance(offsets, np.ndarray) or offsets.dtype != np.uint32 or
+                offsets.ndim != 1 or not offsets.flags.c_contiguous):
+            raise ValueError("CUDA scan offsets must be a contiguous uint32 array")
+        if len(offsets) > self.capacity:
+            raise ValueError("CUDA scan candidate count exceeds capacity")
+        if not hasattr(self.lib, "psp_gpu_scan"):
+            raise RuntimeError("CUDA library does not expose psp_gpu_scan; rebuild it")
+        self.lib.psp_gpu_scan.argtypes = [
+            ctypes.c_void_p, ctypes.c_uint64, ctypes.c_uint32,
+            ctypes.POINTER(ctypes.c_uint32), ctypes.c_uint64,
+            ctypes.POINTER(ctypes.c_uint64), ctypes.POINTER(ctypes.c_uint64),
+            ctypes.POINTER(ctypes.c_float)]
+        self.lib.psp_gpu_scan.restype = ctypes.c_int
+        count, milliseconds = ctypes.c_uint64(), ctypes.c_float()
+        rc = self.lib.psp_gpu_scan(
+            self.ctx, first & ((1 << 64) - 1), first >> 64,
+            offsets.ctypes.data_as(ctypes.POINTER(ctypes.c_uint32)), len(offsets),
+            self.indices, ctypes.byref(count), ctypes.byref(milliseconds))
+        if rc:
+            raise RuntimeError(self.error())
+        if count.value > len(offsets):
+            raise RuntimeError("CUDA returned an invalid hit count")
+        hits = sorted((value & 0xffffffff, (value >> 32) & 0xff, value >> 40)
+                      for value in self.indices[:count.value])
+        indices = [index for index, _, _ in hits]
+        if (any(index >= len(offsets) or witness > 12 or euler > 1
+                for index, witness, euler in hits) or
+                len(set(indices)) != len(indices)):
+            raise RuntimeError("CUDA returned invalid or duplicate hit indices")
+        return hits, milliseconds.value
+
     def close(self):
         if self.ctx:
             ctx, self.ctx = self.ctx, None
@@ -124,6 +164,39 @@ def validate_range(config, batch_size):
             maximum_p >= FACTOR_LIMIT or
             (config["end"] - 1) // config["p_start"] >= FACTOR_LIMIT):
         raise ValueError("CUDA requires p and q strictly below 2^63")
+
+
+def validate_scan_range(config, batch_size):
+    if not 1 <= batch_size <= MAX_BATCH:
+        raise ValueError(f"CUDA batch size must be in [1,{MAX_BATCH}]")
+    if config["start"] < SCAN_MIN or config["end"] > SCAN_LIMIT:
+        raise ValueError("CUDA scan requires the interval in [2^95, 2^96 - 2^79)")
+
+
+def scan_batch(hunt, config, cursor, batch_size, primes, gpu):
+    import numpy as np
+
+    started = time.perf_counter()
+    start = cursor["n"]
+    end = min(config["end"], start + batch_size)
+    first, flags = hunt.sieve_flags(start, end, primes)
+    offsets = np.flatnonzero(np.frombuffer(flags, dtype=np.uint8)).astype(np.uint32)
+    hits, milliseconds = gpu.scan(first, offsets)
+    records = []
+    delta = {"numbers_scanned": end - start, "sieve_survivors": len(offsets),
+             "fermat_passers": len(hits), "confirmed": 0, "pending": 0}
+    for index, witness, euler in hits:
+        n = first + 2 * int(offsets[index])
+        if gmpy2.powmod(2, n - 1, n) != 1:
+            raise RuntimeError(f"CUDA scan returned a false Fermat passer: {n}")
+        record = (hunt.scan_passer(n, config["factor_floor"]) if witness else
+                  hunt.pending_hit_values(n, config["factor_floor"], bool(euler), True))
+        if record:
+            records.append(record)
+            delta[record["status"]] += 1
+    gpu.telemetry = {"sieve_survivors": len(offsets), "filter_passers": len(hits),
+                     "kernel_ms": milliseconds, "batch_seconds": time.perf_counter() - started}
+    return {"n": end}, delta, records, end >= config["end"]
 
 
 def pairs_batch(hunt, config, cursor, batch_size, primes, gpu, order_cache=None):

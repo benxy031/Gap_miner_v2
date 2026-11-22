@@ -10,6 +10,9 @@
 #include <exception>
 #include <limits>
 
+#include "p0_test_u96.cuh"
+#include "mr128_kernel.cuh"
+
 extern "C" {
 struct PspRange {
     uint64_t p, first, step, count, offset;
@@ -35,6 +38,7 @@ struct Context {
     PspRange* ranges = nullptr;
     uint32_t range_capacity = 0;
     uint64_t* indices = nullptr;
+    uint32_t* scan_offsets = nullptr;
     unsigned long long* hits = nullptr;
 };
 
@@ -74,6 +78,8 @@ bool release(Context* ctx) noexcept {
             ok = cleanup_check(cudaFree(ctx->ranges), "cleanup cudaFree ranges") && ok;
         if (ctx->indices)
             ok = cleanup_check(cudaFree(ctx->indices), "cleanup cudaFree indices") && ok;
+        if (ctx->scan_offsets)
+            ok = cleanup_check(cudaFree(ctx->scan_offsets), "cleanup cudaFree scan offsets") && ok;
         if (ctx->hits)
             ok = cleanup_check(cudaFree(ctx->hits), "cleanup cudaFree hits") && ok;
         if (ctx->start)
@@ -153,6 +159,97 @@ __global__ void filter_kernel(const PspRange* ranges, uint32_t job_count,
         const unsigned long long slot = atomicAdd(hits, 1ULL);
         // Each thread emits at most once; total <= capacity, so none are dropped.
         indices[slot] = index;
+    }
+}
+
+__device__ __forceinline__ void scan_add(uint32_t* r, const uint32_t* a,
+                                         const uint32_t* b, const uint32_t* n) {
+    uint32_t t[4], sub[4], carry = 0, borrow = 0;
+#pragma unroll
+    for (int i = 0; i < 4; ++i) {
+        const uint64_t x = uint64_t{a[i]} + b[i] + carry;
+        t[i] = static_cast<uint32_t>(x);
+        carry = static_cast<uint32_t>(x >> 32);
+    }
+#pragma unroll
+    for (int i = 0; i < 4; ++i) {
+        const uint64_t x = uint64_t{t[i]} - n[i] - borrow;
+        sub[i] = static_cast<uint32_t>(x);
+        borrow = static_cast<uint32_t>(x >> 63);
+    }
+#pragma unroll
+    for (int i = 0; i < 4; ++i) r[i] = (carry || !borrow) ? sub[i] : t[i];
+}
+
+__device__ __forceinline__ bool scan_equal(const uint32_t* a, const uint32_t* b) {
+    return a[0] == b[0] && a[1] == b[1] && a[2] == b[2] && a[3] == b[3];
+}
+
+// A zero result is unresolved above the MR12 bound, never a primality proof.
+__device__ unsigned scan_witness(uint64_t lo, uint32_t hi) {
+    const uint32_t n[4] = {static_cast<uint32_t>(lo), static_cast<uint32_t>(lo >> 32), hi, 0};
+    uint32_t nm1[4] = {n[0] - 1, n[1], n[2], 0};
+    int s = 0;
+    while (!nm1[s / 32]) s += 32;
+    s += __ffs(nm1[s / 32]) - 1;
+    uint32_t d[4];
+    const int word = s / 32, shift = s % 32;
+#pragma unroll
+    for (int i = 0; i < 4; ++i) {
+        const uint32_t low = i + word < 4 ? nm1[i + word] : 0;
+        const uint32_t high = i + word + 1 < 4 ? nm1[i + word + 1] : 0;
+        d[i] = shift ? (low >> shift) | (high << (32 - shift)) : low;
+    }
+    int bits = 128;
+    while (bits && !(d[(bits - 1) / 32] & (1u << ((bits - 1) % 32)))) --bits;
+    const uint32_t inv = p0u96::neginv32(n[0]);
+    uint64_t one_lo, one_hi;
+    ciosConstants128(lo, hi, &one_lo, &one_hi);
+    const uint32_t one[4] = {static_cast<uint32_t>(one_lo),
+                             static_cast<uint32_t>(one_lo >> 32),
+                             static_cast<uint32_t>(one_hi), 0};
+    uint32_t neg[4], borrow = 0;
+#pragma unroll
+    for (int i = 0; i < 4; ++i) {
+        const uint64_t x = uint64_t{n[i]} - one[i] - borrow;
+        neg[i] = static_cast<uint32_t>(x);
+        borrow = static_cast<uint32_t>(x >> 63);
+    }
+    const uint32_t bases[12] = {2, 3, 5, 7, 11, 13, 17, 19, 23, 29, 31, 37};
+    for (unsigned j = 0; j < 12; ++j) {
+        uint32_t b[4] = {0, 0, 0, 0};
+        for (int bit = 5; bit >= 0; --bit) {
+            mr128_dbl_mod(b, b, n);
+            if ((bases[j] >> bit) & 1u) scan_add(b, b, one, n);
+        }
+        uint32_t y[4] = {one[0], one[1], one[2], one[3]};
+        for (int bit = bits - 1; bit >= 0; --bit) {
+            mr128_mont_mul(y, y, y, n, inv);
+            if ((d[bit / 32] >> (bit % 32)) & 1u) mr128_mont_mul(y, y, b, n, inv);
+        }
+        bool pass = scan_equal(y, one) || scan_equal(y, neg);
+        for (int r = 1; !pass && r < s; ++r) {
+            mr128_mont_mul(y, y, y, n, inv);
+            pass = scan_equal(y, neg);
+        }
+        if (!pass) return j + 1;
+    }
+    return 0;
+}
+
+__global__ void scan_kernel(uint64_t first_lo, uint32_t first_hi,
+                            const uint32_t* offsets, uint64_t total,
+                            uint64_t* indices, unsigned long long* hits) {
+    const uint64_t index = uint64_t{blockIdx.x} * blockDim.x + threadIdx.x;
+    if (index >= total) return;
+    const uint64_t lo = first_lo + 2ULL * offsets[index];
+    const uint32_t hi = first_hi + (lo < first_lo);
+    bool euler = false;
+    if (p0u96::test(static_cast<uint32_t>(lo), static_cast<uint32_t>(lo >> 32),
+                    hi, nullptr, true, &euler)) {
+        const unsigned witness = scan_witness(lo, hi);
+        indices[atomicAdd(hits, 1ULL)] =
+            index | (uint64_t{witness} << 32) | (uint64_t{euler} << 40);
     }
 }
 
@@ -310,6 +407,74 @@ extern "C" int psp_gpu_filter(void* handle, const PspRange* jobs, uint32_t job_c
         std::snprintf(error_text, sizeof(error_text), "psp_gpu_filter: %s", e.what());
     } catch (...) {
         std::snprintf(error_text, sizeof(error_text), "psp_gpu_filter: unknown exception");
+    }
+    drain(ctx, queued);
+    return -1;
+}
+
+extern "C" int psp_gpu_scan(void* handle, uint64_t first_lo, uint32_t first_hi,
+                             const uint32_t* offsets, uint64_t total,
+                             uint64_t* host_indices, uint64_t* hit_count,
+                             float* kernel_ms) noexcept {
+    error_text[0] = '\0';
+    if (hit_count) *hit_count = 0;
+    if (kernel_ms) *kernel_ms = 0;
+    Context* ctx = static_cast<Context*>(handle);
+    bool queued = false;
+    unsigned long long hits = 0;
+    try {
+        require(ctx && hit_count && kernel_ms, "psp_gpu_scan: null required argument");
+        require(total <= ctx->capacity && total < (uint64_t{1} << 32),
+                "psp_gpu_scan: total exceeds context capacity");
+        require(!total || (offsets && host_indices), "psp_gpu_scan: null buffer");
+        require(total / kBlockSize + (total % kBlockSize != 0) <= ctx->max_blocks,
+                "psp_gpu_scan: total exceeds device grid limit");
+        if (!total) return 0;
+        const __uint128_t first = (__uint128_t{first_hi} << 64) | first_lo;
+        const __uint128_t limit = (__uint128_t{1} << 96) - (__uint128_t{1} << 79);
+        require((first_lo & 1) && first >= (__uint128_t{1} << 95),
+                "psp_gpu_scan: first must be odd and at least 2^95");
+        for (uint64_t i = 1; i < total; ++i)
+            require(offsets[i] > offsets[i - 1], "psp_gpu_scan: offsets must be increasing");
+        require(first + 2 * __uint128_t{offsets[total - 1]} < limit,
+                "psp_gpu_scan: last candidate exceeds u96 domain");
+        check(cudaSetDevice(ctx->device), "cudaSetDevice");
+        if (!ctx->scan_offsets)
+            check(cudaMalloc(reinterpret_cast<void**>(&ctx->scan_offsets),
+                             size_t{ctx->capacity} * sizeof(uint32_t)),
+                  "cudaMalloc scan offsets");
+        queued = true;
+        check(cudaMemcpyAsync(ctx->scan_offsets, offsets, size_t{total} * sizeof(uint32_t),
+                              cudaMemcpyHostToDevice, ctx->stream), "cudaMemcpyAsync offsets");
+        check(cudaMemsetAsync(ctx->hits, 0, sizeof(unsigned long long), ctx->stream),
+              "cudaMemsetAsync hits");
+        check(cudaEventRecord(ctx->start, ctx->stream), "cudaEventRecord start");
+        const unsigned blocks = static_cast<unsigned>(
+            total / kBlockSize + (total % kBlockSize != 0));
+        scan_kernel<<<blocks, kBlockSize, 0, ctx->stream>>>(
+            first_lo, first_hi, ctx->scan_offsets, total, ctx->indices, ctx->hits);
+        check(cudaGetLastError(), "scan_kernel launch");
+        check(cudaEventRecord(ctx->stop, ctx->stream), "cudaEventRecord stop");
+        check(cudaMemcpyAsync(&hits, ctx->hits, sizeof(hits), cudaMemcpyDeviceToHost,
+                              ctx->stream), "cudaMemcpyAsync hit count");
+        check(cudaStreamSynchronize(ctx->stream), "cudaStreamSynchronize kernel");
+        require(hits <= total, "psp_gpu_scan: GPU hit count exceeds total");
+        float elapsed = 0;
+        check(cudaEventElapsedTime(&elapsed, ctx->start, ctx->stop), "cudaEventElapsedTime");
+        if (hits) {
+            check(cudaMemcpyAsync(host_indices, ctx->indices,
+                                  size_t{hits} * sizeof(uint64_t), cudaMemcpyDeviceToHost,
+                                  ctx->stream), "cudaMemcpyAsync surviving indices");
+            check(cudaStreamSynchronize(ctx->stream), "cudaStreamSynchronize indices");
+        }
+        *hit_count = hits;
+        *kernel_ms = elapsed;
+        return 0;
+    } catch (const Failure&) {
+    } catch (const std::exception& e) {
+        std::snprintf(error_text, sizeof(error_text), "psp_gpu_scan: %s", e.what());
+    } catch (...) {
+        std::snprintf(error_text, sizeof(error_text), "psp_gpu_scan: unknown exception");
     }
     drain(ctx, queued);
     return -1;

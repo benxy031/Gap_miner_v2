@@ -323,7 +323,7 @@ $(BUILD_DIR)/tools/%.o: tools/%.cu | $(BUILD_DIR)
 	$(NVCC) -O3 $(CUDA_ARCH) -std=c++17 -MMD -MP -Xcompiler -O2 -I$(SRC_DIR)/gpu -c $< -o $@
 
 ifdef WITH_CUDA
-$(BIN_DIR)/libpsp_pairs_gpu.so: tools/psp_pairs_gpu.cu $(BUILD_FLAGS_STAMP) | $(BIN_DIR)
+$(BIN_DIR)/libpsp_pairs_gpu.so: tools/psp_pairs_gpu.cu tools/p0_test_u96.cuh tools/perig.cuh tools/mr128_kernel.cuh $(BUILD_FLAGS_STAMP) | $(BIN_DIR)
 	$(NVCC) -O3 $(CUDA_ARCH) -std=c++17 -shared -Xcompiler -fPIC $< -o $@
 else
 $(BIN_DIR)/libpsp_pairs_gpu.so:

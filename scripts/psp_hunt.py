@@ -23,9 +23,6 @@ from psp_math import proven_prime_mr12, strong_base2
 VERSION = 1
 MAX_PRIME_TABLE = 25_000_000
 STOP_SIGNAL = 0
-GAP_SMALL_PRIMES = (3, 5, 7, 11, 13, 17, 19, 23, 29, 31, 37,
-                    41, 43, 47, 53, 59, 61, 67, 71, 73, 79, 83, 89, 97)
-GAP_SMALL_PRIME_PRODUCT = math.prod(GAP_SMALL_PRIMES)
 
 
 def exact_int(text):
@@ -181,8 +178,7 @@ def gap_context(n):
         if first % 2 == 0:
             first += 1
         for candidate in range(first, upper, 2):
-            if candidate > GAP_SMALL_PRIMES[-1] and math.gcd(
-                    candidate, GAP_SMALL_PRIME_PRODUCT) > 1:
+            if not gmpy2.is_prime(candidate, 1):
                 continue
             if proven_prime_mr12(candidate):
                 raise RuntimeError(f"prime {candidate} inside claimed gap for {n}")
@@ -237,20 +233,23 @@ def pair_record(config, p, q):
 
 
 def pending_hit(n, floor):
+    return pending_hit_values(n, floor, bool(euler_base2(n)), bool(strong_base2(n)))
+
+
+def pending_hit_values(n, floor, euler, strong):
     return {
         "n": str(n),
         "status": "pending",
         "source": "scan",
         "fermat_base2": True,
-        "euler_jacobi": bool(euler_base2(n)),
-        "strong_base2": bool(strong_base2(n)),
+        "euler_jacobi": euler,
+        "strong_base2": strong,
         "factor_floor": floor,
         "reason": "MR12 passed outside its proven range; compositeness unresolved",
     }
 
 
-def survivors(start, end, primes):
-    """Odd values in [start,end) with no prime divisor in primes."""
+def sieve_flags(start, end, primes):
     first = start | 1
     count = max(0, (end - first + 1) // 2)
     flags = bytearray(b"\x01") * count
@@ -266,6 +265,12 @@ def survivors(start, end, primes):
         if index < count:
             hits = (count - 1 - index) // p + 1
             flags[index::p] = b"\x00" * hits
+    return first, flags
+
+
+def survivors(start, end, primes):
+    """Odd values in [start,end) with no prime divisor in primes."""
+    first, flags = sieve_flags(start, end, primes)
     return (first + 2 * i for i, flag in enumerate(flags) if flag)
 
 
@@ -442,6 +447,15 @@ def chernick_batch(config, cursor, batch_size):
     return {"k": k}, delta, records, k >= config["k_end"]
 
 
+def scan_passer(n, floor):
+    witness = mr12_witness(n)
+    if witness is not None:
+        return confirmed_hit(n, "scan", floor, witness=witness)
+    if n >= MR12_LIMIT:
+        return pending_hit(n, floor)
+    return None
+
+
 def scan_batch(config, cursor, batch_size, primes):
     start = cursor["n"]
     end = min(config["end"], start + batch_size)
@@ -453,14 +467,10 @@ def scan_batch(config, cursor, batch_size, primes):
         if gmpy2.powmod(2, n - 1, n) != 1:
             continue
         delta["fermat_passers"] += 1
-        witness = mr12_witness(n)
-        if witness is not None:
-            records.append(confirmed_hit(n, "scan", config["factor_floor"],
-                                         witness=witness))
-            delta["confirmed"] += 1
-        elif n >= MR12_LIMIT:
-            records.append(pending_hit(n, config["factor_floor"]))
-            delta["pending"] += 1
+        record = scan_passer(n, config["factor_floor"])
+        if record:
+            records.append(record)
+            delta[record["status"]] += 1
     return {"n": end}, delta, records, end >= config["end"]
 
 
@@ -511,9 +521,12 @@ def run_search(args):
         config.update(k_start=args.k_start, k_end=args.k_end)
     validate_config(config)
     gpu_module = None
-    if args.mode == "pairs" and args.backend == "cuda":
+    if args.mode in ("pairs", "scan") and args.backend == "cuda":
         import psp_gpu as gpu_module
-        gpu_module.validate_range(config, args.batch_size)
+        if args.mode == "pairs":
+            gpu_module.validate_range(config, args.batch_size)
+        else:
+            gpu_module.validate_scan_range(config, args.batch_size)
     signal.signal(signal.SIGINT, request_stop)
     signal.signal(signal.SIGTERM, request_stop)
     with contextlib.ExitStack() as stack:
@@ -531,7 +544,7 @@ def run_search(args):
         elif not store.complete and args.mode == "scan":
             primes = prime_table(args.factor_floor)
         order_cache = None
-        if gpu is not None:
+        if gpu is not None and args.mode == "pairs":
             primes = tuple(primes)
             order_cache = gpu_module.PrimeOrderCache(sys.modules[__name__], primes)
         batches = 0
@@ -546,7 +559,10 @@ def run_search(args):
             elif args.mode == "chernick":
                 result = chernick_batch(config, store.cursor, args.batch_size)
             else:
-                result = scan_batch(config, store.cursor, args.batch_size, primes)
+                result = (gpu_module.scan_batch(sys.modules[__name__], config, store.cursor,
+                                                args.batch_size, primes, gpu)
+                          if gpu is not None else
+                          scan_batch(config, store.cursor, args.batch_size, primes))
             cursor, delta, records, complete = result
             if STOP_SIGNAL and cursor == store.cursor and not records:
                 break
@@ -644,13 +660,16 @@ def make_parser():
     pairs.add_argument("--p-end", type=exact_int, required=True, help="exclusive smaller-factor end")
     pairs.add_argument("--min-gap", type=exact_int, default=0,
                        help="retain only gaps >= this size; 0 retains all (default 0)")
-    pairs.add_argument("--backend", choices=("cpu", "cuda"), default="cpu",
-                       help="pairs filter backend (default cpu)")
-    pairs.add_argument("--device", type=exact_int, default=0,
+    def cuda_options(p):
+        p.add_argument("--backend", choices=("cpu", "cuda"), default="cpu",
+                       help="filter backend (default cpu)")
+        p.add_argument("--device", type=exact_int, default=0,
                        help="CUDA device index (default 0)")
-    pairs.add_argument("--gpu-library", default=str(
-        Path(__file__).resolve().parents[1] / "bin/libpsp_pairs_gpu.so"),
-        help="CUDA shared library (default bin/libpsp_pairs_gpu.so in repository)")
+        p.add_argument("--gpu-library", default=str(
+            Path(__file__).resolve().parents[1] / "bin/libpsp_pairs_gpu.so"),
+            help="CUDA shared library (default bin/libpsp_pairs_gpu.so in repository)")
+
+    cuda_options(pairs)
 
     family = sub.add_parser("chernick", help="search the three-factor Chernick family")
     search_options(family, 10_000)
@@ -661,6 +680,7 @@ def make_parser():
     search_options(scan, 100_000)
     scan.add_argument("--start", type=exact_int, default=10**21, help="inclusive interval start")
     scan.add_argument("--end", type=exact_int, required=True, help="exclusive interval end")
+    cuda_options(scan)
 
     show = sub.add_parser("show", help="show saved results as JSON lines")
     show.add_argument("--db", required=True, help="SQLite results path")

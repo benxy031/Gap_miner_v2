@@ -114,8 +114,9 @@ start a GPU scanner or submit anything. Results and restart progress are stored
 in the specified SQLite database. Run the same command again to resume; a
 conflicting search configuration is rejected.
 
-The `pairs` subcommand also has an opt-in CUDA backend (`--backend cuda`;
-default `cpu`), which additionally requires NumPy. It batches arithmetic
+The `pairs` and `scan` subcommands also have an opt-in CUDA backend
+(`--backend cuda`; default `cpu`), which additionally requires NumPy.
+For `pairs`, it batches arithmetic
 progressions rather than transferring every candidate to the GPU. The GPU
 tests `2^(p-1) mod q == 1`; the CPU still proves both factors, checks the full
 Fermat congruence modulo `p*q`, and verifies the entire surrounding gap.
@@ -123,14 +124,14 @@ Euler/Jacobi or strong tests are recorded, **not** used to discard Fermat PSPs.
 This is a semiprime hunter, not a Phase-0 scanner or a change to gapminer's
 mining code.
 
-For gaps below the deterministic MR12 bound, interior composites with a
-factor through 97 are proved by that factor before remaining candidates are
-checked with MR12. This is always enabled and preserves the full gap proof,
-output records and checkpoint compatibility; the ordinary `pairs` examples
-below use it automatically.
+For gaps below the deterministic MR12 bound, GMP first rejects definitely
+composite interior candidates; remaining candidates are checked with MR12.
+This is always enabled and preserves the full gap proof, output records and
+checkpoint compatibility; the ordinary `pairs` examples below use it
+automatically.
 
-On the dev RTX 3070 with an ext4 SSD (2026-11-16), two interleaved runs per
-variant on each of two factor slices measured mean end-to-end times of
+An earlier small-factor prefilter, on the dev RTX 3070 with an ext4 SSD
+(2026-11-16), measured mean end-to-end times of
 2.63 -> 2.07 s and 0.86 -> 0.70 s, respectively, compared with checking
 every interior candidate by MR12. Both slices had byte-identical result
 payloads and identical checkpoint stats. These short measurements do not
@@ -141,6 +142,46 @@ can be reproduced with a free GPU and a new database:
 python3 scripts/psp_hunt.py pairs --backend cuda --start 1e21 --end 1e22 \
   --p-start 10284000001 --p-end 10284300001 --batch-size 1048576 \
   --db data/psp_gap_sieve_bench.sqlite3
+```
+
+Replacing that prefilter with GMP's composite test (2026-11-22, same dev GPU
+and SSD, unfiltered CUDA, batch 1048576) reduced mean end-to-end times from
+3.235 to 2.945 s for `p=[10000000001,10000500001)` and from 1.350 to 1.225 s
+for `p=[53600000001,53600500001)`, with two interleaved runs per variant.
+All result payloads and checkpoint statistics matched. These are bounded
+samples, not a prediction for the fleet's HDD or the wall range.
+
+For an optional manual CPU/GPU overlap experiment, run two independent
+`pairs` processes on the same GPU with contiguous, non-overlapping `p` ranges
+and a separate database and output file for each. The default remains one
+process; each process independently checkpoints and must be resumed with its
+original range and database. Do not share a database between processes. Check
+that both exit successfully: a failed or incomplete partition must be resumed
+before the combined range is complete.
+
+On the dev RTX 3070 and `/tmp` tmpfs (2026-11-22, CUDA batch 1048576, no gap
+filter), two interleaved runs per arrangement took 10.35/10.42 s with one
+process versus 5.52/5.51 s with two for
+`p=[10000000001,10002000001)`, and 3.85/3.81 s versus 2.35/2.27 s for
+`p=[53600000001,53602000001)`. Combined result payloads, work counters and
+completed cursors matched the single-process runs; there were no duplicate
+results. The split adds CPU, GPU-context memory and disk demand; these short
+samples do not predict performance on the fleet's HDD, an occupied GPU, other
+filter settings, or the wall range. For example, with a free GPU and new
+databases:
+
+```bash
+python3 scripts/psp_hunt.py pairs --backend cuda --device 0 \
+  --start 1e21 --end 1e22 --p-start 10000000001 --p-end 10001000001 \
+  --batch-size 1048576 --db data/psp_split_a.sqlite3 > data/psp_split_a.out 2>&1 &
+p1=$!
+python3 scripts/psp_hunt.py pairs --backend cuda --device 0 \
+  --start 1e21 --end 1e22 --p-start 10001000001 --p-end 10002000001 \
+  --batch-size 1048576 --db data/psp_split_b.sqlite3 > data/psp_split_b.out 2>&1 &
+p2=$!
+if wait "$p1"; then s1=0; else s1=$?; fi
+if wait "$p2"; then s2=0; else s2=$?; fi
+printf 'partition exit codes: %s %s\n' "$s1" "$s2"
 ```
 
 `pairs --min-gap G` (default `0`, retain every hit) keeps and prints only
@@ -293,6 +334,7 @@ python3 scripts/psp_hunt.py scan --start 160696461657079906273 \
 | `--batch-size N` | `10000` (`pairs`, `chernick`); `100000` (`scan`) | checkpoint work size: factor comparisons and completed factors / parameters / interval positions |
 | `--max-batches N` | `0` (no extra limit) | pause after N committed batches; resume with the same search settings |
 | `--min-gap G` (`pairs`) | `0` (retain every hit) | retain/print only PSPs whose proven surrounding gap is >= G; positive G is fixed for that database |
+| `--backend`, `--device`, `--gpu-library` (`pairs`, `scan`) | `cpu`, `0`, `bin/libpsp_pairs_gpu.so` | choose CPU or CUDA, CUDA device, and shared library |
 | `--min-gap G`, `--limit N`, `--status S` | `0`, `20`, `confirmed` (`show`) | filter displayed gaps, limit rows (`0` means all), and select `confirmed`, `pending`, or `all` |
 
 `pairs` is complete only for semiprimes in the stated factor slice and product
@@ -305,6 +347,60 @@ the contiguous smaller-factor slices must cover
 Neither covers all composites above `10^21`: three or more large prime factors
 become possible there. `scan` checks all eligible odd numbers in its stated
 interval, irrespective of factor count, but is much slower.
+
+On the dev i3-10100 with `/tmp` tmpfs (2026-11-22), an all-factor `scan`
+of 10,000,000 integers near `7.9e28`, with `--factor-floor 85000` and
+`--batch-size 100000`, took 11.59/11.08 s with one process, 5.98/5.94 s
+with two, and 3.18/3.15 s with four. The interleaved runs used separate
+databases and contiguous, non-overlapping interval partitions. All 149,932
+result payloads and summed work counters matched. The interval was selected
+to include the known three-factor Fermat PSP
+`2361341467 * 4722682933 * 7084024399`; it is not a representative random
+sample and is not within the fleet's stated wall interval.
+
+The CPU scanner examined the entire interval, but returned exit code 4 because
+149,931 Fermat passers remained `pending`; above the MR12 bound these may
+include primes or unresolved pseudoprimes. Its one confirmed PSP had a
+`probable_gmp` gap, not an MR12 proof. This CPU scan does not use a GPU or support
+`--min-gap`, and this parallel speedup does not solve the pending cases or
+predict fleet/HDD performance. Reproduce the one-process case with a new
+database:
+
+```bash
+python3 scripts/psp_hunt.py scan \
+  --start 79000098242502245419951065689 \
+  --end 79000098242502245419961065689 --factor-floor 85000 \
+  --batch-size 100000 --db data/psp_all_factors_bench.sqlite3
+```
+
+For GPU `scan`, the requested interval must lie in
+`[2^95, 2^96 - 2^79)`. The CPU sieves and verifies every GPU Fermat passer;
+the GPU also computes the MR12 and Euler/Jacobi outcomes. A GPU MR12 witness
+is rechecked by the CPU before confirmation. GPU MR12 passers remain
+`pending`, not proven prime or composite. CPU and CUDA use the same checkpoint
+format and can resume each other's checkpoints. The default backend is `cpu`;
+the default scan batch is 100000 interval positions, with a CUDA limit of
+16777216. `CUDA` telemetry reports `sieve_survivors`, `filter_passers`,
+`kernel_ms`, and `batch_seconds`. `scan` has no `--min-gap` filter.
+
+```bash
+make bin/libpsp_pairs_gpu.so WITH_CUDA=1
+python3 scripts/psp_hunt.py scan --backend cuda --device 0 \
+  --start 79000098242502245419955565689 --end 79000098242502245419956565689 \
+  --factor-floor 85000 --batch-size 1048576 --db data/psp_scan_gpu_example.sqlite3
+```
+
+On the dev RTX 3070/i3-10100 and `/tmp` tmpfs (2026-11-22), the same
+10-million-integer interval and floor as the CPU sample above, using batch
+1048576, took 11.67/11.58 s on one CPU process versus 3.06/3.03 s on one
+CUDA process (interleaved). Two CUDA processes sharing the GPU on adjacent
+half-intervals took 1.86/1.83 s; four on adjacent quarters took 1.54/1.58 s
+(interleaved). Separate databases were used, and all 149,932 result payloads
+and summed work counters matched the CPU. These timings include output and
+checkpointing but do not predict fleet/HDD performance. Splitting requires
+one database per process and checking/resuming every partition separately.
+All runs still had 149,931 unresolved passers and exited 4; faster scanning
+does not make the wall search complete.
 
 The prime-factor table is capped at `25000000`: this limits `scan`'s
 `--factor-floor` and the table needed to factor `p-1` in `pairs`. `pairs` and

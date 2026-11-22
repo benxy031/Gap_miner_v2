@@ -188,8 +188,10 @@ P0U_HD void csub3(u32 &r0, u32 &r1, u32 &r2, u32 n0, u32 n1, u32 n2)
 }
 
 /* n = n0 + n1*2^32 + n2*2^64, odd, 2^95 <= n <= 2^96 - 2^79 - 1.
-   If resid != 0 it receives 2^e mod n (fully reduced) for the residue gate. */
-P0U_HD bool test(u32 n0, u32 n1, u32 n2, u32 *resid = 0)
+   resid receives 2^e mod n when requested. Fermat squares that residue
+   rather than requiring it to be +1 or -1: other square roots can occur. */
+P0U_HD bool test(u32 n0, u32 n1, u32 n2, u32 *resid = 0, bool fermat = false,
+                 bool *euler = 0)
 {
     const u32 np = neginv32(n0);
     const u64 m_lo = ((u64)n1 << 32) | n0;
@@ -235,6 +237,23 @@ P0U_HD bool test(u32 n0, u32 n1, u32 n2, u32 *resid = 0)
         step<false>(y0, y1, y2, n0, n1, n2, np, 0);
         step<false>(y0, y1, y2, n0, n1, n2, np, 0);
         step<true >(y0, y1, y2, n0, n1, n2, np, v);
+    }
+    if (fermat) {
+        if (euler) {
+            u32 z0 = y0, z1 = y1, z2 = y2;
+            csub3(z0, z1, z2, n0, n1, n2);
+            u32 t0 = r10, t1 = r11, t2 = r12;
+            if (((n0 >> 1) ^ (n0 >> 2)) & 1) {
+                u64 d0 = (u64)n0 - t0;
+                u64 d1 = (u64)n1 - t1 - (u32)(d0 >> 63);
+                u64 d2 = (u64)n2 - t2 - (u32)(d1 >> 63);
+                t0 = (u32)d0; t1 = (u32)d1; t2 = (u32)d2;
+            }
+            *euler = (z0 == t0) & (z1 == t1) & (z2 == t2);
+        }
+        step<false>(y0, y1, y2, n0, n1, n2, np, 0);
+        csub3(y0, y1, y2, n0, n1, n2);
+        return (y0 == r10) & (y1 == r11) & (y2 == r12);
     }
     if (resid) {
         u32 z0 = y0, z1 = y1, z2 = y2;

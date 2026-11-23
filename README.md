@@ -86,16 +86,21 @@ wheel. For example, at the GPU-sieve default those counts are 664,578 and
 
 In walk mode that table is not used; the startup line says so.
 `--walk-primes` controls the separate walk sieve and defaults to `150000`.
-The walk engine automatically selects a four-limb base-2 test for
-`2^105 <= n < 2^108`; other magnitudes retain their existing dispatch. For
-example:
+The walk engine automatically selects a specialized base-2 test for
+`2^67 <= n < 2^68` and a four-limb test for `2^105 <= n < 2^108`; other
+magnitudes retain their existing dispatch. For example:
 
 ```bash
 ./bin/phase0_scan_gpu --engine walk \
   --start 100000000000000000000000000000000 --length 2000000000000 \
   --gap-min 2002 --walk-primes 150000 --no-records
 
-# Explicitly select the same test for an experiment.
+# The 68-bit test is selected automatically.
+./bin/phase0_scan_gpu --engine walk \
+  --start 147573952600000000000 --length 2000000000000 \
+  --gap-min 960 --walk-primes 150000 --no-records
+
+# Explicitly select the four-limb test for an experiment.
 P0_WALK_TESTMODE=5 ./bin/phase0_scan_gpu --engine walk \
   --start 100000000000000000000000000000000 --length 2000000000000 \
   --gap-min 2002 --walk-primes 150000 --no-records

@@ -25,7 +25,7 @@
  * Test strength: the sieve engine tests with a base-2 STRONG probable prime
  * test (mr_base2, 3 x 32 CIOS).  The WALK engine does NOT: its production
  * bands select the cheaper fused base-2 EULER/JACOBI test (w_test_mode: modes
- * 0/3/4/5 = perig, p0lazy, p0u96, p0u108; only modes 1/2, at >= 2^120, are
+ * 0/3/4/5/6 = perig, p0lazy, p0u96, p0u108, p0u68; only modes 1/2, at >= 2^120, are
  * strong).  That distinction matters for the completeness claim, because an
  * Euler/Jacobi test accepts most Carmichael numbers that a strong test
  * rejects: of the first 51 Carmichael numbers, 41 pass Euler/Jacobi base-2 and
@@ -2073,6 +2073,9 @@ static int run_walk_engine(void) {
             if (!g_walk_off) {
             if (g_walk_prof) {
                 switch (tmode) {
+                case 6: walk_kernel7<6, 1><<<wk_grid, wk_block, 0, sB>>>(bm, cnb * cWords,
+                            (uint64_t)Ab, (uint64_t)(Ab >> 64), d_wtab,
+                            (uint32_t)gapmin, out_r, 1u << 20, st_r); break;
                 case 5: walk_kernel7<5, 1><<<wk_grid, wk_block, 0, sB>>>(bm, cnb * cWords,
                             (uint64_t)Ab, (uint64_t)(Ab >> 64), d_wtab,
                             (uint32_t)gapmin, out_r, 1u << 20, st_r); break;
@@ -2094,6 +2097,9 @@ static int run_walk_engine(void) {
                 }
             } else
             switch (tmode) {
+            case 6: walk_kernel7<6, 0><<<wk_grid, wk_block, 0, sB>>>(bm, cnb * cWords,
+                        (uint64_t)Ab, (uint64_t)(Ab >> 64), d_wtab,
+                        (uint32_t)gapmin, out_r, 1u << 20, st_r); break;
             case 5: walk_kernel7<5, 0><<<wk_grid, wk_block, 0, sB>>>(bm, cnb * cWords,
                         (uint64_t)Ab, (uint64_t)(Ab >> 64), d_wtab,
                         (uint32_t)gapmin, out_r, 1u << 20, st_r); break;

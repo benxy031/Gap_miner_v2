@@ -461,6 +461,7 @@ __global__ static void class30_sieve_kernel(const uint64_t * __restrict__ primes
    variant matching the super-batch's high word. */
 template<int MODE>
 __device__ static inline int w_is_probable_prime(uint64_t v, uint64_t Ahi) {
+    if (MODE == 6) return p0u96::test68_hi(v, (uint32_t)Ahi) ? 1 : 0;
     if (MODE == 5) return p0u108::test_hi(v, Ahi) ? 1 : 0;
     if (MODE == 4) return p0u96::test_hi(v, (uint32_t)Ahi) ? 1 : 0;
     if (MODE == 3) return p0lazy::test_hi(v, (uint32_t)Ahi) ? 1 : 0;
@@ -470,6 +471,7 @@ __device__ static inline int w_is_probable_prime(uint64_t v, uint64_t Ahi) {
 }
 
 __host__ static inline int w_test_mode(uint64_t Ahi) {
+    if (Ahi >= 8 && Ahi < 16) return 6;
     if (Ahi >= W_LAZY_MAX_HI)  return 2;
     if (Ahi >= W_PERIG_MAX_HI) return 1;
     if (Ahi >= W_U108_MIN_HI && Ahi < W_U108_MAX_HI) return 5;

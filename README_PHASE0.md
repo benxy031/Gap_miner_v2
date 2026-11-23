@@ -33,7 +33,7 @@ Current performance (RTX 3070, i3-10100, 8 threads):
 | `bin/mr128_bench`, `tools/mr128_bench.cu` | | 128-bit test validator (`--validate`, GMP cross-check) + benchmark of the production kernel and its faster experimental variants |
 | `tools/mr128_64_range.cpp`, `tools/mr128_64_sqr_range.cpp` | | host-only GMP harnesses for the 2 x 64-bit test and its square (the second one unit-tests the square against the validated generic multiply) |
 | `tools/mr128_range.cpp`, `tools/perig_range.cpp` | | host-only GMP harnesses: MR verdicts vs `mpz_probab_prime_p` per bit length (`g++ -O2 -I tools <harness>.cpp -lgmp`; the headers define the CUDA qualifiers away when not compiled by nvcc) |
-| `tools/p0_test_u96.cuh` | | OUR wall-band primality test (walk `P0_WALK_TESTMODE=4`): the same base-2 Euler/Jacobi predicate as perig for `2^95 <= n < 2^96 - 2^79`, as one fused column-wise 3 x 32-bit Montgomery square+reduce per step (`mad.lo.cc`/`madc.hi.cc` PTX); 1.70x perig standalone, 1.45x end to end at the wall band (§2) |
+| `tools/p0_test_u96.cuh` | | Fused three-limb base-2 Euler/Jacobi tests: mode 4 for `2^95 <= n < 2^96 - 2^79` and automatic mode 6 for `2^67 <= n < 2^68` (§2) |
 | `bin/bench_u96`, `tools/bench_u96.cu` | | gate + A/B of that test against perig and GMP: `gate` (exact `2^e mod n` vs `mpz_powm`, GPU and host), `verd` (verdict parity on consecutive odd n), `sweep` (parity across the whole domain incl. both limits), `time` (ns/test).  Build: `make bin/bench_u96 WITH_CUDA=1` (needs `-lgmp`); gates and example commands: §5 |
 | `tools/p0_test_u108.cuh` | | Four-limb fused Montgomery Euler/Jacobi test, selected automatically for `2^105 <= n < 2^108` (mode 5); the existing test remains the reference (§2) |
 | `bin/bench_u108`, `tools/bench_u108.cu` | | Dispatch boundary checks, GMP step/residue gates and perig verdict parity/timing for mode 5. Build: `make bin/bench_u108 WITH_CUDA=1` (needs `-lgmp`); acceptance commands: §5 |
@@ -82,6 +82,16 @@ bin/phase0_scan_gpu [--start DEC] [--length DEC] [--sieve-limit P] [--threads T]
 ```
 
 Defaults:
+
+The walk engine automatically uses the 68-bit Euler/Jacobi specialization for
+`2^67 <= n < 2^68`. It has the same discovery predicate and pseudoprime
+limitations as the previous test; the sieve depth default remains 150000.
+For example:
+
+```sh
+./bin/phase0_scan_gpu --engine walk --start 147573952600000000000 \
+  --length 2000000000000 --gap-min 960 --walk-primes 150000 --no-records
+```
 
 | flag | default | notes |
 |---|---|---|
@@ -227,8 +237,9 @@ settings**:
   16.00 s < canonical 18.40 s.  Modes 3 and 4 at
   start = 10^22 (hi = 542) and at the 7.9e28 wall band: see the dispatch
   default below.
-* Walk test dispatch (default, no environment variable): `n` under 2^70 ->
-  perig, `2^70 .. 2^75` -> mode 3, `2^75 .. 2^95` -> perig, `2^95 ..
+* Walk test dispatch (default, no environment variable): `n` under 2^67 ->
+  perig, `2^67 .. 2^68` -> mode 6, `2^68 .. 2^70` -> perig,
+  `2^70 .. 2^75` -> mode 3, `2^75 .. 2^95` -> perig, `2^95 ..
   2^96 - 2^79` -> **mode 4**, `2^96 - 2^79 .. 2^105` -> perig,
   `2^105 .. 2^108` -> **mode 5**, `2^108 .. 2^120` -> perig, `2^120 .. 2^126`
   -> mode 1, above -> mode 2 (all upper limits exclusive). The boundaries
@@ -246,6 +257,14 @@ settings**:
   and lazy representative. Example:
   `./bin/phase0_scan_gpu --engine walk --start 10000000000000000000000 --length 2000000000000 --merit-min 20`
   runs mode 3 without any variable set.
+  At 68 bits mode 6 shares mode 4's Montgomery step but skips its unused leading
+  exponent windows. On a dev RTX 3070, an ABBA run at start
+  `147573952600000000000`, length `5000000000000`, gap 960, sieve depth 150000
+  and batch 96 measured perig 17.24/17.32 s and mode 6 11.92/11.92 s (+45%
+  throughput). All four runs and the split build produced the same 18 gaps and
+  the same 12,085,654,860 discovery tests. `bin/bench_u96 gate68` checks the
+  specialization against perig and GMP; this finite check does not prove that
+  discovery-stage pseudoprimes cannot hide a gap.
   **Measured 2026-10-26** (dev 3070, start = 10^22, length = 2e12, `--merit-min 20`,
   2 interleaved reps): perig 9.07/9.00 s vs mode 3 8.44/8.40 s = **+7 % end to
   end**, with a **bit-identical gap set** (22,939 gaps at `--merit-min 12` and
@@ -775,7 +794,7 @@ test is, and every design pays for it with speed.  The three programs:
 
 | | discovery test | guard against a split | what happens to a lost gap |
 |---|---|---|---|
-| **this repo** (`--engine walk`) | base-2 **Euler/Jacobi** (`perig` / `p0u96` / `p0u108`, `w_test_mode` modes 0/3/4/5). The sieve engine uses strong `mr_base2` instead | none in-tree. Every *reported* gap is GMP-verified (`mpz_probab_prime_p(lower,25)` + `mpz_nextprime(lower) == upper`) | silent: both halves below `--gap-min` -> nothing logged |
+| **this repo** (`--engine walk`) | base-2 **Euler/Jacobi** (`perig` / `p0lazy` / `p0u96` / `p0u108`, `w_test_mode` modes 0/3/4/5/6). The sieve engine uses strong `mr_base2` instead | none in-tree. Every *reported* gap is GMP-verified (`mpz_probab_prime_p(lower,25)` + `mpz_nextprime(lower) == upper`) | silent: both halves below `--gap-min` -> nothing logged |
 | **PGS** (`briankehrig/prime-gaps-cuda`) | Perig base-2 Fermat, jump-by-`minGap` walk | (a) **2-PSP sieve**: marks `n = 0 mod p` with `n/p = 1 mod ord_p(2)` for every sieved prime below the 4096th prime, 38873 (7..83 by wheel, 89..38873 by the medium sieve) - the exact subset of multiples of `p` that the base-2 Fermat test would wrongly accept, so it closes every PSP whose factors are inside the sieve at ~1 mark per `p^2` instead of 1 per `p`; (b) CPU re-walk of each reported gap with `isPrime84` = strong MR to bases 2..37, deterministic below 318665857834031151167461 | documented and *bounded*, in the repo's own words: the author's separate search for base-2 PSPs with **no** factor `< 1e7` is "now complete up to 1e21.  The largest prime gap that contains one of them is of length 1194.  Thus, this code will not miss any gaps of size >= 1200 under 1e21", while `minGap < 960` "is not guaranteed to be 100 % exhaustive". The declared domain stays inside the deterministic MR12 band, so the CPU re-walk is a proof, not a probable-prime verdict |
 | **PGN / Prime Gap Scout** (`wizz13150/prime-gap-scout`) | PGN's own fused base-2 Euler/Jacobi - the headers are literally `namespace specialized_euler` and the criterion is `terminalEquation`, an Euler congruence with a Jacobi-derived sign; Wizz has said so himself ("an undercover Euler/Jacobi test").  Same class as ours, so it **splits at exactly the same pseudoprimes** | mandatory `PGN_VERIFY_GAPS` GPU certificate - the runtime will not build without it (`"Production source adapter requires GPU gap certificates"`): both endpoints must be **proven** prime by 12-base MR and every interior candidate that passes Euler must be **proven composite** by the same test.  Inside the qualified window that is a real proof (MR12 is deterministic below 3.19e23).  But `candidate_walk.cuh` emits a gap only `if (gap >= minGapVal)`, and the verifier only inspects emitted gaps - see the emission analysis below | the strictest verifier of the three, and it does not claim more: `"prime_certificate":"MR12 below318665857834031151167461"`, `"coverage":"SOURCE_PRP_INDEPENDENT_PROOF_PENDING"`, README says "baseline independent exhaustive coverage remains pending".  Window is one high word, `supported_high_word: 10` = 1.8446744e20..2.0291418e20 - which contains only **5 of BrianK's 61** published gaps |
 

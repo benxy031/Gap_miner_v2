@@ -187,11 +187,13 @@ P0U_HD void csub3(u32 &r0, u32 &r1, u32 &r2, u32 n0, u32 n1, u32 n2)
     if ((d2 >> 63) == 0) { r0 = (u32)d0; r1 = (u32)d1; r2 = (u32)d2; }
 }
 
-/* n = n0 + n1*2^32 + n2*2^64, odd, 2^95 <= n <= 2^96 - 2^79 - 1.
+/* n = n0 + n1*2^32 + n2*2^64, odd. SMALL_68 selects 2^67 <= n < 2^68;
+   otherwise 2^95 <= n <= 2^96 - 2^79 - 1.
    resid receives 2^e mod n when requested. Fermat squares that residue
    rather than requiring it to be +1 or -1: other square roots can occur. */
-P0U_HD bool test(u32 n0, u32 n1, u32 n2, u32 *resid = 0, bool fermat = false,
-                 bool *euler = 0)
+template <bool SMALL_68>
+P0U_HD bool test_core(u32 n0, u32 n1, u32 n2, u32 *resid, bool fermat,
+                      bool *euler)
 {
     const u32 np = neginv32(n0);
     const u64 m_lo = ((u64)n1 << 32) | n0;
@@ -201,7 +203,7 @@ P0U_HD bool test(u32 n0, u32 n1, u32 n2, u32 *resid = 0, bool fermat = false,
     const u32 r10 = y0, r11 = y1, r12 = y2;              /* 1 in Montgomery form */
     const u32 e0 = fshl(n0, n1, 31), e1 = fshl(n1, n2, 31), e2 = n2 >> 1;
     /* seed: the top 3 exponent bits P (4..7) -> 2^P in Montgomery form */
-    const u32 P = e2 >> 28;
+    const u32 P = SMALL_68 ? e2 : (e2 >> 28);
     for (u32 i = 0; i < P; i++) {
         u32 c = y2 >> 31;
         y2 = fshl(y1, y2, 1); y1 = fshl(y0, y1, 1); y0 <<= 1;
@@ -211,14 +213,17 @@ P0U_HD bool test(u32 n0, u32 n1, u32 n2, u32 *resid = 0, bool fermat = false,
         bool ge = c | ((d2 >> 63) == 0);
         if (ge) { y0 = (u32)d0; y1 = (u32)d1; y2 = (u32)d2; }
     }
-    u32 w = e2 << 4;                                     /* 28 bits left in e2 */
+    u32 w;
+    if (!SMALL_68) {
+        w = e2 << 4;                                     /* 28 bits left in e2 */
 #pragma unroll 1
-    for (int k = 0; k < 7; k++) {
-        u32 v = w >> 28; w <<= 4;
-        step<false>(y0, y1, y2, n0, n1, n2, np, 0);
-        step<false>(y0, y1, y2, n0, n1, n2, np, 0);
-        step<false>(y0, y1, y2, n0, n1, n2, np, 0);
-        step<true >(y0, y1, y2, n0, n1, n2, np, v);
+        for (int k = 0; k < 7; k++) {
+            u32 v = w >> 28; w <<= 4;
+            step<false>(y0, y1, y2, n0, n1, n2, np, 0);
+            step<false>(y0, y1, y2, n0, n1, n2, np, 0);
+            step<false>(y0, y1, y2, n0, n1, n2, np, 0);
+            step<true >(y0, y1, y2, n0, n1, n2, np, v);
+        }
     }
     w = e1;
 #pragma unroll 1
@@ -273,10 +278,24 @@ P0U_HD bool test(u32 n0, u32 n1, u32 n2, u32 *resid = 0, bool fermat = false,
     return (y0 == t0) & (y1 == t1) & (y2 == t2);
 }
 
+P0U_HD bool test(u32 n0, u32 n1, u32 n2, u32 *resid = 0, bool fermat = false,
+                 bool *euler = 0)
+{
+    return test_core<false>(n0, n1, n2, resid, fermat, euler);
+}
+
 /* walk entry: n = hi*2^64 + v */
 P0U_HD bool test_hi(u64 v, u32 hi)
 {
     return test((u32)v, (u32)(v >> 32), hi);
+}
+
+/* For 2^67 <= n < 2^68, e2 holds exactly the top three exponent bits.
+   If x < 2n, a step returns less than n + (2n)^2 / 2^113 < 2n,
+   so one final subtraction is sufficient throughout this band. */
+P0U_HD bool test68_hi(u64 v, u32 hi)
+{
+    return test_core<true>((u32)v, (u32)(v >> 32), hi, 0, false, 0);
 }
 
 } /* namespace p0u96 */

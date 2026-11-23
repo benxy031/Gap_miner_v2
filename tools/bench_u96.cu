@@ -17,6 +17,7 @@
  *        bin/bench_u96 verd  [N=4194304] [Ahi=4282402316] [lowbase]
  *        bin/bench_u96 sweep [chunks=64] [N=1048576]
  *        bin/bench_u96 time  [N=1048576] [iters=20] [Ahi=4282402316]
+ *        bin/bench_u96 gate68 [N=1048576]
  */
 #include <stdio.h>
 #include <stdlib.h>
@@ -27,6 +28,7 @@
 
 #include "p0_test_u96.cuh"   /* ours */
 #include "perig.cuh"         /* production reference */
+#include "p0_walk_kern.cuh"  /* dispatch boundary check */
 
 typedef uint32_t u32;
 typedef uint64_t u64;
@@ -48,6 +50,10 @@ __global__ static void k_perig(const u64 *lo, u32 hi, u8 *res, u32 n) {
     u32 i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= n) return;
     res[i] = ciosFermatTest128_hi(lo[i], (u64)hi) ? 1 : 0;
+}
+__global__ static void k_u68(const u64 *lo, u32 hi, u8 *res, u32 n) {
+    u32 i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) res[i] = p0u96::test68_hi(lo[i], hi) ? 1 : 0;
 }
 __global__ static void k_res(const u32 *nl, u32 *out, u32 n) {
     u32 i = blockIdx.x * blockDim.x + threadIdx.x;
@@ -137,6 +143,49 @@ static int cmd_gate(u32 N) {
     printf("gate N=%u : gpu residue mismatches=%u  host mismatches=%u  verdict mismatches=%u\n",
            N, bad_gpu, bad_host, bad_verdict);
     return (bad_gpu + bad_host + bad_verdict) != 0;
+}
+
+static int cmd_gate68(u32 N) {
+    if (N < 3) { fprintf(stderr, "gate68 needs at least 3 candidates per high word\n"); return 2; }
+    if (w_test_mode(7) != 0 || w_test_mode(8) != 6 ||
+        w_test_mode(15) != 6 || w_test_mode(16) != 0) {
+        fprintf(stderr, "gate68 dispatch boundary mismatch\n");
+        return 1;
+    }
+    u64 *low = (u64 *)malloc(8ull * N), *dlo;
+    u8 *got = (u8 *)malloc(N), *ref = (u8 *)malloc(N), *dg, *dr;
+    if (!low || !got || !ref) { fprintf(stderr, "gate68 host allocation failed\n"); return 2; }
+    CK(cudaMalloc(&dlo, 8ull * N)); CK(cudaMalloc(&dg, N)); CK(cudaMalloc(&dr, N));
+    u64 diff = 0, gmp_diff = 0, host_diff = 0, checked = 0, positives = 0;
+    for (u32 hi = 8; hi < 16; hi++) {
+        for (u32 i = 0; i < N; i++) low[i] = rnd() | 1;
+        low[0] = 1; low[1] = UINT64_MAX; low[2] = UINT64_MAX - 2;
+        CK(cudaMemcpy(dlo, low, 8ull * N, cudaMemcpyHostToDevice));
+        k_u68<<<(N + 127) / 128, 128>>>(dlo, hi, dg, N);
+        k_perig<<<(N + 127) / 128, 128>>>(dlo, hi, dr, N);
+        CK(cudaGetLastError()); CK(cudaDeviceSynchronize());
+        CK(cudaMemcpy(got, dg, N, cudaMemcpyDeviceToHost));
+        CK(cudaMemcpy(ref, dr, N, cudaMemcpyDeviceToHost));
+        for (u32 i = 0; i < N; i++) {
+            diff += got[i] != ref[i];
+            positives += got[i];
+            if (i >= 12500) continue;
+            u32 n[3] = {(u32)low[i], (u32)(low[i] >> 32), hi}, resid[3];
+            ref_resid(n[0], n[1], n[2], resid);
+            bool expected = ref_verdict(n, resid);
+            gmp_diff += got[i] != expected;
+            host_diff += p0u96::test68_hi(low[i], hi) != expected;
+            checked++;
+        }
+    }
+    printf("gate68 N=%u per high word: GPU parity errors=%llu, GMP errors=%llu, "
+           "host errors=%llu, GMP checked=%llu, positives=%llu\n", N,
+           (unsigned long long)diff, (unsigned long long)gmp_diff,
+           (unsigned long long)host_diff, (unsigned long long)checked,
+           (unsigned long long)positives);
+    CK(cudaFree(dlo)); CK(cudaFree(dg)); CK(cudaFree(dr));
+    free(low); free(got); free(ref);
+    return (diff || gmp_diff || host_diff) != 0;
 }
 
 /* verdict parity vs perig on count consecutive odd candidates from base */
@@ -229,6 +278,8 @@ int main(int argc, char **argv) {
     const char *c = argc > 1 ? argv[1] : "time";
     if (!strcmp(c, "gate"))
         return cmd_gate(argc > 2 ? (u32)strtoul(argv[2], 0, 10) : 200000u);
+    if (!strcmp(c, "gate68"))
+        return cmd_gate68(argc > 2 ? (u32)strtoul(argv[2], 0, 10) : (1u << 20));
     if (!strcmp(c, "verd")) {
         u64 N = argc > 2 ? strtoull(argv[2], 0, 10) : (1ull << 22);
         u32 hi = argc > 3 ? (u32)strtoul(argv[3], 0, 10) : AHI_WALL;

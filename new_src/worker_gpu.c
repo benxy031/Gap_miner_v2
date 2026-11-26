@@ -1542,20 +1542,26 @@ void *worker_thread_run(void *arg) {
             sieve.interval_size = scan_size;
             sieve.bitmap_words = (scan_size + 63U) / 64U;
 
-            sieve_ok = cached_generation == generation ?
-                sieve_core_run_from_cached_base(&sieve, window_start,
-                                                &candidate_offsets,
-                                                &candidate_count) :
-                sieve_core_run(&sieve, base,
-                               &candidate_offsets,
-                               &candidate_count);
-            if (!sieve_ok || !candidate_offsets || candidate_count == 0) break;
+            int visible_extract = half_class && cached_generation == generation &&
+                                  (window_start & 1U) == 0;
+            if (visible_extract) {
+                sieve_ok = sieve_core_run_from_cached_base_visible(
+                    &sieve, window_start, base_mod60, halfclass_visible_mask(),
+                    &candidate_offsets, &candidate_count);
+            } else if (cached_generation == generation) {
+                sieve_ok = sieve_core_run_from_cached_base(
+                    &sieve, window_start, &candidate_offsets, &candidate_count);
+            } else {
+                sieve_ok = sieve_core_run(&sieve, base,
+                                          &candidate_offsets, &candidate_count);
+            }
+            if (!sieve_ok || !candidate_offsets) break;
 
             /* HALF_CLASS: probe only the visible classes so the halo
                closing guarantee is a VISIBLE prime (a hidden closer must
                not keep the halo small and leave the last owned gap
                unclosed). */
-            if (half_class) {
+            if (half_class && !visible_extract) {
                 candidate_count = halfclass_filter_offsets(
                     base_mod60, candidate_offsets, candidate_count);
             }

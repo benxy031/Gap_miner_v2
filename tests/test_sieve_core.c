@@ -3,6 +3,7 @@
  */
 
 #include "../new_src/sieve_core.h"
+#include "../new_src/halfclass.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -73,6 +74,119 @@ static int test_build_high_prime_bitmap_batch(const struct sieve_core *sc,
     }
 
     return 1;
+}
+
+static int test_odd_positions_against_division(void) {
+    struct sieve_core sc = {0};
+    mpz_t base, shifted;
+    mpz_init_set_str(base, "1267650600228229401496703205376", 10);
+    mpz_init(shifted);
+    if (!sieve_core_init_window(&sc, 513, 50000)) {
+        mpz_clear(base);
+        mpz_clear(shifted);
+        return 0;
+    }
+
+    int ok = 1;
+    for (unsigned parity = 0; parity < 2 && ok; parity++) {
+        mpz_add_ui(shifted, base, parity);
+        if (!sieve_core_prepare_base_mod_p(&sc, shifted)) { ok = 0; break; }
+        for (uint64_t offset = 0; offset <= 512 && ok; offset += 256) {
+            uint64_t *candidates;
+            uint32_t count;
+            if (!sieve_core_run_from_cached_base(&sc, offset, &candidates, &count)) {
+                ok = 0;
+                break;
+            }
+            uint32_t index = 0;
+            for (uint64_t j = 0; j < sc.interval_size; j++) {
+                int survives = 1;
+                for (size_t i = 0; i < sc.small_primes_count; i++) {
+                    uint64_t p = sc.small_primes[i];
+                    if ((sc.base_mod_p[i] + offset + j) % p == 0) {
+                        survives = 0;
+                        break;
+                    }
+                }
+                if (survives && (index >= count || candidates[index++] != j)) {
+                    ok = 0;
+                    break;
+                }
+            }
+            if (index != count) ok = 0;
+        }
+    }
+    sieve_core_free(&sc);
+    mpz_clear(base);
+    mpz_clear(shifted);
+    return ok;
+}
+
+static int test_visible_extraction(void) {
+    const uint64_t lengths[] = {507, 513, 2049, 2050, 1049600, 1056768};
+    mpz_t base;
+    mpz_init_set_str(base, "1267650600228229401496703205376", 10);
+    int ok = 1;
+    for (size_t len = 0; len < sizeof(lengths) / sizeof(lengths[0]) && ok; len++) {
+        struct sieve_core full = {0}, visible = {0};
+        mpz_set_str(base, "1267650600228229401496703205376", 10);
+        uint64_t prime_limit = lengths[len] > 1000000 ? 2200000 : 50000;
+        if (!sieve_core_init_window(&full, lengths[len], prime_limit)) {
+            fprintf(stderr, "FAIL: visible sieve initialization\n");
+            ok = 0;
+            break;
+        }
+        if (!sieve_core_init_window(&visible, lengths[len], prime_limit)) {
+            fprintf(stderr, "FAIL: visible sieve initialization\n");
+            sieve_core_free(&full);
+            ok = 0;
+            break;
+        }
+        int avx2_enabled = visible.avx2_enabled;
+        for (unsigned parity = 0; parity < 2 && ok; parity++) {
+            if (parity) mpz_add_ui(base, base, 1);
+            if (!sieve_core_prepare_base_mod_p(&full, base) ||
+                !sieve_core_prepare_base_mod_p(&visible, base)) {
+                ok = 0;
+                break;
+            }
+            for (int scalar = 0; scalar < 2 && ok; scalar++) {
+                visible.avx2_enabled = scalar ? 0 : avx2_enabled;
+                uint64_t *empty;
+                uint32_t empty_count;
+                if (!sieve_core_run_from_cached_base_visible(
+                        &visible, 0, (uint32_t)mpz_fdiv_ui(base, 60), 0,
+                        &empty, &empty_count) || empty_count != 0) {
+                    ok = 0;
+                    break;
+                }
+                uint64_t step = lengths[len] > 1000000 ? 1048576 : 2;
+                uint64_t last = lengths[len] > 1000000 ? 2 * step : 28;
+                for (uint64_t off = 0; off <= last && ok; off += step) {
+                    uint32_t mod60 = (uint32_t)((mpz_fdiv_ui(base, 60) + off) % 60);
+                    for (int quarter = 0; quarter < 2; quarter++) {
+                        halfclass_set_quarter(quarter);
+                        uint64_t *all, *got;
+                        uint32_t all_count, got_count;
+                        if (!sieve_core_run_from_cached_base(&full, off, &all, &all_count) ||
+                            !sieve_core_run_from_cached_base_visible(
+                                &visible, off, mod60, halfclass_visible_mask(), &got, &got_count)) {
+                            ok = 0;
+                            break;
+                        }
+                        all_count = halfclass_filter_offsets(mod60, all, all_count);
+                        if (all_count != got_count ||
+                            memcmp(all, got, all_count * sizeof(*all)) != 0) ok = 0;
+                    }
+                    halfclass_set_quarter(0);
+                }
+            }
+        }
+        sieve_core_free(&full);
+        sieve_core_free(&visible);
+    }
+    mpz_clear(base);
+    return ok;
 }
 
 int main(void) {
@@ -182,7 +296,11 @@ int main(void) {
     printf("Cached-base sieve comparison: %u candidates\n", cached_count);
     printf("Hybrid GPU-pre-marked sieve comparison (packed batch): %u candidates\n",
            hybrid_count);
-    printf("%s\n", matched && cache_matched && hybrid_matched ? "PASS" : "FAIL");
+    int division_matched = test_odd_positions_against_division();
+    int visible_matched = test_visible_extraction();
+    printf("Odd-position direct division comparison: %s\n", division_matched ? "PASS" : "FAIL");
+    printf("Visible extraction comparison: %s\n", visible_matched ? "PASS" : "FAIL");
+    printf("%s\n", matched && cache_matched && hybrid_matched && division_matched && visible_matched ? "PASS" : "FAIL");
 
     free(hybrid_batch_bitmaps);
     sieve_core_free(&scalar);
@@ -190,5 +308,5 @@ int main(void) {
     sieve_core_free(&hybrid);
     mpz_clear(base);
     mpz_clear(shifted_base);
-    return matched && cache_matched && hybrid_matched ? 0 : 1;
+    return matched && cache_matched && hybrid_matched && division_matched && visible_matched ? 0 : 1;
 }

@@ -78,6 +78,16 @@ int sieve_core_run_from_cached_base(struct sieve_core *sc, uint64_t base_offset,
                                     uint64_t **out_candidates,
                                     uint32_t *out_count);
 
+/* Extract only residues in visible_mask (mod 60); base_offset must be even,
+   and base_mod60 is the residue of the actual window base. A successful
+   extraction may have zero candidates. */
+int sieve_core_run_from_cached_base_visible(struct sieve_core *sc,
+                                            uint64_t base_offset,
+                                            uint32_t base_mod60,
+                                            uint64_t visible_mask,
+                                            uint64_t **out_candidates,
+                                            uint32_t *out_count);
+
 /* Hybrid cached-base sieve path:
      - premarked_bitmap contains high-prime composite marks for odd slots
      - CPU marks low-prime range [0, split_index)

@@ -76,10 +76,12 @@ static uint32_t sieve_extract_odd_candidates_scalar(const uint64_t *bitmap,
                                                    uint64_t bitmap_words,
                                                    uint64_t odd_count,
                                                    uint64_t first_odd_offset,
+                                                   const uint64_t *visible_masks,
                                                    uint64_t *candidates) {
     uint32_t count = 0;
     for (uint64_t word = 0; word < bitmap_words; word++) {
         uint64_t survivors = ~bitmap[word];
+        if (visible_masks) survivors &= visible_masks[word % 15U];
         if (word + 1U == bitmap_words && (odd_count & 63U) != 0) {
             survivors &= (1ULL << (odd_count & 63U)) - 1ULL;
         }
@@ -99,6 +101,7 @@ static uint32_t sieve_extract_odd_candidates_avx2(const uint64_t *bitmap,
                                                   uint64_t bitmap_words,
                                                   uint64_t odd_count,
                                                   uint64_t first_odd_offset,
+                                                  const uint64_t *visible_masks,
                                                   uint64_t *candidates) {
     const __m256i all_composite = _mm256_set1_epi64x(-1LL);
     uint32_t count = 0;
@@ -111,6 +114,7 @@ static uint32_t sieve_extract_odd_candidates_avx2(const uint64_t *bitmap,
 
         for (uint64_t lane = 0; lane < 4U; lane++) {
             uint64_t survivors = ~bitmap[word + lane];
+            if (visible_masks) survivors &= visible_masks[(word + lane) % 15U];
             /* Mask the trailing partial word so positions >= odd_count are
                never emitted (matches the scalar extractor; without this the
                AVX2 path returns spurious candidates whenever bitmap_words is
@@ -129,6 +133,7 @@ static uint32_t sieve_extract_odd_candidates_avx2(const uint64_t *bitmap,
 
     for (; word < bitmap_words; word++) {
         uint64_t survivors = ~bitmap[word];
+        if (visible_masks) survivors &= visible_masks[word % 15U];
         while (survivors) {
             unsigned int bit = (unsigned int)__builtin_ctzll(survivors);
             uint64_t index = (word << 6) + bit;
@@ -146,6 +151,7 @@ static int sieve_core_run_odd_only(struct sieve_core *sc,
                                    const mpz_t base,
                                    uint64_t base_offset,
                                    int use_cache,
+                                   const uint64_t *visible_masks,
                                    uint64_t **out_candidates,
                                    uint32_t *out_count) {
     if (!sc || !out_candidates || !out_count ||
@@ -172,9 +178,9 @@ static int sieve_core_run_odd_only(struct sieve_core *sc,
         remainder += first_odd_offset % p;
         if (remainder >= p) remainder -= p;
 
-        uint64_t inverse_two = (p + 1U) >> 1;
+        /* Divide by two modulo odd p without a modular multiply. */
         uint64_t t = (remainder == 0U) ? 0U : (p - remainder);
-        uint64_t pos = sieve_fast_mod(t * inverse_two, p, sc->inv_p[i]);
+        uint64_t pos = (t + (t & 1U) * p) >> 1;
         uint64_t vector_end = (sc->avx2_enabled && p <= SIEVE_AVX2_PRIME_MAX) ?
                               (odd_count / SIEVE_AVX2_BLOCK_OFFSETS) *
                               SIEVE_AVX2_BLOCK_OFFSETS : 0;
@@ -200,19 +206,19 @@ static int sieve_core_run_odd_only(struct sieve_core *sc,
     if (sc->avx2_enabled) {
         count = sieve_extract_odd_candidates_avx2(
             sc->bitmap, bitmap_words, odd_count, first_odd_offset,
-            sc->candidate_buffer);
+            visible_masks, sc->candidate_buffer);
     } else {
         count = sieve_extract_odd_candidates_scalar(
             sc->bitmap, bitmap_words, odd_count, first_odd_offset,
-            sc->candidate_buffer);
+            visible_masks, sc->candidate_buffer);
     }
 #else
     count = sieve_extract_odd_candidates_scalar(
         sc->bitmap, bitmap_words, odd_count, first_odd_offset,
-        sc->candidate_buffer);
+        visible_masks, sc->candidate_buffer);
 #endif
 
-    if (count == 0) return 0;
+    if (count == 0 && !visible_masks) return 0;
     *out_candidates = sc->candidate_buffer;
     *out_count = count;
     return 1;
@@ -403,7 +409,7 @@ static int sieve_core_run_impl(struct sieve_core *sc, const mpz_t base,
         }
         if (use_cache || mpz_cmp_ui(base, 3) >= 0) {
             return sieve_core_run_odd_only(sc, base, base_offset, use_cache,
-                                           out_candidates, out_count);
+                                           NULL, out_candidates, out_count);
         }
     }
     
@@ -515,6 +521,33 @@ int sieve_core_run_from_cached_base(struct sieve_core *sc, uint64_t base_offset,
                                out_candidates, out_count);
 }
 
+int sieve_core_run_from_cached_base_visible(struct sieve_core *sc,
+                                            uint64_t base_offset,
+                                            uint32_t base_mod60,
+                                            uint64_t visible_mask,
+                                            uint64_t **out_candidates,
+                                            uint32_t *out_count) {
+    if (!sc || !sc->base_mod_p_valid || !sc->base_mod_p ||
+        (base_offset & 1U) || base_mod60 >= 60U) return 0;
+
+    uint64_t masks[15];
+    uint32_t start = (base_mod60 + ((sc->base_mod_p[0] & 1U) ? 0U : 1U)) % 60U;
+    for (unsigned word = 0; word < 15; word++) {
+        uint64_t bits = 0;
+        uint32_t residue = start;
+        for (unsigned bit = 0; bit < 64; bit++) {
+            bits |= ((visible_mask >> residue) & 1ULL) << bit;
+            residue += 2U;
+            if (residue >= 60U) residue -= 60U;
+        }
+        masks[word] = bits;
+        start += 8U;
+        if (start >= 60U) start -= 60U;
+    }
+    return sieve_core_run_odd_only(sc, NULL, base_offset, 1, masks,
+                                   out_candidates, out_count);
+}
+
 int sieve_core_run_from_cached_base_hybrid(struct sieve_core *sc,
                                            uint64_t base_offset,
                                            const uint64_t *premarked_bitmap,
@@ -556,9 +589,8 @@ int sieve_core_run_from_cached_base_hybrid(struct sieve_core *sc,
         remainder += first_odd_offset % p;
         if (remainder >= p) remainder -= p;
 
-        uint64_t inverse_two = (p + 1U) >> 1;
         uint64_t t = (remainder == 0U) ? 0U : (p - remainder);
-        uint64_t pos = sieve_fast_mod(t * inverse_two, p, sc->inv_p[i]);
+        uint64_t pos = (t + (t & 1U) * p) >> 1;
 
         for (; pos < odd_count; pos += p) {
             sc->bitmap[pos >> 6] |= 1ULL << (pos & 63U);
@@ -570,16 +602,16 @@ int sieve_core_run_from_cached_base_hybrid(struct sieve_core *sc,
     if (sc->avx2_enabled) {
         count = sieve_extract_odd_candidates_avx2(
             sc->bitmap, bitmap_words, odd_count, first_odd_offset,
-            sc->candidate_buffer);
+            NULL, sc->candidate_buffer);
     } else {
         count = sieve_extract_odd_candidates_scalar(
             sc->bitmap, bitmap_words, odd_count, first_odd_offset,
-            sc->candidate_buffer);
+            NULL, sc->candidate_buffer);
     }
 #else
     count = sieve_extract_odd_candidates_scalar(
         sc->bitmap, bitmap_words, odd_count, first_odd_offset,
-        sc->candidate_buffer);
+        NULL, sc->candidate_buffer);
 #endif
 
     if (count == 0) return 0;
